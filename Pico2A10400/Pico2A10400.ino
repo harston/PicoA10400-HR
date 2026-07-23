@@ -2387,7 +2387,7 @@ void loop()
     // Warning, openNext starts at the current directory position
     // so a rewind of the directory may be required.
     
-     set_menu_status_msg("V.0.1 AOTTA ");
+     set_menu_status_msg("AOTTAv01 HR1"); // exactly 12 chars: the menu kernel renders 12 per row
    	 set_menu_status_byte(0);
 
   int i=0;
