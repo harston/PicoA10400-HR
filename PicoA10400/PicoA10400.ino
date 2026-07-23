@@ -252,7 +252,7 @@ uint8_t AR_ROM[8448*4];
 char filelist[85*48]; // 85 name of 48 chars max lenght
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
 char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: loaded truncated, shown red in the menu
-#define MENU_FOOTER_TEXT "AOTTAv01 HR1" // 12 chars: the menu kernel renders exactly 12 per row
+#define MENU_FOOTER_TEXT "AOTTAv01 HR2" // 12 chars: the menu kernel renders exactly 12 per row
 // Colour of oversized-ROM names. The kernel reads this at runtime from menu_status[12],
 // so changing it needs no ROM patch - just this line. $66 was picked by sweeping all 16
 // hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
@@ -331,62 +331,121 @@ retry:
 }
 
 ////////////////////////////////////////////////////////////////////////////
+// Activision bankswitch - the only two games are Double Dragon and Rampage.
+// 128K image, 8 x 16K banks:
+//   $4000-$7FFF  bank 6
+//   $8000-$9FFF  one 8K half of bank 7
+//   $A000-$DFFF  switchable bank; selected by a write at or above $E000, the
+//                bank number coming from A2-A0 of that address
+//   $E000-$FFFF  the other 8K half of bank 7
+//
+// A13 IS INVERTED relative to the map that MAME's a78_rom_act_device::read_40xx
+// describes: inside every window the two 8K halves trade places. That is not a
+// guess - it was read out of the game images and then confirmed on hardware
+// (full trail in not_working_roms3/experiment_activision/README.md):
+//   * $E000-$FFFF must serve file 0x1C000. Only then do the $FF80-$FFF7
+//     signature block and the $FFF8/$FFF9 bytes land where the 7800 BIOS looks
+//     for them; with 0x1E000 the console reads 00/FF there, decides no cartridge
+//     is present and starts its built-in game.
+//   * Double Dragon's reset vector $FF74 does JMP $448D, and $448D holds real
+//     startup code - "LDA #$00 / STA $FF80 / JMP $DC00", i.e. select bank 0 and
+//     jump into it - only at file 0x1A48D, which is bank 6 with A13 flipped.
+//     Straight bank 6 gives 0x1848D, all zeros.
+//   * That JMP $DC00 in turn needs bank 0 with A13 flipped (file 0x03C00, a
+//     table of JMPs); without the flip it lands on 0x01C00, again all zeros.
+// The call in setup1() used to be commented out with "doesn't work"; with this
+// mapping Double Dragon (PAL) runs correctly on real hardware.
+#define ACT_BANK7_AT_E000 0x1C000   // file half served at $E000-$FFFF
+#define ACT_BANK7_AT_8000 0x1E000   // file half served at $8000-$9FFF
+#define ACT_A13           0x2000    // A13 flip applied inside the 16K windows
+
+// Shaped like emulate_supercart_ef(): one gpio_get_all() per pass, bit tests
+// instead of range compares, and the data lines left driven (rom_in_use) rather
+// than a SET_DATA_MODE_OUT / wait / SET_DATA_MODE_IN dance on every access. The
+// original loop did all three the slow way and could not keep up with MARIA once
+// a game started pulling graphics - the picture died the moment gameplay began.
+__attribute__((optimize("O2")))
 void __time_critical_func(emulate_activision()) {
-
-  /*-------------------------------------------------
-
- Carts with Activision bankswitch:
- 128K games. 8 x 16K banks (0-7) to be mapped at
- 0xa000-0xdfff. Bank is selected by writing above
- 0xe000 and depends on A2-A0.
- The rest of the memory is as follows:
- 0x4000-0x7fff bank 6
- 0x8000-0x9fff first 8K of bank 7
- 0xe000-0xffff second 8K of bank 7
- GAMES: Double Dragon, Rampage.
- -------------------------------------------------*/
-      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      uint32_t bank=0, addr=0, rawaddr=0;
       uint8_t rom_in_use=1;
-      uint32_t write_mask=(RW_PIN_MASK | A15_PIN_MASK | A14_PIN_MASK | A13_PIN_MASK );
-      while (1) {    // Get address
-             // Get address
-         	  while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
-			        addr_prev = addr;
-            
-            //addr = (gpio_get_all()&BUS_PIN_MASK);
-			      
-            if ((gpio_get_all()&RW_PIN_MASK)==0) {
-                if (addr>=0xff80)  bank= (gpio_get_all() & 7) * 0x4000;
-              } else {
-	          if ((addr>=0x4000)&&(addr<=0x7fff)) { // 0x4000-0x7fff bank 6
-	            gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) + 0x18000] << D0_PIN);
-              SET_DATA_MODE_OUT;
-              while ((gpio_get_all()&BUS_PIN_MASK)==addr);
-              SET_DATA_MODE_IN;
-			      } else
-            if ((addr>=0x8000)&&(addr<=0x9fff)) { // first 8k bank 7
-	            gpio_put_masked(DATA_PIN_MASK, rom_table[(addr& 0x3fff)+ 0x1c000] << D0_PIN);
-              SET_DATA_MODE_OUT;
-              while ((gpio_get_all()&BUS_PIN_MASK)==addr);
-              SET_DATA_MODE_IN;
-			      } else
-            if ((addr>=0xe000)&&(addr<=0xffff)) { // second 8k bank 7
-                    gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff)+ 0x1c000] << D0_PIN);
-                SET_DATA_MODE_OUT;
-                while ((gpio_get_all()&BUS_PIN_MASK)==addr);
-                SET_DATA_MODE_IN;
-            } else
-            if ((addr>=0xa000)&&(addr<=0xdfff)) { 
-                  gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff ) + bank] << D0_PIN);
-              SET_DATA_MODE_OUT;
-              while ((gpio_get_all()&BUS_PIN_MASK)==addr);
-              SET_DATA_MODE_IN;
-            } 
-          }
-        } 
-      }	              
-  
-    
+
+      while (1) {
+        rawaddr = gpio_get_all();
+        addr = rawaddr & BUS_PIN_MASK;
+        if (addr & A15_PIN_MASK) {
+            if (addr & A14_PIN_MASK) {
+                if (addr & A13_PIN_MASK) {                 // $E000-$FFFF: fixed half of bank 7
+                    sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x1fff) + ACT_BANK7_AT_E000] << D0_PIN;
+                    rawaddr = gpio_get_all() & READ_PIN_MASK;
+                    if (rawaddr == READ_PIN_MASK) {
+                        if (!rom_in_use) {
+                            SET_DATA_MODE_OUT;
+                            rom_in_use = 1;
+                        }
+                    } else {
+                        // Bank select - but only after a second look confirms it.
+                        // Anything that makes the read pattern fail to match,
+                        // above all the address simply changing between the two
+                        // samples, would otherwise be taken for a write and move
+                        // the bank at random. Not theory: without this re-check
+                        // both games banked away from their own code mid-frame
+                        // (Double Dragon went black, Rampage showed only noise).
+                        rawaddr = gpio_get_all();
+                        if ((rawaddr & (RW_PIN_MASK | A15_PIN_MASK | A14_PIN_MASK | A13_PIN_MASK))
+                              == (A15_PIN_MASK | A14_PIN_MASK | A13_PIN_MASK)) {
+                            SET_DATA_MODE_IN;
+                            rom_in_use = 0;
+                            bank = (rawaddr & 7) * 0x4000;
+                        }
+                    }
+                } else {                                   // $C000-$DFFF: switchable bank
+                    sio_hw->gpio_out = (uint32_t)rom_table[((addr & 0x3fff) ^ ACT_A13) + bank] << D0_PIN;
+                    rawaddr = gpio_get_all() & READ_PIN_MASK;
+                    if (rawaddr == READ_PIN_MASK) {
+                        if (!rom_in_use) {
+                            SET_DATA_MODE_OUT;
+                            rom_in_use = 1;
+                        }
+                    }
+                }
+            } else {
+                if (addr & A13_PIN_MASK) {                 // $A000-$BFFF: switchable bank
+                    sio_hw->gpio_out = (uint32_t)rom_table[((addr & 0x3fff) ^ ACT_A13) + bank] << D0_PIN;
+                } else {                                   // $8000-$9FFF: fixed half of bank 7
+                    sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x1fff) + ACT_BANK7_AT_8000] << D0_PIN;
+                }
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+                if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                }
+            }
+        } else {
+            if (addr & A14_PIN_MASK) {                     // $4000-$7FFF: bank 6
+                sio_hw->gpio_out = (uint32_t)rom_table[((addr & 0x3fff) ^ ACT_A13) + 0x18000] << D0_PIN;
+                rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
+                if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                } else {
+                    if (rom_in_use) {
+                        SET_DATA_MODE_IN;
+                        rom_in_use = 0;
+                    }
+                }
+            } else {
+                if (rom_in_use) {
+                    SET_DATA_MODE_IN;
+                    rom_in_use = 0;
+                }
+            }
+        }
+      }
+}
 
 void __time_critical_func(emulate_supercart_ef()) {
       uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
@@ -858,8 +917,8 @@ start:
  
   switch (cart_to_emulate) {
 
-     case CART_TYPE_ACTIVISION: 
-      //  emulate_activision(); // doesn't work
+     case CART_TYPE_ACTIVISION:
+      emulate_activision();
         break;
 
      case CART_TYPE_SUPERCART_RAM: 
