@@ -9,6 +9,7 @@
 */
 
 #include "hardware/gpio.h"
+#include "hardware/structs/sio.h"
 #include "pico/platform.h"
 #include "pico/stdlib.h"
 #include "hardware/vreg.h"
@@ -547,6 +548,100 @@ void __time_critical_func(emulate_supercart_ram()) {
       }
 }
 
+// Extracted from the inline switch case it used to be (see patches/PicoA10400_0.09.txt).
+// Pure extraction + speed: behaviour is unchanged from before, only where the code lives
+// and how fast it answers the bus changed. Compiled at -O2 rather than the sketch
+// default -Os: at -Os the SDK's static-inline gpio_put_masked() gets outlined into a
+// copy in FLASH, called through a RAM veneer on every single bus response (~25 cycles
+// plus XIP-cache-miss jitter - see PicoA10400_tune/README.md for the measured evidence).
+// Each data output below is a single SIO store instead, safe here because in 7800
+// modes the only output pins are D0-D7, so the other OUT-latch bits are don't-cares.
+// Verify any future change to this function with PicoA10400_tune/tools/check_hotpath.sh
+// - it must keep reporting zero calls leaving RAM.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_supercart_large()) {
+      // bank is a byte OFFSET into rom_table for the $8000-$BFFF window (not a bank
+      // number): bank=0 means file bank 0 - the same 16KB already visible at
+      // $4000-$7FFF - is what a real 9-bank SuperGame cart shows at $8000 before its
+      // first bank-select write (MAME's a78 sg9 device: device_reset() { m_bank=0; }).
+      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      uint8_t rom_in_use=1;
+
+      while (1) {    // Get address
+             // Get address
+        rawaddr = gpio_get_all();
+        addr = rawaddr & BUS_PIN_MASK;
+        // Check for A15
+        if (addr & A15_PIN_MASK) {
+            // Check for A14
+            if (addr & A14_PIN_MASK) {
+                // Set the data on the bus for fixed bank 7
+                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x14000] << D0_PIN;
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == READ_PIN_MASK) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                }
+            } else {
+                // Set the data on the bus for active bank
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;
+                // Check for RW
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
+                    // Read cycle
+                    if (!rom_in_use) {
+                       SET_DATA_MODE_OUT;
+                       rom_in_use = 1;
+                    }
+                } else {  // Write cycle to ROM
+                    rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
+                    // Check for bankswitch
+                    if (rawaddr == A15_PIN_MASK) {
+                        // Bankswitching write
+                        SET_DATA_MODE_IN;
+                        rawaddr = gpio_get_all();
+                        // Mask 7, not 0xF: MAME computes bank_mask=7 for a 9-bank (144KB)
+                        // image and wraps the written value against it. With 0xF a stray
+                        // write of 8..15 would select "file banks 9..16", i.e. read past
+                        // the end of rom_table into unrelated RAM - Alien Brigade writes
+                        // values it loaded from memory here, not only the immediates
+                        // 2..5 seen in its startup code, so out-of-range values cannot be
+                        // ruled out. +1: file bank 0 is already shown at $4000.
+                        bank = (((rawaddr >> D0_PIN) & 0x7) + 1) * 0x4000;
+                        rom_in_use = 0;
+                    }
+                }
+            }
+        } else {
+            // EXROM - first 16k at 0x4000
+            if (addr & 0x4000) {
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) ] << D0_PIN;
+                rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
+	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                } else {
+                    if (rom_in_use) {
+                        SET_DATA_MODE_IN;
+                        rom_in_use = 0;
+                    }
+                }
+            } else {
+                if (rom_in_use) {
+                    SET_DATA_MODE_IN;
+                    rom_in_use = 0;
+                }
+            }
+        }
+      }
+}
+
 void __time_critical_func(emulate_supercharger_cartridge())  {
   uint8_t* buffer=rom_table;
   unsigned int image_size;
@@ -772,8 +867,12 @@ start:
         break;
       
     case CART_TYPE_SUPERCART:
-      emulate_supercart_ram();
-     
+      // Plain SuperGame carts serve file bank 6 at $4000-$7FFF, i.e. exactly the
+      // emulate_supercart_ef mapping (confirmed against MAME's a78 SG device, see
+      // patches/PicoA10400_0.10.txt). This used to fall through into
+      // emulate_supercart_ram() first - a dead call, since that function never
+      // returns, so the EF path below was unreachable and every plain-SG cart
+      // silently got RAM at $4000 instead of the ROM data it expects there.
      case CART_TYPE_SUPERCART_EF:
       // Continually check address lines and put associated data on bus.
       emulate_supercart_ef();
@@ -1354,80 +1453,10 @@ start:
 	} 
      break;
 
+      case CART_TYPE_SUPERCART_ROM: // same 9-bank shape as SUPERCART_LARGE; used to fall
+                                     // through to default (no emulation at all, dead cart)
       case CART_TYPE_SUPERCART_LARGE:
-      // Continually check address lines and put associated data on bus.
-      bank=0;
-      addr=0;addr_prev=0;
-      rom_in_use=1;
-      
-      while (1) {    // Get address
-             // Get address
-        rawaddr = gpio_get_all();
-        addr = rawaddr & BUS_PIN_MASK;
-        // Check for A15
-        if (addr & A15_PIN_MASK) {
-            // Check for A14
-            if (addr & A14_PIN_MASK) {
-                // Set the data on the bus for fixed bank 7
-                gpio_put_masked(DATA_PIN_MASK, rom_table[addr + 0x14000] << D0_PIN);
-                rawaddr = gpio_get_all() & READ_PIN_MASK;
-	          if (rawaddr == READ_PIN_MASK) {
-                    // Read cycle
-                    if (!rom_in_use) {
-                        SET_DATA_MODE_OUT;
-                        rom_in_use = 1;
-                    }
-                }
-            } else {
-                // Set the data on the bus for active bank
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) + bank+0x4000] << D0_PIN);
-                // Check for RW
-                rawaddr = gpio_get_all() & READ_PIN_MASK;
-	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
-                    // Read cycle
-                    if (!rom_in_use) {
-                       SET_DATA_MODE_OUT;
-                       rom_in_use = 1;
-                    }
-                } else {  // Write cycle to ROM
-                   // rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
-                    rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
-                    // Check for bankswitch
-                    if (rawaddr == A15_PIN_MASK) {
-                        // Bankswitching write
-                        SET_DATA_MODE_IN;
-                        // Check for 0x01
-                        rawaddr = gpio_get_all();
-                        bank=((rawaddr >> D0_PIN) & 0xf)*0x4000;
-                        rom_in_use = 0;
-                    }
-                }
-            }
-        } else {
-            // EXROM - first 16k at 0x4000
-            if (addr & 0x4000) {
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) ] << D0_PIN);
-                rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
-	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
-                    // Read cycle
-                    if (!rom_in_use) {
-                        SET_DATA_MODE_OUT;
-                        rom_in_use = 1;
-                    }
-                } else {
-                    if (rom_in_use) {
-                        SET_DATA_MODE_IN;
-                        rom_in_use = 0;
-                    }
-                }
-            } else {
-                if (rom_in_use) {
-                    SET_DATA_MODE_IN;
-                    rom_in_use = 0;
-                }
-            }
-        }
-      }
+      emulate_supercart_large();
         break;
 
     default:
