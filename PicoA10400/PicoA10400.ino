@@ -1,5 +1,5 @@
 /*
-//            PICO A10400 an Atari 2600+7800 MultiCART by Andrea Ottaviani 
+//            PICO A10400 an Atari 2600+7800 MultiCART by Andrea Ottaviani
 // Atari 2600 / Atari 7800   multicart based on Raspberry Pico board -
 
 // v. 0.1 2024-10-03 : Initial version for Pi Pico 
@@ -249,9 +249,10 @@ unsigned int cart_size_bytes;
 char menu_status[16];
 uint8_t AR_ROM[8448*4];
 char filelist[85*48]; // 85 name of 48 chars max lenght
+char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
 uint8_t ram_table[32*1024];
 char path[128];
- char filetoopen[50];
+ char filetoopen[200]; // must hold path[128] + filename (up to 47 chars) + terminator; was 50, which overflowed with long names or subdirectories
  
 char menu_ram[1024];	// < NUM_DIR_ITEMS * 12 (85 max)
 char isfor7800=0;
@@ -1706,13 +1707,9 @@ int identify_cartridge(char *filename)
   
   if (!(file.open(filename))) Serial.println("Open error");
   int pos=0;
-	// select type by file extension?
-  for (int j=50;j>1;j--) {
-    if (filename[j]=='.') {
-      pos=j;
-      break;
-    }
-  }
+	// select type by file extension (last '.'); avoids fixed-size loop bound and out-of-bounds read
+  char *dot = strrchr(filename, '.');
+  if (dot != NULL) pos = dot - filename;
   char ext[4]={0,0,0,0};
   ext[0]=filename[pos+1];
   if (ext[0]>96) ext[0]=ext[0]-32;
@@ -1740,7 +1737,13 @@ int identify_cartridge(char *filename)
 	if ((cart_type == CART_TYPE_NONE) && ((image_size % 8448) == 0))
 		cart_type = CART_TYPE_AR;
 	if (cart_type == CART_TYPE_AR) {
-        for (int i=0;i<=image_size;i++) {
+        if (image_size > sizeof(AR_ROM)) {
+          Serial.print("ERROR: Supercharger image (");Serial.print(image_size);
+          Serial.print(" bytes) exceeds AR_ROM capacity (");Serial.print(sizeof(AR_ROM));
+          Serial.println(" bytes), truncating to prevent memory corruption");
+          image_size = sizeof(AR_ROM);
+        }
+        for (int i=0;i<image_size;i++) {
         int readbyte=file.read();
         if (readbyte!=-1) {
           AR_ROM[i]=readbyte;
@@ -1755,7 +1758,13 @@ int identify_cartridge(char *filename)
           isfor7800=1;
           for (int j=0;j<0x80;j++) A78_HEADER[j]=file.read();
     }
-    for (int i=0;i<=image_size;i++) {
+    if (image_size > sizeof(rom_table)) {
+      Serial.print("ERROR: ROM (");Serial.print(image_size);
+      Serial.print(" bytes) exceeds rom_table capacity (");Serial.print(sizeof(rom_table));
+      Serial.println(" bytes), truncating to prevent memory corruption");
+      image_size = sizeof(rom_table);
+    }
+    for (int i=0;i<image_size;i++) {
       int readbyte=file.read();
       if (readbyte!=-1) {
         rom_table[i]=readbyte;
@@ -1997,16 +2006,8 @@ void msc_flush_cb (void)
 }
 // check if dir up
 bool checkDirUp (char* fileto) {
-  bool check;
-  for (int i=49;i>1;i--) {
-    if ((fileto[i]=='.')&&(fileto[i-1]=='.')) {
-      check=true;
-      break;
-    } else {
-      check=false;
-    }
-  }
-  return check;
+  size_t len = strlen(fileto);
+  return (len>=2) && (fileto[len-1]=='.') && (fileto[len-2]=='.');
 }
 // check if dir up
 void DirUp() {
@@ -2035,12 +2036,11 @@ void LoadGame(int numfile) {
   Serial.print("load game n.:");Serial.print(numfile);
   Serial.print(" - ");Serial.println(filelist[numfile*48]);
 
-  memset(filetoopen,0,sizeof(filetoopen));
-  strcat(filetoopen,path);
   char filetoadd[48];
   for(int x=0;x<48;x++) filetoadd[x]=filelist[numfile*48+x];//   memcpy(filelist[contfile*48],filename,48);
-         
-  strcat(filetoopen,filetoadd);
+  filetoadd[47]=0; // guarantee null-terminator regardless of source name length
+
+  snprintf(filetoopen, sizeof(filetoopen), "%s%s", path, filetoadd); // bounds-checked; replaces unsafe strcat/strcat that overflowed filetoopen[50]
            
 
   Serial.print("FTO:");Serial.println(filetoopen);
@@ -2060,7 +2060,7 @@ void LoadGame(int numfile) {
   if (file.isDir()) {
     //Serial.println("is dir");
     memset(path,0,sizeof(path));
-    memcpy(path,filetoopen,sizeof(filetoopen));
+    snprintf(path, sizeof(path)-1, "%s", filetoopen); // bounds-checked (filetoopen can now be longer than path); leaves room for the trailing '/' appended below
     file.close();
     Serial.print("old path:");root.printName(&Serial);
     root.close();
@@ -2074,10 +2074,10 @@ void LoadGame(int numfile) {
   } else {
     Serial.println("start loading");
     file.close();
-  
+
     cart_to_emulate=identify_cartridge(filetoopen);
-       
-    //delay(300); 
+
+    //delay(300);
      
         // 400 MHz
    
@@ -2121,7 +2121,43 @@ void printfilelist() {
 
 ////////////////////////////////////////////////////////////////////////////////////
 //                     MENU ATARI
-////////////////////////////////////////////////////////////////////////////////////    
+////////////////////////////////////////////////////////////////////////////////////
+
+// case-insensitive compare of two null-terminated (or space-padded) filelist entries
+int compareNamesCI(const char* a, const char* b) {
+  for (int i=0;i<47;i++) {
+    char ca=a[i], cb=b[i];
+    if ((ca>96)&&(ca<123)) ca-=32;
+    if ((cb>96)&&(cb<123)) cb-=32;
+    if (ca!=cb) return (unsigned char)ca-(unsigned char)cb;
+    if (ca==0) break;
+  }
+  return 0;
+}
+
+// sort filelist[start..start+count) in place: directories first, alphabetical within each group;
+// direntry_isdir is kept in sync with the swaps
+void sortFileList(int start, int count) {
+  for (int i=start;i<start+count-1;i++) {
+    int best=i;
+    for (int j=i+1;j<start+count;j++) {
+      bool better;
+      if (direntry_isdir[j]!=direntry_isdir[best]) {
+        better = direntry_isdir[j]>direntry_isdir[best]; // directories before files
+      } else {
+        better = compareNamesCI(&filelist[j*48], &filelist[best*48])<0;
+      }
+      if (better) best=j;
+    }
+    if (best!=i) {
+      char tmp[48];
+      memcpy(tmp,&filelist[i*48],48);
+      memcpy(&filelist[i*48],&filelist[best*48],48);
+      memcpy(&filelist[best*48],tmp,48);
+      char t=direntry_isdir[i]; direntry_isdir[i]=direntry_isdir[best]; direntry_isdir[best]=t;
+    }
+  }
+}
 
 void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
   int contfile=0;
@@ -2130,76 +2166,66 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
  
   memset(filename,0,sizeof(filename));
   switch (tipo) {
-    case 1: // root dir
+    case 1: { // root dir
       //memset(menu_ram,32,1023);
       contfile=0;
       memset(filelist,0,sizeof(filelist));
+      memset(direntry_isdir,0,sizeof(direntry_isdir));
       root.rewind();
       // Serial.println(" Menu-1:");
-     
+
       // root.printName(&Serial);Serial.println(" ");
-      
+
+      int firstentry=0; // index where real (sortable) entries start: 1 if ".." was added, 0 otherwise
         if ((!root.isRoot())&&(contfile==0)) {
        //    Serial.println("subdir, adding ..");
            memset(filename,0,sizeof(filename));
-           memcpy(filename,"..           ",12);
+           memcpy(filename,"..",2); // no trailing padding: filetoadd is read as a C-string (checkDirUp needs it to end in "..")
            for(int x=0;x<48;x++) filelist[contfile*48+x]=filename[x];//   memcpy(filelist[contfile*48],filename,48);
-           memset(atarifile,0,12);
-          for (int i=0;i<12;i++) {
-            atarifile[i]=filename[i];
-            if (atarifile[i]==0) atarifile[i]=32;
-            menu_ram[contfile*12+i]=atarifile[i];
-          }
         contfile++;
+        firstentry=1;
       }
-      
+
+      // pass 1: just collect names + type (dir/file), skipping hidden entries; no rendering yet
       while (file.openNext(&root, O_RDONLY) ) {
       memset(filename,32,sizeof(filename));
-      file.getName(filename, 48);
-      
+      file.getName(filename, 48); // may fail/truncate silently for names >47 chars
+      filename[sizeof(filename)-1]=0; // force null-terminator so later strcat can't run past this buffer
+
       //Serial.println(filename);
- 
-      if (file.isDir()) {  // is directory
-        if (file.isHidden()) {
-         //    Serial.println("Skipped");
-        } else { 
-          for(int x=0;x<48;x++) filelist[contfile*48+x]=filename[x];//   memcpy(filelist[contfile*48],filename,48);
-           memset(atarifile,0,12);
-          for (int i=0;i<12;i++) {
-            atarifile[i]=filename[i];
-            if ((atarifile[i]>96) && (atarifile[i]<123)) atarifile[i]=atarifile[i]-32;
-            if (atarifile[i]==0) atarifile[i]=32;
-            if (i==0) atarifile[i]=atarifile[i]|0x80;
-            menu_ram[contfile*12+i]=atarifile[i];
-          }
-     
-        if (contfile<=84) contfile++;
-        //Serial.print("+");Serial.println(contfile);
-         }
-      } else {  // not directory, rom files:
-        if (file.isHidden()) {
-             Serial.println("Skipped");
-        } else { 
+
+      if (file.isHidden()) {
+        //    Serial.println("Skipped");
+      } else if (contfile<=84) { // bounds check: filelist/menu_ram hold at most 85 entries (0..84)
         for(int x=0;x<48;x++) filelist[contfile*48+x]=filename[x];//   memcpy(filelist[contfile*48],filename,48);
-        memset(atarifile,0,12);
-        for (int i=0;i<12;i++) {
-          atarifile[i]=filename[i];
-          if ((atarifile[i]>96) && (atarifile[i]<123)) atarifile[i]=atarifile[i]-32;
-          if (atarifile[i]==0) atarifile[i]=32;
-          menu_ram[contfile*12+i]=atarifile[i];
-        }
-         if (contfile<=84) contfile++;
-        }
-     
+        direntry_isdir[contfile] = file.isDir() ? 1 : 0;
+        contfile++;
       }
       file.close();
       }
+
+      // pass 2: sort real entries (".." excluded) - directories first, alphabetical within each group
+      sortFileList(firstentry, contfile-firstentry);
+
+      // pass 3: render sorted filelist into menu_ram (uppercase, directories flagged with high bit = yellow in menu)
+      for (int idx=0; idx<contfile; idx++) {
+        memset(atarifile,0,12);
+        for (int i=0;i<12;i++) {
+          atarifile[i]=filelist[idx*48+i];
+          if ((atarifile[i]>96) && (atarifile[i]<123)) atarifile[i]=atarifile[i]-32;
+          if (atarifile[i]==0) atarifile[i]=32;
+          if ((i==0) && direntry_isdir[idx]) atarifile[i]=atarifile[i]|0x80;
+          menu_ram[idx*12+i]=atarifile[i];
+        }
+      }
+
       //Serial.print("stop byte a:");Serial.println(contfile);
       menu_ram[(contfile)*12]=0;
-     
+
       Serial.print("tot file:");Serial.println(contfile-1);
-     
+
       break;
+    }
     case 2:
     //  Serial.println(" Menu-2:");
       //printram();
