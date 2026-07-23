@@ -366,6 +366,12 @@ retry:
 // a game started pulling graphics - the picture died the moment gameplay began.
 __attribute__((optimize("O2")))
 void __time_critical_func(emulate_activision()) {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
       uint32_t bank=0, addr=0, rawaddr=0;
       uint8_t rom_in_use=1;
 
@@ -447,7 +453,19 @@ void __time_critical_func(emulate_activision()) {
       }
 }
 
+// v0.13 (P1): same treatment 0.09 gave emulate_supercart_large and 0.12 gave
+// emulate_activision. At -Os GCC outlines the masked-GPIO-write helper into a
+// copy in FLASH called through a RAM veneer on every bus response (~25 cycles
+// + XIP-miss jitter, see PicoA10400_tune/README.md). -O2 plus the direct SIO
+// store below keep the whole response path in RAM - verify with check_hotpath.sh.
+__attribute__((optimize("O2")))
 void __time_critical_func(emulate_supercart_ef()) {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
       uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
       uint8_t rom_in_use=1;
       
@@ -460,7 +478,7 @@ void __time_critical_func(emulate_supercart_ef()) {
             // Check for A14
             if (addr & A14_PIN_MASK) {
                 // Set the data on the bus for fixed bank 7
-                gpio_put_masked(DATA_PIN_MASK, rom_table[addr + 0x10000] << D0_PIN);
+                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x10000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == READ_PIN_MASK) {
                     // Read cycle
@@ -471,7 +489,7 @@ void __time_critical_func(emulate_supercart_ef()) {
                 }
             } else {
                 // Set the data on the bus for active bank
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) + bank] << D0_PIN);
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 // Check for RW
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
@@ -497,7 +515,7 @@ void __time_critical_func(emulate_supercart_ef()) {
         } else {
             // EXFIX - bank 6 is in 0x4000
             if (addr & 0x4000) {
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) + 0x18000] << D0_PIN);
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + 0x18000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
 	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
                     // Read cycle
@@ -521,8 +539,23 @@ void __time_critical_func(emulate_supercart_ef()) {
       }
     }
 
+// v0.13 (P1): same treatment 0.09 gave emulate_supercart_large and 0.12 gave
+// emulate_activision. At -Os GCC outlines the masked-GPIO-write helper into a
+// copy in FLASH called through a RAM veneer on every bus response (~25 cycles
+// + XIP-miss jitter, see PicoA10400_tune/README.md). -O2 plus the direct SIO
+// store below keep the whole response path in RAM - verify with check_hotpath.sh.
+__attribute__((optimize("O2")))
 void __time_critical_func(emulate_supercart_ram()) {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
       uint32_t bank=0;
+      // v0.13 (P1): romLen is volatile, so the fixed-bank index below was
+      // re-read from memory on every pass. Constant for the whole game - hoist.
+      const uint32_t fixed_base = (uint32_t)romLen - 0x8000;
       uint32_t addr=0, addr_prev=0, rawaddr=0;
       uint8_t rom_in_use=1;
       
@@ -535,7 +568,7 @@ void __time_critical_func(emulate_supercart_ram()) {
             // Check for A14
             if (addr & A14_PIN_MASK) {
                 // Set the data on the bus for fixed bank 7
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x7fff) + romLen - 0x8000 ] << D0_PIN);
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x7fff) + fixed_base] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == READ_PIN_MASK) {
                     // Read cycle
@@ -546,8 +579,8 @@ void __time_critical_func(emulate_supercart_ram()) {
                 }
             } else {
                 // Set the data on the bus for active bank
-                //gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) + bank] << D0_PIN);
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x7fff) + bank] << D0_PIN);
+                //sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x7fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 // Check for RW
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
@@ -575,7 +608,7 @@ void __time_critical_func(emulate_supercart_ram()) {
             // EXram - 16k is in 0x4000
             if (rawaddr & 0x4000) {
                 addr= rawaddr & 0x3fff;
-                gpio_put_masked(DATA_PIN_MASK, ram_table[addr] << D0_PIN);
+                sio_hw->gpio_out = (uint32_t)ram_table[addr] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
 	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
                     // Read cycle
@@ -619,6 +652,12 @@ void __time_critical_func(emulate_supercart_ram()) {
 // - it must keep reporting zero calls leaving RAM.
 __attribute__((optimize("O2")))
 void __time_critical_func(emulate_supercart_large()) {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
       // bank is a byte OFFSET into rom_table for the $8000-$BFFF window (not a bank
       // number): bank=0 means file bank 0 - the same 16KB already visible at
       // $4000-$7FFF - is what a real 9-bank SuperGame cart shows at $8000 before its
@@ -702,6 +741,12 @@ void __time_critical_func(emulate_supercart_large()) {
 }
 
 void __time_critical_func(emulate_supercharger_cartridge())  {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
   uint8_t* buffer=rom_table;
   unsigned int image_size;
  	uint8_t *ram = buffer;
