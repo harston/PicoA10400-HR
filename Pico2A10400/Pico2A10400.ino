@@ -262,6 +262,13 @@ char menu_status[16];
 uint8_t AR_ROM[8448*4];
 char filelist[85*48]; // 85 name of 48 chars max lenght
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
+char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: loaded truncated, shown red in the menu
+#define MENU_FOOTER_TEXT "AOTTAv01 HR1" // 12 chars: the menu kernel renders exactly 12 per row
+// Colour of oversized-ROM names. The kernel reads this at runtime from menu_status[12],
+// so changing it needs no ROM patch - just this line. $66 was picked by sweeping all 16
+// hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
+// saturated (luminance A washed out to near-white). More saturated: $64. Brighter: $68.
+#define OVERSIZED_COLOUR 0x66
 uint8_t ram_table[32*1024];
 char path[128];
  char filetoopen[200]; // must hold path[128] + filename (up to 47 chars) + terminator; was 50, which overflowed with long names or subdirectories
@@ -1489,7 +1496,11 @@ start:
 ////////////////////////////////////////////////////////////////////////////////////    
 
 void set_menu_status_msg(const char* message) {
-	strncpy(menu_status, message, 15);
+	// 12, not 15: the kernel renders exactly 12 characters, and bytes [12..15] carry
+	// out-of-band data (the oversized-file colour, the status byte). Copying 15 here
+	// zero-padded the colour byte to $00 on every footer update, drawing flagged names
+	// in black.
+	strncpy(menu_status, message, 12);
 }
 
 void set_menu_status_byte(char status_byte) {
@@ -1834,9 +1845,12 @@ int identify_cartridge(char *filename)
           for (int j=0;j<0x80;j++) A78_HEADER[j]=file.read();
     }
     if (image_size > sizeof(rom_table)) {
-      Serial.print("ERROR: ROM (");Serial.print(image_size);
+      // Truncate rather than refuse: the menu shows these entries in red, and loading
+      // a partial image is the user's call. Truncation is what keeps the copy below
+      // inside rom_table - writing past it lands directly in the TinyUSB descriptors.
+      Serial.print("WARNING: ROM (");Serial.print(image_size);
       Serial.print(" bytes) exceeds rom_table capacity (");Serial.print(sizeof(rom_table));
-      Serial.println(" bytes), truncating to prevent memory corruption");
+      Serial.println(" bytes), truncating - the game will most likely misbehave");
       image_size = sizeof(rom_table);
     }
     for (int i=0;i<image_size;i++) {
@@ -2230,6 +2244,7 @@ void sortFileList(int start, int count) {
       memcpy(&filelist[i*48],&filelist[best*48],48);
       memcpy(&filelist[best*48],tmp,48);
       char t=direntry_isdir[i]; direntry_isdir[i]=direntry_isdir[best]; direntry_isdir[best]=t;
+      t=direntry_toobig[i]; direntry_toobig[i]=direntry_toobig[best]; direntry_toobig[best]=t;
     }
   }
 }
@@ -2246,6 +2261,7 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
       contfile=0;
       memset(filelist,0,sizeof(filelist));
       memset(direntry_isdir,0,sizeof(direntry_isdir));
+      memset(direntry_toobig,0,sizeof(direntry_toobig));
       root.rewind();
       // Serial.println(" Menu-1:");
 
@@ -2261,28 +2277,69 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
         firstentry=1;
       }
 
-      // pass 1: just collect names + type (dir/file), skipping hidden entries; no rendering yet
-      while (file.openNext(&root, O_RDONLY) ) {
-      memset(filename,32,sizeof(filename));
-      file.getName(filename, 48); // may fail/truncate silently for names >47 chars
-      filename[sizeof(filename)-1]=0; // force null-terminator so later strcat can't run past this buffer
+      // pass 1: collect names + type, skipping hidden entries; no rendering yet.
+      // Directories are collected in their own sweep FIRST. menu_ram is what the Atari
+      // reads at $1800-$1BFF, so the listing can never hold more than 1024/12 = 85
+      // entries. That cut-off used to fall wherever the filesystem happened to return
+      // entries, and sorting only ran afterwards - so a subdirectory returned after 85
+      // files was dropped before sorting could lift it to the top, leaving it invisible
+      // and the whole subtree unreachable. Files now fill only the room left over.
+      int dirs_found=0, files_found=0;
+      for (int wantdir=1; wantdir>=0; wantdir--) {
+        root.rewind();
+        while (file.openNext(&root, O_RDONLY) ) {
+          bool isdir = file.isDir();
+          if (file.isHidden() || (isdir?1:0)!=wantdir) { // wrong kind for this sweep
+            file.close();
+            continue;
+          }
+          if (isdir) dirs_found++; else files_found++;
 
-      //Serial.println(filename);
-
-      if (file.isHidden()) {
-        //    Serial.println("Skipped");
-      } else if (contfile<=84) { // bounds check: filelist/menu_ram hold at most 85 entries (0..84)
-        for(int x=0;x<48;x++) filelist[contfile*48+x]=filename[x];//   memcpy(filelist[contfile*48],filename,48);
-        direntry_isdir[contfile] = file.isDir() ? 1 : 0;
-        contfile++;
-      }
-      file.close();
+          if (contfile<=84) { // bounds check: filelist/menu_ram hold at most 85 entries (0..84)
+            memset(filename,32,sizeof(filename));
+            file.getName(filename, 48); // may fail/truncate silently for names >47 chars
+            filename[sizeof(filename)-1]=0; // force null-terminator so later strcat can't run past this buffer
+            for(int x=0;x<48;x++) filelist[contfile*48+x]=filename[x];//   memcpy(filelist[contfile*48],filename,48);
+            direntry_isdir[contfile] = isdir ? 1 : 0;
+            // A .a78 file starts with a 128-byte header that identify_cartridge() consumes
+            // before copying, so only the payload has to fit in rom_table. Without this a
+            // 7800 ROM of exactly 144KB (file size 147584) would be flagged despite loading
+            // whole. This mirrors what the loader really does: bytes are lost only when
+            // fileSize-header exceeds the buffer.
+            uint32_t payload = file.fileSize();
+            char *ext = strrchr(filename, '.');
+            if (ext && (ext[1]=='a'||ext[1]=='A') && ext[2]=='7' && ext[3]=='8' && payload>=0x80)
+              payload -= 0x80;
+            direntry_toobig[contfile] = (!isdir && payload > sizeof(rom_table)) ? 1 : 0;
+            contfile++;
+          }
+          file.close();
+        }
       }
 
       // pass 2: sort real entries (".." excluded) - directories first, alphabetical within each group
       sortFileList(firstentry, contfile-firstentry);
 
-      // pass 3: render sorted filelist into menu_ram (uppercase, directories flagged with high bit = yellow in menu)
+      // The 85-entry ceiling is a hard limit of the cart<->Atari protocol, so a directory
+      // with more entries is shown partially. Say so in the footer instead of silently
+      // hiding files - padded to 12 chars because unset bytes render as underscores.
+      {
+        int shown = contfile-firstentry, found = dirs_found+files_found;
+        char msg[20];
+        if (found > shown) {
+          char num[20];
+          snprintf(num, sizeof(num), "%d OF %d", shown, found);
+          snprintf(msg, sizeof(msg), "%-12.12s", num);
+          Serial.print("WARNING: directory holds ");Serial.print(found);
+          Serial.print(" entries, only ");Serial.print(shown);Serial.println(" fit in the menu");
+        } else {
+          snprintf(msg, sizeof(msg), "%-12.12s", MENU_FOOTER_TEXT);
+        }
+        set_menu_status_msg(msg);
+      }
+
+      // pass 3: render sorted filelist into menu_ram (uppercase; high bit of char[0] = directory,
+      // high bit of char[1] = oversized ROM - the glyph renderer masks it with AND #$7F)
       for (int idx=0; idx<contfile; idx++) {
         memset(atarifile,0,12);
         for (int i=0;i<12;i++) {
@@ -2290,6 +2347,7 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
           if ((atarifile[i]>96) && (atarifile[i]<123)) atarifile[i]=atarifile[i]-32;
           if (atarifile[i]==0) atarifile[i]=32;
           if ((i==0) && direntry_isdir[idx]) atarifile[i]=atarifile[i]|0x80;
+          if ((i==1) && direntry_toobig[idx]) atarifile[i]=atarifile[i]|0x80;
           menu_ram[idx*12+i]=atarifile[i];
         }
       }
@@ -2387,7 +2445,8 @@ void loop()
     // Warning, openNext starts at the current directory position
     // so a rewind of the directory may be required.
     
-     set_menu_status_msg("AOTTAv01 HR1"); // exactly 12 chars: the menu kernel renders 12 per row
+     set_menu_status_msg(MENU_FOOTER_TEXT);
+     menu_status[12] = OVERSIZED_COLOUR; // read by the menu kernel for oversized entries
    	 set_menu_status_byte(0);
 
   int i=0;
