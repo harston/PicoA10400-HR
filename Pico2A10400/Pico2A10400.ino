@@ -269,6 +269,18 @@ char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: l
 // hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
 // saturated (luminance A washed out to near-white). More saturated: $64. Brighter: $68.
 #define OVERSIZED_COLOUR 0x66
+
+// Marquee: the highlighted entry scrolls when its name is longer than the 12 columns
+// a row can show. Only that row moves - moving the cursor away restores the plain
+// beginning of the name. The cursor position is not visible to us on its own; the
+// menu kernel reports it once per frame by reading CART_CMD_CURSOR_n + row.
+#define MARQUEE_STEP_MS 280 // time per one-character step
+#define MARQUEE_HOLD    5   // steps held still at each end, so both ends stay readable
+volatile int cursor_row=0;  // row the Atari is highlighting
+int menu_count=0;           // entries currently in menu_ram (guards the row index)
+int marquee_row=-1;         // row being scrolled, -1 = none
+int marquee_tick=0;
+uint32_t marquee_last=0;
 uint8_t ram_table[32*1024];
 char path[128];
  char filetoopen[200]; // must hold path[128] + filename (up to 47 chars) + terminator; was 50, which overflowed with long names or subdirectories
@@ -706,6 +718,7 @@ void __time_critical_func(setup1()) {   //HandleBUS()
   //------------------------------------------------------------------
  
 #define CART_CMD_SEL_ITEM_n	0x1E00
+#define CART_CMD_CURSOR_n	0x1E80	// kernel reports the highlighted row here, once per frame
 #define CART_CMD_ROOT_DIR	0x1EF0
 #define CART_CMD_START_CART	0x1EFF
 #define CART_STATUS_BYTES	0x1FE0	// 16 bytes of status
@@ -736,8 +749,16 @@ start:
 				// on a 7800, we know we are in 2600 mode now.
 	      addrc= addr & 0x1fff;
         if ((addrc >= 0x1E00)&&(addrc<0x1F00)){
-            retaddr=addrc;	// atari 2600 has sent a command
-            if (addr==CART_CMD_START_CART) newgame=1; //goto ballout;
+            if ((addrc >= CART_CMD_CURSOR_n) && (addrc < CART_CMD_ROOT_DIR)) {
+              // Position report, not a command. It arrives every frame, so it must never
+              // land in retaddr: the kernel resumes browsing about one frame after a
+              // selection, and the next report would overwrite a command the main loop
+              // had not polled yet - which silently swallowed selections such as "..".
+              cursor_row = addrc - CART_CMD_CURSOR_n;
+            } else {
+              retaddr=addrc;	// atari 2600 has sent a command
+              if (addr==CART_CMD_START_CART) newgame=1; //goto ballout;
+            }
         } else if ((addrc >= 0x1800) && (addrc < 0x1C00)) {
 				    	gpio_put_masked(DATA_PIN_MASK,menu_ram[addr&0x3FF]<<D0_PIN);
           } else if ((addr & 0x1FF0) == CART_STATUS_BYTES) {
@@ -2249,10 +2270,25 @@ void sortFileList(int start, int count) {
   }
 }
 
+// Render one listing entry into the 12 bytes the Atari reads for that row.
+// off skips characters of the name, which is how the highlighted row scrolls. The high
+// bit of a character is never drawn (the glyph renderer masks with AND #$7F), so it
+// carries the colour flags - and those belong to fixed screen positions, not to the
+// characters, hence they are applied after the shift.
+void renderEntry(int idx, int off) {
+  for (int i=0;i<12;i++) {
+    char c = (off+i < 48) ? filelist[idx*48+off+i] : 32;
+    if ((c>96) && (c<123)) c=c-32; // the font has no lowercase letters
+    if (c==0) c=32;
+    if ((i==0) && direntry_isdir[idx]) c=c|0x80;
+    if ((i==1) && direntry_toobig[idx]) c=c|0x80;
+    menu_ram[idx*12+i]=c;
+  }
+}
+
 void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
   int contfile=0;
   char filename[48];
-  char atarifile[12];
 
   memset(filename,0,sizeof(filename));
   switch (tipo) {
@@ -2338,19 +2374,10 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
         set_menu_status_msg(msg);
       }
 
-      // pass 3: render sorted filelist into menu_ram (uppercase; high bit of char[0] = directory,
-      // high bit of char[1] = oversized ROM - the glyph renderer masks it with AND #$7F)
-      for (int idx=0; idx<contfile; idx++) {
-        memset(atarifile,0,12);
-        for (int i=0;i<12;i++) {
-          atarifile[i]=filelist[idx*48+i];
-          if ((atarifile[i]>96) && (atarifile[i]<123)) atarifile[i]=atarifile[i]-32;
-          if (atarifile[i]==0) atarifile[i]=32;
-          if ((i==0) && direntry_isdir[idx]) atarifile[i]=atarifile[i]|0x80;
-          if ((i==1) && direntry_toobig[idx]) atarifile[i]=atarifile[i]|0x80;
-          menu_ram[idx*12+i]=atarifile[i];
-        }
-      }
+      // pass 3: render every entry from its start (see renderEntry)
+      for (int idx=0; idx<contfile; idx++) renderEntry(idx, 0);
+      menu_count = contfile;
+      marquee_row = -1; // listing rebuilt: nothing is being scrolled yet
 
       //Serial.print("stop byte a:");Serial.println(contfile);
       menu_ram[(contfile)*12]=0;
@@ -2473,6 +2500,28 @@ void loop()
       } 
       retaddr=0;
     }
+
+   // Scroll the highlighted entry when its name does not fit in 12 columns.
+   if (menuletto && cursor_row>=0 && cursor_row<menu_count) {
+     if (cursor_row != marquee_row) {
+       if (marquee_row>=0 && marquee_row<menu_count) renderEntry(marquee_row, 0); // put the old row back
+       marquee_row = cursor_row;
+       marquee_tick = 0;
+       marquee_last = millis();
+       renderEntry(marquee_row, 0);
+     } else if (millis()-marquee_last > MARQUEE_STEP_MS) {
+       marquee_last = millis();
+       int len = strlen(&filelist[marquee_row*48]);
+       if (len > 12) {
+         int maxoff = len-12;
+         marquee_tick = (marquee_tick+1) % (maxoff + 2*MARQUEE_HOLD);
+         int off = marquee_tick < MARQUEE_HOLD          ? 0
+                 : marquee_tick < MARQUEE_HOLD + maxoff ? marquee_tick-MARQUEE_HOLD
+                                                        : maxoff;
+         renderEntry(marquee_row, off);
+       }
+     }
+   }
 
    if (cmd_exec!=0) {
     Serial.print("GC:");Serial.println(gamechoosen);
