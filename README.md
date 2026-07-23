@@ -1,3 +1,10 @@
+> ## ⚠️ HEADS UP, TRAVELER!
+> This is a **fork** of the original repo by Andrea Ottaviani: https://github.com/aotta/PicoA10400
+>
+> Changes here are highly experimental, occasionally hand-crafted by an AI with more confidence than reading comprehension, and come with an industry-standard **zero guarantee that anything works**. Flash at your own risk, and maybe keep a fire extinguisher nearby (for the vibes, not because Pico boards actually catch fire... probably).
+>
+> If you still decide to use it, do the right thing and drop a ⭐ on aotta's original repo. He did the actual hard work.
+
 # PicoA10400
 Flashcart for Atari 2600 and Atari 7800 based on Pico "Purple" clone, easy to build and cheap.
 This is a "double-face" flashcart, it could be used for both Atari 2600 and Atari 7800, simply rotating it and inserting the cart in different Atari!!
