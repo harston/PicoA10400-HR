@@ -261,10 +261,25 @@ unsigned int cart_size_bytes;
 //unsigned char rom_table[32*1024];
 char menu_status[16];
 uint8_t AR_ROM[8448*4];
-char filelist[85*48]; // 85 name of 48 chars max lenght
+// bugs/b01: file names were capped at 48 bytes (47 usable + terminator). SdFat's
+// getName8() correctly REFUSES to write past the buffer it's given (FsUtf::cpToMb
+// returns null when it runs out of room) - that is not a library bug. The bug was
+// entirely ours: real ROM names in ROMS/ run up to 61 chars, so any name >=48 chars
+// hit that refusal, and SdFat's own failure path then zeroed byte 0 of the (already
+// partially-written) buffer instead of the byte it had actually reached - producing
+// a name that starts with '\0' followed by real characters 1..46. That corrupted
+// sort order (a leading '\0' sorts before everything), marquee scrolling (strlen()
+// of a string starting with '\0' is 0), and loading (LoadGame() rebuilds the path
+// from this same corrupted string, so it silently re-opens the current directory
+// instead of the file). Fix: give the buffer enough room that real names never hit
+// SdFat's failure path in the first place. 80 covers the longest name currently in
+// ROMS/ (61) with margin; raise it if a longer name ever needs it. Verified via the
+// L<len>C<code> footer diagnostic (see bugs/b01/worklog.md) on real hardware.
+#define MAX_NAME_LEN 80
+char filelist[85*MAX_NAME_LEN]; // 85 entries, MAX_NAME_LEN bytes each (incl. terminator)
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
 char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: loaded truncated, shown red in the menu
-#define MENU_FOOTER_TEXT "AOTTAv01 HR2" // 12 chars: the menu kernel renders exactly 12 per row
+#define MENU_FOOTER_TEXT "AOTTAv01 HR3" // 12 chars: the menu kernel renders exactly 12 per row
 // Colour of oversized-ROM names. The kernel reads this at runtime from menu_status[12],
 // so changing it needs no ROM patch - just this line. $66 was picked by sweeping all 16
 // hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
@@ -284,7 +299,7 @@ int marquee_tick=0;
 uint32_t marquee_last=0;
 uint8_t ram_table[32*1024];
 char path[128];
- char filetoopen[200]; // must hold path[128] + filename (up to 47 chars) + terminator; was 50, which overflowed with long names or subdirectories
+ char filetoopen[256]; // must hold path[128] + filename (up to MAX_NAME_LEN-1 chars) + terminator; was 50, which overflowed with long names or subdirectories
  
 char menu_ram[1024];	// < NUM_DIR_ITEMS * 12 (85 max)
 char isfor7800=0;
@@ -2282,11 +2297,11 @@ void LoadGame(int numfile) {
   int verified=0;
   
   Serial.print("load game n.:");Serial.print(numfile);
-  Serial.print(" - ");Serial.println(filelist[numfile*48]);
+  Serial.print(" - ");Serial.println(filelist[numfile*MAX_NAME_LEN]);
 
-  char filetoadd[48];
-  for(int x=0;x<48;x++) filetoadd[x]=filelist[numfile*48+x];//   memcpy(filelist[contfile*48],filename,48);
-  filetoadd[47]=0; // guarantee null-terminator regardless of source name length
+  char filetoadd[MAX_NAME_LEN];
+  for(int x=0;x<MAX_NAME_LEN;x++) filetoadd[x]=filelist[numfile*MAX_NAME_LEN+x];
+  filetoadd[MAX_NAME_LEN-1]=0; // guarantee null-terminator regardless of source name length
 
   snprintf(filetoopen, sizeof(filetoopen), "%s%s", path, filetoadd); // bounds-checked; replaces unsafe strcat/strcat that overflowed filetoopen[50]
            
@@ -2362,7 +2377,7 @@ void printram() {
 void printfilelist() {
   Serial.println("----------------filelist-----------");
   for (int j=0;j<8;j++) {
-    Serial.print(filelist[j*48]);
+    Serial.print(filelist[j*MAX_NAME_LEN]);
   Serial.print(" ");Serial.println(j);
   }
 }
@@ -2373,7 +2388,7 @@ void printfilelist() {
 
 // case-insensitive compare of two null-terminated (or space-padded) filelist entries
 int compareNamesCI(const char* a, const char* b) {
-  for (int i=0;i<47;i++) {
+  for (int i=0;i<MAX_NAME_LEN-1;i++) {
     char ca=a[i], cb=b[i];
     if ((ca>96)&&(ca<123)) ca-=32;
     if ((cb>96)&&(cb<123)) cb-=32;
@@ -2393,15 +2408,15 @@ void sortFileList(int start, int count) {
       if (direntry_isdir[j]!=direntry_isdir[best]) {
         better = direntry_isdir[j]>direntry_isdir[best]; // directories before files
       } else {
-        better = compareNamesCI(&filelist[j*48], &filelist[best*48])<0;
+        better = compareNamesCI(&filelist[j*MAX_NAME_LEN], &filelist[best*MAX_NAME_LEN])<0;
       }
       if (better) best=j;
     }
     if (best!=i) {
-      char tmp[48];
-      memcpy(tmp,&filelist[i*48],48);
-      memcpy(&filelist[i*48],&filelist[best*48],48);
-      memcpy(&filelist[best*48],tmp,48);
+      char tmp[MAX_NAME_LEN];
+      memcpy(tmp,&filelist[i*MAX_NAME_LEN],MAX_NAME_LEN);
+      memcpy(&filelist[i*MAX_NAME_LEN],&filelist[best*MAX_NAME_LEN],MAX_NAME_LEN);
+      memcpy(&filelist[best*MAX_NAME_LEN],tmp,MAX_NAME_LEN);
       char t=direntry_isdir[i]; direntry_isdir[i]=direntry_isdir[best]; direntry_isdir[best]=t;
       t=direntry_toobig[i]; direntry_toobig[i]=direntry_toobig[best]; direntry_toobig[best]=t;
     }
@@ -2415,7 +2430,7 @@ void sortFileList(int start, int count) {
 // characters, hence they are applied after the shift.
 void renderEntry(int idx, int off) {
   for (int i=0;i<12;i++) {
-    char c = (off+i < 48) ? filelist[idx*48+off+i] : 32;
+    char c = (off+i < MAX_NAME_LEN) ? filelist[idx*MAX_NAME_LEN+off+i] : 32;
     if ((c>96) && (c<123)) c=c-32; // the font has no lowercase letters
     if (c==0) c=32;
     if ((i==0) && direntry_isdir[idx]) c=c|0x80;
@@ -2426,7 +2441,7 @@ void renderEntry(int idx, int off) {
 
 void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
   int contfile=0;
-  char filename[48];
+  char filename[MAX_NAME_LEN];
 
   memset(filename,0,sizeof(filename));
   switch (tipo) {
@@ -2446,7 +2461,7 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
        //    Serial.println("subdir, adding ..");
            memset(filename,0,sizeof(filename));
            memcpy(filename,"..",2); // no trailing padding: filetoadd is read as a C-string (checkDirUp needs it to end in "..")
-           for(int x=0;x<48;x++) filelist[contfile*48+x]=filename[x];//   memcpy(filelist[contfile*48],filename,48);
+           for(int x=0;x<MAX_NAME_LEN;x++) filelist[contfile*MAX_NAME_LEN+x]=filename[x];
         contfile++;
         firstentry=1;
       }
@@ -2471,9 +2486,11 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
 
           if (contfile<=84) { // bounds check: filelist/menu_ram hold at most 85 entries (0..84)
             memset(filename,32,sizeof(filename));
-            file.getName(filename, 48); // may fail/truncate silently for names >47 chars
+            // MAX_NAME_LEN-1 usable chars + terminator: see the bugs/b01 note by the
+            // filelist declaration for why this must stay >= the longest real ROM name.
+            file.getName(filename, MAX_NAME_LEN);
             filename[sizeof(filename)-1]=0; // force null-terminator so later strcat can't run past this buffer
-            for(int x=0;x<48;x++) filelist[contfile*48+x]=filename[x];//   memcpy(filelist[contfile*48],filename,48);
+            for(int x=0;x<MAX_NAME_LEN;x++) filelist[contfile*MAX_NAME_LEN+x]=filename[x];
             direntry_isdir[contfile] = isdir ? 1 : 0;
             // A .a78 file starts with a 128-byte header that identify_cartridge() consumes
             // before copying, so only the payload has to fit in rom_table. Without this a
@@ -2649,7 +2666,7 @@ void loop()
        renderEntry(marquee_row, 0);
      } else if (millis()-marquee_last > MARQUEE_STEP_MS) {
        marquee_last = millis();
-       int len = strlen(&filelist[marquee_row*48]);
+       int len = strlen(&filelist[marquee_row*MAX_NAME_LEN]);
        if (len > 12) {
          int maxoff = len-12;
          marquee_tick = (marquee_tick+1) % (maxoff + 2*MARQUEE_HOLD);
