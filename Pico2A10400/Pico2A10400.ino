@@ -279,12 +279,20 @@ uint8_t AR_ROM[8448*4];
 char filelist[85*MAX_NAME_LEN]; // 85 entries, MAX_NAME_LEN bytes each (incl. terminator)
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
 char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: loaded truncated, shown red in the menu
-#define MENU_FOOTER_TEXT "AOTTAv01 HR3" // 12 chars: the menu kernel renders exactly 12 per row
+#define MENU_FOOTER_TEXT "AOTTAv01 HR4" // 12 chars: the menu kernel renders exactly 12 per row
 // Colour of oversized-ROM names. The kernel reads this at runtime from menu_status[12],
 // so changing it needs no ROM patch - just this line. $66 was picked by sweeping all 16
 // hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
 // saturated (luminance A washed out to near-white). More saturated: $64. Brighter: $68.
 #define OVERSIZED_COLOUR 0x66
+
+// Core-1 clock used while a 7800 cart type is being emulated (cart_to_emulate>=33 on
+// this board). Everything else - menu, USB, 2600 types - keeps the 250MHz set in
+// setup(). Kept in sync with PicoA10400.ino, where the full reasoning lives:
+// the measured response path is ~18 instructions against MARIA's ~279ns tightest
+// cartridge access, so 250MHz still leaves ~3.9x margin while 400000 was ~2.7x past
+// the RP2350's 150MHz spec. Single-variable change - the 1.25V below is unchanged.
+#define EMU_CLOCK_KHZ 250000
 
 // Marquee: the highlighted entry scrolls when its name is longer than the 12 columns
 // a row can show. Only that row moves - moving the cursor away restores the plain
@@ -534,7 +542,19 @@ void __time_critical_func(emulate_supercart_ef()) {
                         // Bankswitching write
                         SET_DATA_MODE_IN;
                         // Check for 0x01
-                        rawaddr = gpio_get_all();
+                        // Krok 20: end-of-cycle capture - see emulate_supercart_ram()
+                        // for the reasoning. Bounded at 64 turns; A15 is gpio 26 here so
+                        // the comparison uses BUS15_PIN_MASK.
+                        {
+                          uint32_t last = gpio_get_all(), cur;
+                          uint32_t full = last & BUS15_PIN_MASK;
+                          for (uint32_t g = 0; g < 64; g++) {
+                              cur = gpio_get_all();
+                              if ((cur & BUS15_PIN_MASK) != full) break;
+                              last = cur;
+                          }
+                          rawaddr = last;
+                        }
                         switch ((rawaddr >> D0_PIN) & 0xff) {
                         case 0:
                             bank = 0;
@@ -613,7 +633,17 @@ void __time_critical_func(emulate_supercart_ram()) {
       const uint32_t fixed_base = (uint32_t)romLen - 0x8000;
       uint32_t addr=0, addr_prev=0, rawaddr=0;
       uint8_t rom_in_use=1;
-      
+      // Bank-number mask derived from the real ROM size, mirroring MAME
+      // (a78_slot.cpp:74-77 + rom.cpp:388: data & m_bank_mask, where
+      // m_bank_mask = (nbanks odd) ? nbanks-2 : nbanks-1) and ProSystem/JS7800
+      // (Cartridge.js:729, which instead drops any write with bank >= size/16384).
+      // For the 128KB/8-bank carts this type actually sees, this is exactly the
+      // "& 0x07" that used to be hardcoded here; deriving it keeps PicoA10400 and
+      // Pico2A10400 identical and stays correct for 4/9/16-bank carts too.
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
+
       while (1) {    // Get address
              // Get address
         rawaddr = gpio_get_all();
@@ -650,8 +680,25 @@ void __time_critical_func(emulate_supercart_ram()) {
                     if (rawaddr == A15_PIN_MASK) {
                         // Bankswitching write
                         SET_DATA_MODE_IN;
-                        // Check for 0x01
-                        bank = ((rawaddr >> D0_PIN) & 0x07) * 0x4000;
+                        // Krok 14b BUG: rawaddr still held the RW/A15-masked value from
+                        // the test above, so inside this branch it is exactly A15_PIN_MASK
+                        // and every data bit in it is 0 - ((0x04000000 >> 15) & 0x07) is a
+                        // constant 0. A bankswitch write always selected bank 0, so no
+                        // SUPERCART_RAM cart could ever leave its first 16KB bank on this
+                        // board. Krok 19: and the byte must come from the END of the write
+                        // cycle - a 6502 does not drive the data lines until the second
+                        // half of the cycle. Bounded (see PicoA10400.ino for the cycle
+                        // arithmetic); an unbounded wait here hung the cart in Krok 18.
+                        // A15 is gpio 26 on this board and sits OUTSIDE BUS_PIN_MASK, so
+                        // end-of-cycle detection must compare BUS15_PIN_MASK.
+                        uint32_t last = gpio_get_all(), cur;
+                        uint32_t full = last & BUS15_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS15_PIN_MASK) != full) break;
+                            last = cur;
+                        }
+                        bank = ((last >> D0_PIN) & sc_bank_mask) * 0x4000;
                         rom_in_use = 0;
                     }
                 }
@@ -673,8 +720,17 @@ void __time_critical_func(emulate_supercart_ram()) {
                   if (rawaddr == A14_PIN_MASK) {
                      // Write cycle
                         SET_DATA_MODE_IN;
-                        rawaddr = gpio_get_all();
-                        ram_table[rawaddr & 0x3fff] = (rawaddr >> D0_PIN) & 0xff;
+                        // Krok 19: end-of-cycle capture, same reasoning as the bank
+                        // register above. 'addr' is already a 14-bit offset here, so keep
+                        // a full-width address for the comparison.
+                        uint32_t wlast = gpio_get_all(), wcur;
+                        uint32_t wfull = wlast & BUS15_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            wcur = gpio_get_all();
+                            if ((wcur & BUS15_PIN_MASK) != wfull) break;
+                            wlast = wcur;
+                        }
+                        ram_table[wlast & 0x3fff] = (wlast >> D0_PIN) & 0xff;
                         rom_in_use = 0;
                   } else {
                     if (rom_in_use) {
@@ -758,7 +814,22 @@ void __time_critical_func(emulate_supercart_large()) {
                     if (rawaddr == A15_PIN_MASK) {
                         // Bankswitching write
                         SET_DATA_MODE_IN;
-                        rawaddr = gpio_get_all();
+                        // Krok 20: end-of-cycle capture, proven on CART_TYPE_SUPERCART_RAM
+                        // in Krok 19 - the 6502 drives the data lines only in the second
+                        // half of a write cycle, and this polling loop catches the write at
+                        // a random phase. Bounded at 64 turns; an unbounded wait hung the
+                        // cart in Krok 18. A15 is gpio 26 here, outside BUS_PIN_MASK, so
+                        // compare BUS15_PIN_MASK.
+                        {
+                          uint32_t last = gpio_get_all(), cur;
+                          uint32_t full = last & BUS15_PIN_MASK;
+                          for (uint32_t g = 0; g < 64; g++) {
+                              cur = gpio_get_all();
+                              if ((cur & BUS15_PIN_MASK) != full) break;
+                              last = cur;
+                          }
+                          rawaddr = last;
+                        }
                         // Mask 7, not 0xF: MAME computes bank_mask=7 for a 9-bank (144KB)
                         // image and wraps the written value against it. With 0xF a stray
                         // write of 8..15 would select "file banks 9..16", i.e. read past
@@ -910,6 +981,135 @@ void __time_critical_func(emulate_supercharger_cartridge())  {
 	}
  }
 
+// not_working_roms4: CART_TYPE_NORMALA78 and CART_TYPE_ABSOLUTE are just as
+// real a 7800/MARIA game as CART_TYPE_SUPERCART_RAM etc. (same tight DMA
+// response window), but never got the "P2" treatment already given to
+// emulate_activision()/emulate_supercart_*() on this board: core-1 IRQs left
+// on, and (for the 32k path here) a SET_DATA_MODE_OUT / wait / SET_DATA_MODE_IN
+// dance on every single access instead of the rom_in_use-cached direction
+// those functions use. They ran inline inside setup1() instead - which is
+// itself built at -O3 (see the #pragma block below), so this is purely the
+// same gap noted on those other functions: no cpsid i, and gpio_put_masked()
+// (a call+return per bus response, confirmed call-only via check_hotpath.sh -
+// no flash veneer) instead of a single inlined SIO store.
+// User-visible motivation: "7800 XMAS" (SUPERCART_RAM, already P2-hardened)
+// showed visibly fewer in-game artifacts than CART_TYPE_NORMALA78 titles
+// (2600 Maze Pac-Man, 3D Worldrunner) on the same hardware. Pure extraction
+// otherwise: logic - including the bugs/b01 16k A14+A15 fix, the 32k path's
+// per-access direction toggling, and the 48k/ABSOLUTE paths' rom_in_use
+// caching and RW_PIN_MASK-based bankswitch-write detection - is unchanged,
+// only where it lives and how it drives the bus changed. Diagnostic - not
+// yet confirmed on hardware to actually reduce artifacts; see
+// not_working_roms4/README.md.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_normala78()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  uint32_t addr=0, addr_prev=0, rawaddr=0;
+  // not_working_roms4 "Krok 21" - one general mapping instead of three hardcoded
+  // size cases, taken from MAME's a78_rom_device::read_40xx (rom.cpp:257-263):
+  // a flat cart sits at the TOP of the address space (m_base_rom = 0x10000 - size)
+  // and stays silent below its own start. The old code only handled 16k/32k/48k;
+  // any other size fell through and drove nothing at all - a blank screen. In this
+  // library that silently broke "7ix" (28KB) and "Bouncing Balls (Demo)" (8KB).
+  // See PicoA10400.ino for the equivalence proof against the three old cases.
+  //
+  // Board difference (NOT a copy of PicoA10400.ino): here BUS_PIN_MASK covers only
+  // A0-A14 and A15 is gpio 26, so the full 16-bit address has to be reassembled
+  // before it can be compared against a $0000-$FFFF boundary, and the wait for the
+  // cycle to end compares BUS15_PIN_MASK.
+  const uint32_t base_rom = (romLen >= 0x10000) ? 0x4000 : (0x10000 - (uint32_t)romLen);
+  const uint32_t lo = (base_rom < 0x4000) ? 0x4000 : base_rom;
+
+  while (1) {
+    // wait for a stable full address (A0-A14 plus A15 on gpio 26)
+    while ((rawaddr = (gpio_get_all()&BUS15_PIN_MASK)) != addr_prev)
+      addr_prev = rawaddr;
+    addr = (rawaddr & BUS_PIN_MASK) | ((rawaddr & A15_PIN_MASK) ? 0x8000 : 0);
+    if (addr >= lo) {
+      sio_hw->gpio_out = (uint32_t)rom_table[addr - base_rom] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+      SET_DATA_MODE_OUT;
+      // wait for address bus to change
+      while ((gpio_get_all()&BUS15_PIN_MASK) == rawaddr) ;
+      SET_DATA_MODE_IN;
+    }
+  }
+}
+
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_absolute()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  // Continually check address lines and put associated data on bus.
+  uint32_t addr=0, rawaddr=0;
+  uint32_t bank=0x4000;
+  uint8_t rom_in_use=1;
+  while (1) {       // Get address
+    rawaddr = gpio_get_all();
+    addr=rawaddr & BUS_PIN_MASK;
+ // Check for A15
+    if (rawaddr & A15_PIN_MASK) {
+        addr |= 0x8000;
+        // Set the data on the bus
+        sio_hw->gpio_out = (uint32_t)rom_table[addr] << D0_PIN;
+        // Check for RW
+      if (rawaddr & RW_PIN_MASK) {
+            // Read cycle
+            if (!rom_in_use) {
+                SET_DATA_MODE_OUT;
+                rom_in_use = 1;
+            }
+        } else {
+            // Write cycle to ROM
+            rawaddr = gpio_get_all() & (BUS15_PIN_MASK | RW_PIN_MASK);
+            // Check for bankswitch
+            if (rawaddr == A15_PIN_MASK) {
+                // Bankswitching write
+                SET_DATA_MODE_IN;
+                // Check for 0x01
+                      // Krok 20: end-of-cycle capture - see emulate_supercart_ram()
+                      // for the reasoning. Bounded at 64 turns; A15 is gpio 26 here so
+                      // the comparison uses BUS15_PIN_MASK.
+                      {
+                        uint32_t last = gpio_get_all(), cur;
+                        uint32_t full = last & BUS15_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS15_PIN_MASK) != full) break;
+                            last = cur;
+                        }
+                        rawaddr = last;
+                      }
+                if ((rawaddr & DATA_PIN_MASK) == 0x008000) {
+                    // Switch to flying mode
+                    bank = 0;
+                } else {
+                    if ((rawaddr & DATA_PIN_MASK) == 0x010000) {
+                        // Switch to title page
+                        bank = 0x4000;
+                    }
+                }
+                rom_in_use = 0;
+            }
+        }
+    } else {
+        // Check for A14
+        if (addr & A14_PIN_MASK) {
+            // Set the data on the bus
+            sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;
+            if (!rom_in_use) {
+                SET_DATA_MODE_OUT;
+                rom_in_use = 1;
+            }
+        } else {
+            if (rom_in_use) {
+                SET_DATA_MODE_IN;
+                rom_in_use = 0;
+            }
+        }
+      }
+    }
+}
+
+
 
 ////////////////////////////////////////////////////////////////////////////////////
 //                     HANDLE BUS
@@ -1009,7 +1209,7 @@ start:
   
   if (cart_to_emulate>=33) {
    vreg_set_voltage(VREG_VOLTAGE_1_25);
-   int ret=set_sys_clock_khz(400000, true); // settled in compiler IDE as 250mhz overclocked
+   int ret=set_sys_clock_khz(EMU_CLOCK_KHZ, true); // was hardcoded 400000 - see EMU_CLOCK_KHZ
   }
   if (cart_to_emulate<=32) {
    gpio_set_dir_out_masked(BUS_H_PIN_MASK);
@@ -1041,126 +1241,11 @@ start:
         break;
     
     case CART_TYPE_NORMALA78:
-      if (romLen==1024*16) { //16k
-	      while (1) {  
-		      while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
-			      addr_prev = addr;
-   	      // got a stable address
-		      if (addr & 0x4000) 	{ // A14 
-				    gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0x3FFF]<<D0_PIN);	
-		        SET_DATA_MODE_OUT;
-				    // wait for address bus to change
-				    while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
-				    SET_DATA_MODE_IN;
-          }
-        } 
-      } else if  (romLen==0x8000) { // 32k   
-     	  while (1)   {
-          rawaddr = (gpio_get_all());
-			    //  addr_prev = rawaddr;
-          addr=rawaddr & BUS_PIN_MASK;
-   	      // got a stable address
-      	  if (rawaddr & A15_PIN_MASK)	{ // A15 high
-            addr=addr | 0x8000;
-            gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0x7fff]<<D0_PIN);	
-		        SET_DATA_MODE_OUT;
-				    // wait for address bus to change
-				//    while ((gpio_get_all()&BUS_PIN_MASK) == (addr & BUS_PIN_MASK)) ;
-				    while ((gpio_get_all() &BUS15_PIN_MASK) == addr) ;
-				    SET_DATA_MODE_IN;
-          }
-        }
-      } else if  (romLen==0xc000) { // 48k   
-        SET_DATA_MODE_OUT;
-     	  while (1)   {
-         // Get address
-        rawaddr = gpio_get_all();
-        addr = rawaddr & BUS_PIN_MASK;
-        // Check for A15
-        if (rawaddr & A15_PIN_MASK) {
-            addr |= 0x8000;
-            // Set the data on the bus
-            gpio_put_masked(DATA_PIN_MASK, rom_table[addr-0x4000] << D0_PIN);
-            if (!rom_in_use) {
-                SET_DATA_MODE_OUT;
-                rom_in_use = 1;
-            }
-        } else {
-            // Check for A14
-            if (addr & A14_PIN_MASK) {
-                // Set the data on the bus
-                gpio_put_masked(DATA_PIN_MASK, rom_table[addr-0x4000] << D0_PIN);
-                if (!rom_in_use) {
-                    SET_DATA_MODE_OUT;
-                    rom_in_use = 1;
-                }
-            } else {
-                if (rom_in_use) {
-                    SET_DATA_MODE_IN;
-                    rom_in_use = 0;
-                }
-            }
-          }
-        }
-      } 
+      emulate_normala78();
     break;
- 
+
     case CART_TYPE_ABSOLUTE:
-      // Continually check address lines and put associated data on bus.
-      bank=0x4000;
-      while (1) {       // Get address
-        rawaddr = gpio_get_all();
-        addr=rawaddr & BUS_PIN_MASK;
-     // Check for A15
-        if (rawaddr & A15_PIN_MASK) {
-            addr |= 0x8000;
-            // Set the data on the bus
-            gpio_put_masked(DATA_PIN_MASK, rom_table[addr] << D0_PIN);
-            // Check for RW
-	      if (rawaddr & RW_PIN_MASK) {
-                // Read cycle
-                if (!rom_in_use) {
-                    SET_DATA_MODE_OUT;
-                    rom_in_use = 1;
-                }
-            } else {
-                // Write cycle to ROM
-                rawaddr = gpio_get_all() & (BUS15_PIN_MASK | RW_PIN_MASK);
-                // Check for bankswitch
-                if (rawaddr == A15_PIN_MASK) {
-                    // Bankswitching write
-                    SET_DATA_MODE_IN;
-                    // Check for 0x01
-                    rawaddr = gpio_get_all();
-                    if ((rawaddr & DATA_PIN_MASK) == 0x008000) {
-                        // Switch to flying mode
-                        bank = 0;
-                    } else {
-                        if ((rawaddr & DATA_PIN_MASK) == 0x010000) {
-                            // Switch to title page
-                            bank = 0x4000;
-                        }
-                    }
-                    rom_in_use = 0;
-                }
-            }
-        } else {
-            // Check for A14
-            if (addr & A14_PIN_MASK) {
-                // Set the data on the bus
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) + bank] << D0_PIN);
-                if (!rom_in_use) {
-                    SET_DATA_MODE_OUT;
-                    rom_in_use = 1;
-                }
-            } else {
-                if (rom_in_use) {
-                    SET_DATA_MODE_IN;
-                    rom_in_use = 0;
-                }
-            }
-          }
-        }
+      emulate_absolute();
        break;
     case CART_TYPE_2K:
     	while (1)  {

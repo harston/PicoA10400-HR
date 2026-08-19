@@ -267,12 +267,32 @@ uint8_t AR_ROM[8448*4];
 char filelist[85*MAX_NAME_LEN]; // 85 entries, MAX_NAME_LEN bytes each (incl. terminator)
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
 char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: loaded truncated, shown red in the menu
-#define MENU_FOOTER_TEXT "AOTTAv01 HR3" // 12 chars: the menu kernel renders exactly 12 per row
+#define MENU_FOOTER_TEXT "AOTTAv01 HR4" // 12 chars: the menu kernel renders exactly 12 per row
 // Colour of oversized-ROM names. The kernel reads this at runtime from menu_status[12],
 // so changing it needs no ROM patch - just this line. $66 was picked by sweeping all 16
 // hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
 // saturated (luminance A washed out to near-white). More saturated: $64. Brighter: $68.
 #define OVERSIZED_COLOUR 0x66
+
+// Core-1 clock used while a 7800 cart type is being emulated (cart_to_emulate>=35).
+// Everything else - menu, USB, 2600 types - keeps the 250MHz/1.15V set in setup().
+//
+// not_working_roms4 "Krok 13/17": the 400000 this used to be is ~3x past the RP2040's
+// 133MHz spec, and the measured timing budget says it buys nothing. Response path in
+// emulate_supercart_ram() is 18 instructions (objdump), and MARIA's tightest cartridge
+// access interval is ~279ns (maria.cpp cost model at 7.159MHz):
+//     400MHz -> 45ns typical / 107ns worst case   (~6x margin)
+//     250MHz -> 72ns typical / 172ns worst case   (~3.9x margin)
+// Both fit comfortably, and both are faster than the 150-250ns mask ROMs MARIA was
+// designed against. So this is a pure stability experiment: if artifacts drop at
+// 250MHz, the overclock was CAUSING them rather than preventing them - which is also
+// what upstream's own "set to 1_15 or 1_20 if you experience some glitches" comment
+// in setup() hints at. Deliberately a single-variable change: the voltage below stays
+// at 1.30V, so any difference is attributable to the clock alone (a higher voltage at
+// a lower clock only widens internal timing margin, it cannot cause logic errors).
+// If 250000 helps, the follow-ups worth trying are 200000, and then dropping the
+// voltage to VREG_VOLTAGE_1_20 to cut heat.
+#define EMU_CLOCK_KHZ 250000
 
 // Marquee: the highlighted entry scrolls when its name is longer than the 12 columns
 // a row can show. Only that row moves - moving the cursor away restores the plain
@@ -483,7 +503,12 @@ void __time_critical_func(emulate_supercart_ef()) {
   __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
       uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
       uint8_t rom_in_use=1;
-      
+      // Bank-number mask derived from the real ROM size - see the identical
+      // comment in emulate_supercart_ram() for the full reasoning and sources.
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
+
       while (1) {    // Get address
              // Get address
         rawaddr = gpio_get_all();
@@ -520,9 +545,23 @@ void __time_critical_func(emulate_supercart_ef()) {
                     if (rawaddr == A15_PIN_MASK) {
                         // Bankswitching write
                         SET_DATA_MODE_IN;
-                        // Check for 0x01
-                        rawaddr = gpio_get_all();
-                        bank=((rawaddr >> D0_PIN) & 0xf)*0x4000;
+                        // Krok 20: end-of-cycle capture, proven on CART_TYPE_SUPERCART_RAM
+                        // in Krok 19. The 6502 does not drive the data lines until the
+                        // second half of a write cycle, and this loop polls, so it spots
+                        // the write at a random phase - sampling here reads the bus before
+                        // the CPU has driven it roughly half the time. Keep the last value
+                        // seen while the address was still valid. Bounded at 64 turns
+                        // (~2x one 6502 cycle at 250MHz): an unbounded wait hung the cart
+                        // in Krok 18. Note the 2600 paths in setup1() have always used
+                        // this shape ("while (addr unchanged) { data_prev = data; ... }");
+                        // only the 7800 SuperGame paths were missing it.
+                        uint32_t last = gpio_get_all(), cur;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS_PIN_MASK) != addr) break;
+                            last = cur;
+                        }
+                        bank=((last >> D0_PIN) & sc_bank_mask)*0x4000;  // was & 0xf - see the mask comment above
                         rom_in_use = 0;
                     }
                 }
@@ -573,6 +612,28 @@ void __time_critical_func(emulate_supercart_ram()) {
       const uint32_t fixed_base = (uint32_t)romLen - 0x8000;
       uint32_t addr=0, addr_prev=0, rawaddr=0;
       uint8_t rom_in_use=1;
+      // not_working_roms4 "Przypadek 3": the bank number latched on a $8000-$BFFF
+      // write used to be masked with a fixed "& 0xf", i.e. 16 banks, no matter how
+      // big the cart actually is. Both reference implementations bound it to the
+      // real ROM instead:
+      //   MAME  a78_slot.cpp:74-77 + rom.cpp:388 - m_bank = data & m_bank_mask,
+      //         where m_bank_mask = (nbanks odd) ? nbanks-2 : nbanks-1;
+      //   ProSystem/JS7800 Cartridge.js:729 - the write is IGNORED entirely unless
+      //         cartridge_GetBank(data) < size/16384.
+      // Every SUPERCART_RAM cart in this library is 128KB = 8 banks, so the old
+      // mask let a bankswitch write select banks 8-15, which do not exist: bank 8
+      // reads whatever the previously loaded game left in rom_table (it is never
+      // cleared between loads), banks 9-15 index past the 144KB array altogether -
+      // straight into the TinyUSB descriptors, per CLAUDE.md. That matters even for
+      // a well-behaved ROM, because this firmware samples the data bus on a write at
+      // a moment of its own choosing rather than on the CPU's write strobe: a single
+      // misread D3 turns a legal "select bank 5" into "show 16KB of garbage until the
+      // next bankswitch" - transient corruption that appears and disappears, which is
+      // exactly the reported symptom. Pico2A10400 already hardcoded "& 0x07" here;
+      // deriving the mask keeps both boards correct for 4/8/9/16-bank carts alike.
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
       
       while (1) {    // Get address
              // Get address
@@ -611,9 +672,27 @@ void __time_critical_func(emulate_supercart_ram()) {
                     if (rawaddr == A15_PIN_MASK) {
                         // Bankswitching write
                         SET_DATA_MODE_IN;
-                        // Check for 0x01
-                        rawaddr = gpio_get_all();
-                        bank=((rawaddr >> D0_PIN) & 0xf)*0x4000;
+                        // not_working_roms4 "Krok 19": a 6502 puts address and R/W up at
+                        // the start of a cycle but does not drive the data lines until its
+                        // second half, so grabbing the byte here - a few instructions after
+                        // spotting the write - reads the bus before the CPU has driven it.
+                        // Because this loop polls, it catches the write at a random phase,
+                        // so the byte is sometimes good and sometimes garbage: intermittent
+                        // wrong-bank corruption, i.e. 16KB of the wrong graphics until the
+                        // next bankswitch. Take instead the LAST sample seen while the
+                        // address was still valid (= end of the write cycle, data settled).
+                        // BOUNDED on purpose: Krok 18 used an unbounded wait here and the
+                        // cart hung (yellow screen). One 6502 cycle at 250MHz is ~140 Pico
+                        // cycles and this spin is ~5 cycles per turn, so ~28 turns covers a
+                        // whole bus cycle; 64 gives 2x headroom while capping the time we
+                        // can ever stop serving the bus at well under 1.5us.
+                        uint32_t last = gpio_get_all(), cur;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS_PIN_MASK) != addr) break;
+                            last = cur;
+                        }
+                        bank=((last >> D0_PIN) & sc_bank_mask)*0x4000;  // was & 0xf
                         rom_in_use = 0;
                     }
                 }
@@ -635,8 +714,20 @@ void __time_critical_func(emulate_supercart_ram()) {
                   if (rawaddr == A14_PIN_MASK) {
                      // Write cycle
                         SET_DATA_MODE_IN;
-                        rawaddr = gpio_get_all();
-                        ram_table[rawaddr & 0x3fff] = (rawaddr >> D0_PIN) & 0xff;
+                        // Krok 19: same end-of-cycle capture as the bank register above.
+                        // This path corrupts whatever the game just stored in on-cart RAM,
+                        // which for these carts is graphics - so a byte sampled before the
+                        // 6502 drives it shows up directly on screen. 'addr' has already
+                        // been narrowed to a 14-bit offset here, so compare a full-width
+                        // address captured now.
+                        uint32_t wlast = gpio_get_all(), wcur;
+                        uint32_t waddr = wlast & BUS_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            wcur = gpio_get_all();
+                            if ((wcur & BUS_PIN_MASK) != waddr) break;
+                            wlast = wcur;
+                        }
+                        ram_table[waddr & 0x3fff] = (wlast >> D0_PIN) & 0xff;
                         rom_in_use = 0;
                   } else {
                     if (rom_in_use) {
@@ -715,7 +806,18 @@ void __time_critical_func(emulate_supercart_large()) {
                     if (rawaddr == A15_PIN_MASK) {
                         // Bankswitching write
                         SET_DATA_MODE_IN;
-                        rawaddr = gpio_get_all();
+                        // Krok 20: end-of-cycle capture - see emulate_supercart_ef() above
+                        // for the full reasoning. Directly relevant here: the comment below
+                        // notes Alien Brigade writes values it loaded from memory, so a
+                        // half-driven bus sampled too early is exactly how a legal bank
+                        // number turns into a wrong one.
+                        uint32_t last = gpio_get_all(), cur;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS_PIN_MASK) != addr) break;
+                            last = cur;
+                        }
+                        rawaddr = last;
                         // Mask 7, not 0xF: MAME computes bank_mask=7 for a 9-bank (144KB)
                         // image and wraps the written value against it. With 0xF a stray
                         // write of 8..15 would select "file banks 9..16", i.e. read past
@@ -867,6 +969,122 @@ void __time_critical_func(emulate_supercharger_cartridge())  {
 	}
  }
 
+// not_working_roms4: CART_TYPE_NORMALA78 and CART_TYPE_ABSOLUTE are just as
+// real a 7800/MARIA game as CART_TYPE_SUPERCART_RAM etc. (same tight DMA
+// response window), but - unlike every SuperGame/Activision/Supercharger path
+// above - never got the 0.09-0.13 hardening, because those patches were
+// scoped to specific bug reports (Alien Brigade, Ikari Warriors, Double
+// Dragon, Rampage), not a full audit of every cart type. They ran inline
+// inside setup1() instead, which IS built at -O3 (see the #pragma block
+// below) - so the missing piece here is not optimization level, it's:
+//   1. cpsid i - setup1() itself never disables core-1 IRQs, so every inline
+//      case (including these two) was exposed the whole game, not just once
+//      at startup.
+//   2. gpio_put_masked() - even at -O3 this compiles to a call into a small
+//      shared RAM-resident helper (verified with check_hotpath.sh: no flash
+//      veneer here, unlike the pre-0.09 bug, but still a call+return on every
+//      single bus response) instead of the single inlined SIO store the
+//      functions above use.
+// User-visible motivation: "7800 XMAS" (SUPERCART_RAM, hardened) showed
+// visibly fewer in-game artifacts than CART_TYPE_NORMALA78 titles (2600 Maze
+// Pac-Man, 3D Worldrunner) on the same hardware. Pure extraction otherwise:
+// logic (including the bugs/b01 16k A14+A15 fix) is unchanged, only where it
+// lives and how it answers the bus changed. Diagnostic - not yet confirmed
+// on hardware to actually reduce artifacts; see not_working_roms4/README.md.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_normala78()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  uint32_t addr, addr_prev = 0;
+  // not_working_roms4 "Krok 21": one general mapping instead of three hardcoded
+  // size cases. Straight from MAME's a78_rom_device::read_40xx (rom.cpp:257-263),
+  // which is the authority for every flat 7800 cart:
+  //
+  //     m_base_rom = 0x10000 - size;
+  //     if (offset + 0x4000 < m_base_rom) return 0xff;      // open bus
+  //     else return m_rom[offset + 0x4000 - m_base_rom];
+  //
+  // i.e. a flat cart is mapped to the TOP of the address space and stays silent
+  // below its own start. The old code hardcoded that for exactly three sizes -
+  // 16k/32k/48k - and any other size fell through the if/else chain and drove
+  // nothing at all, which is a white/blank screen. In this library that silently
+  // broke "7ix" (28KB) and "Bouncing Balls (Demo)" (8KB).
+  //
+  // Verified equivalent to the old code for all three sizes it did handle:
+  //   16k: base=0xC000 -> answers $C000-$FFFF, index addr-0xC000 == addr&0x3FFF
+  //   32k: base=0x8000 -> answers $8000-$FFFF, index addr-0x8000 == addr&0x7FFF
+  //   48k: base=0x4000 -> answers $4000-$FFFF, index addr-0x4000, which for
+  //        $4000-$7FFF equals the old (addr&0x7fff-0x4000) - that expression is
+  //        really addr&0x3FFF, since 0x7fff-0x4000 binds first.
+  // The 16k case keeps the bugs/b01 behaviour (silent in $4000-$BFFF, so a POKEY
+  // at $4000 is not fought over) - it falls out of the same formula.
+  //
+  // The 0x4000 floor is a safety net, not part of MAME's formula: the cartridge
+  // slot only decodes $4000-$FFFF, so a hypothetical >=64KB flat image must never
+  // make this drive over TIA/RIOT/console RAM below $4000.
+  const uint32_t base_rom = (romLen >= 0x10000) ? 0x4000 : (0x10000 - (uint32_t)romLen);
+  const uint32_t lo = (base_rom < 0x4000) ? 0x4000 : base_rom;
+
+  while (1) {
+    while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+      addr_prev = addr;
+    // got a stable address
+    if (addr >= lo) {
+      sio_hw->gpio_out = (uint32_t)rom_table[addr - base_rom] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+      SET_DATA_MODE_OUT;
+      // wait for address bus to change
+      while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+      SET_DATA_MODE_IN;
+    }
+  }
+}
+
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_absolute()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  // Continually check address lines and put associated data on bus.
+  uint32_t addr;
+  uint32_t bank=0x4000;
+  while (1) {       // Get address
+    addr = gpio_get_all()&BUS_PIN_MASK;
+    if (addr == 0x8000) {  // TO CHECK
+        // Bankswitching write
+       // Check for 0x01
+      SET_DATA_MODE_IN;
+      // Krok 20: end-of-cycle capture - see emulate_supercart_ef() for the reasoning.
+      // No CART_TYPE_ABSOLUTE file exists in the current ROMS/ library, so this one
+      // is corrected for consistency and cannot be verified on hardware yet.
+      uint32_t alast = gpio_get_all(), acur;
+      for (uint32_t g = 0; g < 64; g++) {
+          acur = gpio_get_all();
+          if ((acur & BUS_PIN_MASK) != addr) break;
+          alast = acur;
+      }
+      uint8_t data = (alast & DATA_PIN_MASK)>>D0_PIN;
+      if (data == 0x01) {
+        bank = 0;   // Switch to flying mode
+      } else {
+        if (data == 0x02) {
+          bank = 0x4000; // Switch to title page
+        }
+      }
+    } else if (addr & 0x8000) {        // Check for A15
+        sio_hw->gpio_out = (uint32_t)rom_table[addr] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+        SET_DATA_MODE_OUT;
+       	while ((gpio_get_all()&BUS_PIN_MASK) == addr);
+        SET_DATA_MODE_IN;
+        // Check for RW
+      } else {    // Check for A14
+        if (addr & 0x4000) {
+            // Set the data on the bus
+            sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+            SET_DATA_MODE_OUT;
+         		while ((gpio_get_all()&BUS_PIN_MASK) == addr);
+            SET_DATA_MODE_IN;
+        }
+      }
+    }
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////
 //                     HANDLE BUS
@@ -966,7 +1184,7 @@ start:
   
   if (cart_to_emulate>=35) {
    vreg_set_voltage(VREG_VOLTAGE_1_30);
-   int ret=set_sys_clock_khz(400000, true); // settled in compiler IDE as 250mhz overclocked
+   int ret=set_sys_clock_khz(EMU_CLOCK_KHZ, true); // was hardcoded 400000 - see EMU_CLOCK_KHZ
   }
   if (cart_to_emulate<=32) {
    gpio_set_dir_out_masked(BUS_H_PIN_MASK);
@@ -998,89 +1216,11 @@ start:
         break;
     
     case CART_TYPE_NORMALA78:
-      if (romLen==1024*16) { //16k
-	      while (1) {  
-		      while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
-			      addr_prev = addr;
-   	      // got a stable address
-		      if (addr & 0x4000) 	{ // A14 
-				    gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0x3FFF]<<D0_PIN);	
-		        SET_DATA_MODE_OUT;
-				    // wait for address bus to change
-				    while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
-				    SET_DATA_MODE_IN;
-          }
-        } 
-      } else if  (romLen==0x8000) { // 32k   
-     	  while (1)   {
-	        while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
-			      addr_prev = addr;
-   	      // got a stable address
-      	  if (addr & 0x8000)	{ // A15 high
-            gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0x7fff]<<D0_PIN);	
-		        SET_DATA_MODE_OUT;
-				    // wait for address bus to change
-				    while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
-				    SET_DATA_MODE_IN;
-          }
-        }
-      } else if  (romLen==0xc000) { // 48k   
-     	  while (1)   {
-	        while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
-			      addr_prev = addr;
-   	      // got a stable address
-      	  if (addr & 0x8000)	{ // A15 high
-            gpio_put_masked(DATA_PIN_MASK,rom_table[(addr)-0x4000]<<D0_PIN);	
-		        SET_DATA_MODE_OUT;
-				    // wait for address bus to change
-				    while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
-				    SET_DATA_MODE_IN;
-          } else {
-    	      if ((addr & 0x4000))	{ // A14 high
-              gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0x7fff-0x4000]<<D0_PIN);	
-		          SET_DATA_MODE_OUT;
-				      // wait for address bus to change
-				      while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
-				      SET_DATA_MODE_IN;
-            }
-          }
-        }
-      } 
+      emulate_normala78();
     break;
- 
+
     case CART_TYPE_ABSOLUTE:
-      // Continually check address lines and put associated data on bus.
-      bank=0x4000;
-      while (1) {       // Get address
-        addr = gpio_get_all()&BUS_PIN_MASK;
-        if (addr == 0x8000) {  // TO CHECK
-            // Bankswitching write
-           // Check for 0x01
-          SET_DATA_MODE_IN;
-          data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN;
-          if (data == 0x01) {
-            bank = 0;   // Switch to flying mode
-          } else {
-            if (data == 0x02) {
-              bank = 0x4000; // Switch to title page
-            }
-          }
-        } else if (addr & 0x8000) {        // Check for A15
-            gpio_put_masked(DATA_PIN_MASK, rom_table[addr] << D0_PIN);
-            SET_DATA_MODE_OUT;
-           	while ((gpio_get_all()&BUS_PIN_MASK) == addr);     
-            SET_DATA_MODE_IN;
-            // Check for RW
-          } else {    // Check for A14
-            if (addr & 0x4000) {
-                // Set the data on the bus
-                gpio_put_masked(DATA_PIN_MASK, rom_table[(addr & 0x3fff) + bank] << D0_PIN);
-                SET_DATA_MODE_OUT;
-             		while ((gpio_get_all()&BUS_PIN_MASK) == addr);     
-                SET_DATA_MODE_IN;
-            }
-          }
-        }
+      emulate_absolute();
        break;
     case CART_TYPE_2K:
     	while (1)  {
