@@ -975,6 +975,244 @@ void __time_critical_func(emulate_supercharger_cartridge())  {
 	}
  }
 
+// DPC - Activision's custom chip, the one in "Pitfall II - Lost Caverns". Not a
+// bankswitching scheme: a co-processor with 8 "data fetchers" (address counters
+// that walk a 2KB display-data area backwards), per-fetcher top/bottom/flag
+// registers, an LFSR random-number generator, and three of the fetchers doubling
+// as a music generator.
+//
+// Ported from UnoCart's cartridge_dpc.c, which is the same class of device as us
+// (a microcontroller bit-banging the 2600 bus), cross-checked against Stella's
+// CartDPC.cxx for the authoritative behaviour. The two agree on everything that
+// matters here, including the amplitude table {00,04,05,09,06,0A,0B,0F}
+// (CartDPC.cxx:183) and the display data living at offset 8192 of the image
+// (CartDPC.cxx:64) - so rom_table[0..8191] is the two 4KB banks and
+// rom_table[8192..10239] is the display data.
+//
+// NO AUDIO HARDWARE IS INVOLVED. The DPC does not make sound; on a read of
+// $1005-$1007 it returns an AMPLITUDE, and the game writes that to the TIA's
+// volume register itself. So this works on both boards, unlike the 7800 POKEY.
+//
+// Two deliberate differences from UnoCart:
+//
+//  1. No copy of the image. UnoCart memcpy()s the whole cart into fast CCM RAM
+//     because on an STM32 it would otherwise be read from flash. rom_table is
+//     already in SRAM here, so the copy would cost 10KB for nothing.
+//
+//  2. The music clock is read from the hardware timer instead of being polled.
+//     UnoCart hangs an UPDATE_MUSIC_COUNTER macro off SysTick in EVERY branch of
+//     the bus loop; the DPC's oscillator is just free-running (~20kHz - Stella's
+//     default DPC pitch, AudioSettings.hxx:62 - and user-tunable there, so the
+//     exact figure is not critical), which means the tick count can be derived
+//     from elapsed time whenever it is actually needed. timer_hw->timerawl is a
+//     free-running microsecond counter, so /50 gives 20kHz ticks. That takes the
+//     music update out of the hot path entirely. The counter is only ever used
+//     modulo a top value, so starting from boot rather than from game start just
+//     shifts the phase.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_dpc_cartridge()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+
+  // NOT static const: that would land in .rodata in FLASH and be read from the
+  // bus loop through the XIP cache - the exact defect patches 0.09/0.13 removed.
+  // Written out element by element so it is unambiguously on the stack, in SRAM.
+  uint8_t soundAmplitudes[8];
+  soundAmplitudes[0] = 0x00; soundAmplitudes[1] = 0x04;
+  soundAmplitudes[2] = 0x05; soundAmplitudes[3] = 0x09;
+  soundAmplitudes[4] = 0x06; soundAmplitudes[5] = 0x0a;
+  soundAmplitudes[6] = 0x0b; soundAmplitudes[7] = 0x0f;
+
+  // Zeroed by hand rather than with "= {0}": across four arrays that is 40 bytes,
+  // and GCC decides a call to memset is cheaper - which puts a FLASH call in a
+  // function that must not have one. Cold path (runs once, before the loop), but
+  // a check_hotpath.sh FAIL we learn to ignore is worse than none at all.
+  uint8_t  DpcTops[8], DpcBottoms[8], DpcFlags[8];
+  uint16_t DpcCounters[8];
+  DpcTops[0]=0; DpcTops[1]=0; DpcTops[2]=0; DpcTops[3]=0;
+  DpcTops[4]=0; DpcTops[5]=0; DpcTops[6]=0; DpcTops[7]=0;
+  DpcBottoms[0]=0; DpcBottoms[1]=0; DpcBottoms[2]=0; DpcBottoms[3]=0;
+  DpcBottoms[4]=0; DpcBottoms[5]=0; DpcBottoms[6]=0; DpcBottoms[7]=0;
+  DpcFlags[0]=0; DpcFlags[1]=0; DpcFlags[2]=0; DpcFlags[3]=0;
+  DpcFlags[4]=0; DpcFlags[5]=0; DpcFlags[6]=0; DpcFlags[7]=0;
+  DpcCounters[0]=0; DpcCounters[1]=0; DpcCounters[2]=0; DpcCounters[3]=0;
+  DpcCounters[4]=0; DpcCounters[5]=0; DpcCounters[6]=0; DpcCounters[7]=0;
+
+  uint32_t DpcRandom = 1;               // LFSR seed; must be non-zero
+  uint32_t dpctop_music = 0, dpcbottom_music = 0;
+  uint8_t  music_flags = 0, music_modes = 0;
+  uint8_t  prev_rom = 0, prev_rom2 = 0;
+  uint32_t addr, addr_prev = 0xFFFF, data = 0, data_prev = 0;
+  uint8_t *bankPtr = &rom_table[0];
+  uint8_t *DpcDisplayPtr = &rom_table[8*1024];
+
+  // Music oscillator state. Kept as a per-voice phase advanced by elapsed time,
+  // rather than one counter taken modulo each voice's top: a variable "%" on a
+  // Cortex-M0+ is a call to __aeabi_uidivmod, which lives in FLASH and is reached
+  // through a RAM veneer - the defect patches 0.09/0.13 removed and the reason
+  // check_hotpath.sh exists. Subtraction in a BOUNDED loop costs less than the
+  // call would and never leaves RAM. It is also closer to Stella, which likewise
+  // keeps a counter per voice (CartDPC.cxx updateMusicModeDataFetchers).
+  uint32_t music_last_us = timer_hw->timerawl;
+  uint32_t music_acc = 0;               // microseconds not yet turned into ticks
+  uint32_t mphase[3];                   // each < its voice's top
+  mphase[0]=0; mphase[1]=0; mphase[2]=0;
+
+  while (1) {
+    while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+      addr_prev = addr;
+
+    if (addr & 0x1000) {                // A12 high: the cartridge is selected
+      if (addr < 0x1040) {              // ---- DPC register read ----
+        uint32_t index    = addr & 0x07;
+        uint32_t function = (addr >> 3) & 0x07;
+        uint8_t  result   = 0;
+
+        switch (function) {
+          case 0x00:
+            if (index < 4) {            // random number
+              DpcRandom ^= DpcRandom << 3;
+              DpcRandom ^= DpcRandom >> 5;
+              result = (uint8_t)DpcRandom;
+            } else {                    // music amplitude
+              result = soundAmplitudes[music_modes & music_flags];
+            }
+            break;
+          case 0x01:                    // display data
+            result = DpcDisplayPtr[2047 - DpcCounters[index]];
+            break;
+          case 0x02:                    // display data AND'd with the flag
+            result = DpcDisplayPtr[2047 - DpcCounters[index]] & DpcFlags[index];
+            break;
+          case 0x07:                    // flag register
+            result = DpcFlags[index];
+            break;
+        }
+
+        gpio_put_masked(DATA_PIN_MASK, (uint32_t)result << D0_PIN);
+        SET_DATA_MODE_OUT;
+
+        // Clock this data fetcher - but NOT the ones running in music mode,
+        // which are driven by the oscillator instead. Done AFTER the byte is on
+        // the bus, so none of it is in the response path.
+        if (index < 5 || !(music_modes & (1 << (index - 5)))) {
+          DpcCounters[index] = (DpcCounters[index] - 1) & 0x07FF;
+          if ((DpcCounters[index] & 0x00FF) == DpcTops[index])
+            DpcFlags[index] = 0xFF;
+          else if ((DpcCounters[index] & 0x00FF) == DpcBottoms[index])
+            DpcFlags[index] = 0x00;
+        }
+
+        while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+        SET_DATA_MODE_IN;
+        addr_prev = 0xFFFF;
+      }
+      else if (addr < 0x1080) {         // ---- DPC register write ----
+        uint32_t index    = addr & 0x07;
+        uint32_t function = (addr >> 3) & 0x07;
+        uint8_t  ctr      = DpcCounters[index] & 0xFF;
+
+        // End-of-cycle capture: a 6502 drives the data lines only in the second
+        // half of the cycle. Same shape as the proven F8SC path.
+        while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+        { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK) >> D0_PIN; }
+        addr_prev = 0xFFFF;
+
+        uint8_t value = (uint8_t)data_prev;
+        switch (function) {
+          case 0x00:                    // top count
+            DpcTops[index] = value;
+            DpcFlags[index] = (ctr == value) ? 0xFF : 0x00;
+            if (index >= 5)
+              dpctop_music = (dpctop_music & ~(0xFFu << (8*(index-5))))
+                           | ((uint32_t)value << (8*(index-5)));
+            break;
+          case 0x01:                    // bottom count
+            DpcBottoms[index] = value;
+            if (ctr == value) DpcFlags[index] = 0x00;
+            if (index >= 5)
+              dpcbottom_music = (dpcbottom_music & ~(0xFFu << (8*(index-5))))
+                              | ((uint32_t)value << (8*(index-5)));
+            break;
+          case 0x02:                    // counter low
+            DpcCounters[index] = (DpcCounters[index] & 0x0700) | value;
+            if (value == DpcTops[index])         DpcFlags[index] = 0xFF;
+            else if (value == DpcBottoms[index]) DpcFlags[index] = 0x00;
+            break;
+          case 0x03:                    // counter high (+ music mode bit)
+            DpcCounters[index] = (((uint16_t)(value & 0x07)) << 8) | ctr;
+            if (index >= 5)
+              music_modes = (music_modes & ~(0x01 << (index-5)))
+                          | ((value & 0x10) >> (9 - index));
+            break;
+          case 0x06:                    // reset the random number generator
+            DpcRandom = 1;
+            break;
+        }
+      }
+      else {                            // ---- plain ROM, with F8 bankswitch ----
+        if      (addr == 0x1FF8) bankPtr = &rom_table[0];
+        else if (addr == 0x1FF9) bankPtr = &rom_table[4*1024];
+
+        gpio_put_masked(DATA_PIN_MASK, (uint32_t)bankPtr[addr&0xFFF] << D0_PIN);
+        SET_DATA_MODE_OUT;
+
+        prev_rom2 = prev_rom;
+        prev_rom = bankPtr[addr&0xFFF];
+
+        while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+        SET_DATA_MODE_IN;
+        addr_prev = 0xFFFF;
+      }
+    }
+    // Below $1000 the console owns the bus. UnoCart uses this window to refresh
+    // the music flags, recognising the moment by the two bytes the cart last
+    // handed over: (prev_rom2 & 0xDC) == 0x84 matches the zero-page LDA/LDX/LDY
+    // and STA/STX/STY opcodes, and prev_rom - the operand byte - equalling the
+    // address now on the bus confirms this really is that instruction's zero-page
+    // access rather than a coincidence. It is a heuristic, but it is the one that
+    // ships in a working cartridge, and it costs nothing when it does not match.
+    else if (((prev_rom2 & 0xDC) == 0x84) && prev_rom == addr) {
+      // Advance the oscillator by however long it has been. 50us per tick is the
+      // ~20kHz Stella uses by default. This branch is entered on nearly every
+      // zero-page access, so the gap is normally a handful of microseconds and
+      // both loops below run once or not at all; the bounds only matter if the
+      // game goes a long time without one, and losing a few ticks of music is a
+      // far better failure than stalling the bus.
+      uint32_t now = timer_hw->timerawl;
+      music_acc += now - music_last_us;          // unsigned: wraps correctly
+      music_last_us = now;
+      // Bounded at 16 ticks. That bound sets the worst case for the per-voice
+      // loops below: each runs at most (16 / top) + 1 times, so 17 iterations for
+      // top=1 and three voices is under 1us even then - about one 2600 bus cycle.
+      // A bound of 64 would have allowed ~3us here, i.e. missing up to four bus
+      // cycles, which is not worth it: this branch is entered on nearly every
+      // zero-page access, thousands of times per frame, so ticks is realistically
+      // 0 or 1 and the bound never binds.
+      uint32_t ticks = 0;
+      while (music_acc >= 50 && ticks < 16) { music_acc -= 50; ticks++; }
+      if (music_acc >= 50) music_acc = 0;        // fell far behind - resync
+
+      uint32_t tops    = dpctop_music;
+      uint32_t bottoms = dpcbottom_music;
+      music_flags = 0;
+      for (uint32_t v = 0; v < 3; v++) {
+        uint32_t top    = (tops    >> (8*v)) & 0xFF;
+        uint32_t bottom = (bottoms >> (8*v)) & 0xFF;
+        if (top) {
+          uint32_t p = mphase[v] + ticks;
+          while (p >= top) p -= top;             // bounded: ticks <= 64
+          mphase[v] = p;
+          if (p > bottom) music_flags |= (1 << v);
+        } else {
+          mphase[v] = 0;
+        }
+      }
+      while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+      addr_prev = 0xFFFF;
+    }
+  }
+}
+
 // not_working_roms4: CART_TYPE_NORMALA78 and CART_TYPE_ABSOLUTE are just as
 // real a 7800/MARIA game as CART_TYPE_SUPERCART_RAM etc. (same tight DMA
 // response window), but - unlike every SuperGame/Activision/Supercharger path
@@ -2361,8 +2599,11 @@ start:
      }
   	}
       break;
-    case CART_TYPE_AR:  
-         emulate_supercharger_cartridge();  
+    case CART_TYPE_AR:
+         emulate_supercharger_cartridge();
+      break;
+    case CART_TYPE_DPC:
+         emulate_dpc_cartridge();
       break;
     case CART_TYPE_3F:  
   	  cartPages = romLen/2048;
