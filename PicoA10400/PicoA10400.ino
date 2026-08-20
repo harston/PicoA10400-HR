@@ -170,6 +170,8 @@ bool fs_changed;
 #define CART_TYPE_SUPERCART_RAM	38	// Atari 7800
 #define CART_TYPE_SUPERCART_LARGE	39	// Atari 7800
 #define CART_TYPE_SUPERCART	40	// Atari 7800 supercart bs
+#define CART_TYPE_MRAM	41	// Atari 7800 flat ROM + mRAM ("masked RAM") @$4000
+#define CART_TYPE_VERSA	42	// Atari 7800 VersaBoard: SuperGame + 2x16K banked RAM
 
 #define CCM_RAM ((uint8_t*)0x10000000)
 #define CCM_SIZE (64 * 1024)
@@ -1095,6 +1097,81 @@ void __time_critical_func(emulate_normala78_pokey()) {
   }
 }
 
+// mRAM ("masked RAM") - MAME's A78_TYPE8, test7800's external/mram.go. A FLAT
+// cart plus 16KB of on-cart RAM at $4000-$7FFF. MAME's rom.cpp describes the
+// board as "no bankswitch + mRAM chip"; it is selected by bit 7 of the a78
+// header's low byte, which OVERRIDES whatever bankswitch bits are also set
+// (a78_slot.cpp:493) - "Turrican II Circular Scroll Test" (header 0x0082) has
+// the SuperGame bit on and is still an mRAM cart.
+//
+// Two halves, each already proven on this hardware, joined:
+//   * the ROM window is emulate_normala78()'s general mapping (version 0.16,
+//     from MAME rom.cpp:257-263): a flat cart sits at the TOP of the address
+//     space, base_rom = 0x10000 - size, and stays silent below its own start.
+//   * the RAM window is emulate_supercart_ram()'s $4000 path, including the
+//     Krok 19 end-of-cycle write capture.
+//
+// The one new element is the address mask. test7800 (mram.go):
+//
+//     if address < 0x8000 { address &= 0xfeff; ram[address-0x4000] }
+//
+// A8 is not connected, so $4100-$41FF is the same storage as $4000-$40FF - that
+// is where the name comes from. For the $4000-$7FFF range this branch handles,
+// (address & 0xfeff) - 0x4000 is exactly (address & 0x3eff), so the mask is
+// folded into the index. Highest index reached is 0x3EFF, inside ram_table.
+//
+// Unlike emulate_normala78() this loop does NOT block while the address is
+// stable: it must keep servicing the RAM window, and "blocking ROM path + R/W
+// gating" is precisely the combination that regressed 3D Worldrunner in 0.18.
+// Shaped like emulate_supercart_ram(), which never blocks.
+//
+// No _pokey variant on purpose: every mRAM file in this library has header
+// 0x0080 or 0x0082, i.e. none declares a POKEY, and an untested variant would
+// cost RAM on a board that is already 95% full.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_mram()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  const uint32_t base_rom = (romLen >= 0x10000) ? 0x4000 : (0x10000 - (uint32_t)romLen);
+  const uint32_t lo = (base_rom < 0x4000) ? 0x4000 : base_rom;
+  uint32_t addr = 0, rawaddr = 0;
+  uint8_t rom_in_use = 1;
+
+  while (1) {
+    rawaddr = gpio_get_all();
+    addr = rawaddr & BUS_PIN_MASK;
+    if (addr >= lo) {                       // flat ROM at the top of the map
+        sio_hw->gpio_out = (uint32_t)rom_table[addr - base_rom] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+        if ((gpio_get_all() & RW_PIN_MASK) == RW_PIN_MASK) {
+            if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else if (rom_in_use) {
+            SET_DATA_MODE_IN; rom_in_use = 0;
+        }
+    } else if (addr & A14_PIN_MASK) {       // $4000-$7FFF: the mRAM window
+        sio_hw->gpio_out = (uint32_t)ram_table[addr & 0x3EFF] << D0_PIN;
+        rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
+        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+            if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else if (rawaddr == A14_PIN_MASK) {
+            SET_DATA_MODE_IN;
+            // Krok 19 end-of-cycle capture - see emulate_supercart_ram().
+            uint32_t wlast = gpio_get_all(), wcur;
+            uint32_t waddr = wlast & BUS_PIN_MASK;
+            for (uint32_t g = 0; g < 64; g++) {
+                wcur = gpio_get_all();
+                if ((wcur & BUS_PIN_MASK) != waddr) break;
+                wlast = wcur;
+            }
+            ram_table[waddr & 0x3EFF] = (wlast >> D0_PIN) & 0xff;
+            rom_in_use = 0;
+        } else if (rom_in_use) {
+            SET_DATA_MODE_IN; rom_in_use = 0;
+        }
+    } else if (rom_in_use) {                // below $4000, or the gap under a 16K ROM
+        SET_DATA_MODE_IN; rom_in_use = 0;
+    }
+  }
+}
+
 __attribute__((optimize("O2")))
 void __time_critical_func(emulate_absolute()) {
   __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
@@ -1424,6 +1501,199 @@ void __time_critical_func(emulate_supercart_ram_pokey()) {
       }
 }
 
+// VersaBoard (CPUWIZ homebrew board) - MAME cpuwiz.cpp:83-104. This is
+// emulate_supercart_ram() with ONE addition: the 16KB RAM window at $4000-$7FFF
+// is banked, and the second bank is selected by bit 5 of the same write that
+// selects the ROM bank:
+//
+//     write_40xx: offset < 0x4000 -> m_ram[offset + m_ram_bank * 0x4000];
+//                 offset < 0x8000 -> m_bank     = (data & 0x0f) & m_bank_mask;
+//                                    m_ram_bank = BIT(data, 5);
+//     read_40xx:  offset < 0x4000 -> m_ram[offset + m_ram_bank * 0x4000];
+//                 offset < 0x8000 -> m_rom[(offset & 0x3fff) + m_bank * 0x4000];
+//                 else            -> m_rom[(offset & 0x3fff) + m_bank_mask * 0x4000];
+//
+// (MAME's `offset` is relative to $4000, so its "offset < 0x4000" is our
+// $4000-$7FFF RAM window and its "< 0x8000" is our $8000-$BFFF bank window.)
+//
+// ram_table is 32KB - exactly the 2 x 16KB this board has, so no allocation
+// change is needed. The "& 0x0f" is MAME's; for the 128KB carts this type
+// actually has it is already implied by sc_bank_mask (7), but keeping it
+// explicit stays correct for the 256KB/16-bank configurations the board allows.
+//
+// MegaCart+ is the same board with a 5-bit bank mask and up to 512KB of ROM;
+// it is deliberately NOT implemented, because 512KB cannot fit rom_table's
+// 144KB and no file in this library needs it (MAME picks MegaCart over
+// VersaBoard only when the payload exceeds 256KB - a78_slot.cpp:424).
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_versa()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+      uint32_t bank=0, ram_bank=0;
+      const uint32_t fixed_base = (uint32_t)romLen - 0x8000;
+      uint32_t addr=0, rawaddr=0;
+      uint8_t rom_in_use=1;
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
+
+      while (1) {
+        rawaddr = gpio_get_all();
+        addr = rawaddr & BUS_PIN_MASK;
+        if (addr & A15_PIN_MASK) {
+            if (addr & A14_PIN_MASK) {
+                // $C000-$FFFF: fixed last bank
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x7fff) + fixed_base] << D0_PIN;
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+                if (rawaddr == READ_PIN_MASK) {
+                    if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+                }
+            } else {
+                // $8000-$BFFF: switchable bank, and the bank/RAM-bank register
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x7fff) + bank] << D0_PIN;
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+                if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {
+                    if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+                } else {
+                    rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
+                    if (rawaddr == A15_PIN_MASK) {
+                        SET_DATA_MODE_IN;
+                        // Krok 19 end-of-cycle capture - see emulate_supercart_ram().
+                        uint32_t last = gpio_get_all(), cur;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS_PIN_MASK) != addr) break;
+                            last = cur;
+                        }
+                        uint32_t d = (last >> D0_PIN) & 0xff;
+                        bank     = (d & 0x0f & sc_bank_mask) * 0x4000;
+                        ram_bank = (d & 0x20) ? 0x4000 : 0;   // BIT(data, 5)
+                        rom_in_use = 0;
+                    }
+                }
+            }
+        } else {
+            rawaddr = gpio_get_all();
+            if (rawaddr & 0x4000) {
+                // $4000-$7FFF: banked on-cart RAM
+                addr = rawaddr & 0x3fff;
+                sio_hw->gpio_out = (uint32_t)ram_table[addr + ram_bank] << D0_PIN;
+                rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
+                if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+                    if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+                } else {
+                  if (rawaddr == A14_PIN_MASK) {
+                        SET_DATA_MODE_IN;
+                        uint32_t wlast = gpio_get_all(), wcur;
+                        uint32_t waddr = wlast & BUS_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            wcur = gpio_get_all();
+                            if ((wcur & BUS_PIN_MASK) != waddr) break;
+                            wlast = wcur;
+                        }
+                        ram_table[(waddr & 0x3fff) + ram_bank] = (wlast >> D0_PIN) & 0xff;
+                        rom_in_use = 0;
+                  } else {
+                    if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+                  }
+                }
+            } else {
+                if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+            }
+        }
+      }
+}
+
+// POKEY-cart variant of emulate_versa(). A SEPARATE function for the same reason
+// as every other _pokey variant (see version 0.18): pokey_base is volatile, so a
+// shared helper re-reads it from memory on every pass through the cold branch -
+// the branch every console-RAM, TIA and MARIA access takes - which is what made
+// "Alien Brigade" glitch. MAME gives this board its own device, a78_versapokey
+// (cpuwiz.cpp:41), because a few VersaBoard demos combine banked RAM with a POKEY
+// at $0450 for XBoarD/XM compatibility. In this library that is exactly one file:
+// "Mario Bros (Ice Stress Test)", header 0x0062.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_versa_pokey()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+      uint32_t bank=0, ram_bank=0;
+      const uint32_t fixed_base = (uint32_t)romLen - 0x8000;
+      uint32_t addr=0, rawaddr=0;
+      uint8_t rom_in_use=1;
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
+      // Hoisted: see emulate_supercart_ram_pokey().
+      const uint32_t pkbase = (uint32_t)pokey_base;
+      const uint32_t pkmask = (uint32_t)pokey_mask;
+
+      while (1) {
+        rawaddr = gpio_get_all();
+        addr = rawaddr & BUS_PIN_MASK;
+        if (addr & A15_PIN_MASK) {
+            if (addr & A14_PIN_MASK) {
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x7fff) + fixed_base] << D0_PIN;
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+                if (rawaddr == READ_PIN_MASK) {
+                    if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+                }
+            } else {
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x7fff) + bank] << D0_PIN;
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+                if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {
+                    if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+                } else {
+                    rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
+                    if (rawaddr == A15_PIN_MASK) {
+                        SET_DATA_MODE_IN;
+                        uint32_t last = gpio_get_all(), cur;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS_PIN_MASK) != addr) break;
+                            last = cur;
+                        }
+                        uint32_t d = (last >> D0_PIN) & 0xff;
+                        bank     = (d & 0x0f & sc_bank_mask) * 0x4000;
+                        ram_bank = (d & 0x20) ? 0x4000 : 0;   // BIT(data, 5)
+                        rom_in_use = 0;
+                    }
+                }
+            }
+        } else {
+            rawaddr = gpio_get_all();
+            if (rawaddr & 0x4000) {
+                addr = rawaddr & 0x3fff;
+                sio_hw->gpio_out = (uint32_t)ram_table[addr + ram_bank] << D0_PIN;
+                rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
+                if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+                    if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+                } else {
+                  if (rawaddr == A14_PIN_MASK) {
+                        SET_DATA_MODE_IN;
+                        uint32_t wlast = gpio_get_all(), wcur;
+                        uint32_t waddr = wlast & BUS_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            wcur = gpio_get_all();
+                            if ((wcur & BUS_PIN_MASK) != waddr) break;
+                            wlast = wcur;
+                        }
+                        ram_table[(waddr & 0x3fff) + ram_bank] = (wlast >> D0_PIN) & 0xff;
+                        rom_in_use = 0;
+                  } else {
+                    if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+                  }
+                }
+            } else {
+                // $0000-$3FFF. The $0450 POKEY window lives here, below every
+                // VersaBoard window, so it cannot collide with the ROM/RAM paths.
+                if ((addr & pkmask) == pkbase) {
+                    pokey_window_service(addr, &rom_in_use);
+                } else if (rom_in_use) {
+                    SET_DATA_MODE_IN; rom_in_use = 0;
+                }
+            }
+        }
+      }
+}
+
 // POKEY-cart variant of emulate_supercart_large(). A SEPARATE function so that carts without
 // POKEY keep byte-identical code to the version proven on hardware.
 __attribute__((optimize("O2")))
@@ -1676,6 +1946,18 @@ start:
     case CART_TYPE_ABSOLUTE:
       emulate_absolute();
        break;
+
+    case CART_TYPE_MRAM:
+      emulate_mram();
+    break;
+
+    case CART_TYPE_VERSA:
+      // Only "Mario Bros (Ice Stress Test)" (header 0x0062) takes the _pokey path
+      // in this library; the other four VersaBoard files declare no POKEY.
+      if (pokey_enabled) emulate_versa_pokey();
+      else               emulate_versa();
+    break;
+
     case CART_TYPE_2K:
     	while (1)  {
 		  while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
@@ -1734,6 +2016,50 @@ start:
 				  // wait for address bus to change
 				  while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
 				  SET_DATA_MODE_IN;
+        }
+      }
+       break;
+
+    // 4K + SuperChip RAM. Detected since forever (isProbably4KSC(), reached only
+    // for a 4096-byte image) but until now it fell through the switch and the
+    // cart answered nothing. This is CART_TYPE_4K above with the SuperChip block
+    // from CART_TYPE_F8SC dropped in - 128 bytes of RAM mirrored as write port
+    // $1000-$107F and read port $1080-$10FF - and no bankswitching, because a 4K
+    // cart has exactly one bank. Both halves are hardware-proven; only the
+    // combination is new.
+    //
+    // NOTE: this library contains no real 4KSC GAME to verify it with. All 112
+    // matching files are single 4KB banks of one batari Basic multikernel
+    // framework (their first 256 bytes are 0xFF padding, which is what satisfies
+    // the "256 identical bytes" half of isProbably4KSC, and their reset vectors
+    // point into a bankswitch trampoline). See TEST_ROMS_2/README.md.
+    case CART_TYPE_4KSC:
+      data=0; data_prev=0;
+      while (1) {
+		    while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+			  addr_prev = addr;
+   	    // got a stable address
+		    if (addr & 0x1000) 	{ // A12 high
+          if ((addr & 0x1F00) == 0x1000) {	// SC RAM access
+            if (addr & 0x0080) {	// a read from cartridge ram
+              gpio_put_masked(DATA_PIN_MASK,ram_table[addr&0x7F]<<D0_PIN);
+              SET_DATA_MODE_OUT;
+              // wait for address bus to change
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+              SET_DATA_MODE_IN;
+            } else {	// a write to cartridge ram
+              // read last data on the bus before the address lines change
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+              { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
+              ram_table[addr&0x7F] = data_prev;
+            }
+          } else {	// normal rom access
+            gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0xFFF]<<D0_PIN);
+            SET_DATA_MODE_OUT;
+            // wait for address bus to change
+            while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+            SET_DATA_MODE_IN;
+          }
         }
       }
        break;
@@ -2605,8 +2931,27 @@ int identify_cartridge(char *filename)
         Serial.print("POKEY base:");Serial.println(pokey_base,HEX);
 
         if(A78_HEADER[53] == 0) {
+          // Keep the raw low byte: the mask on the next line clears bit 0 and
+          // bit 6, and bit 6 (POKEY @$0450) is what selects the _pokey variant
+          // for a VersaBoard. Bits 7 and 5, which pick the mapper itself, do
+          // survive the mask - reading them from raw54 is for clarity, not need.
+          uint8_t raw54 = A78_HEADER[54];
           A78_HEADER[54]=A78_HEADER[54]&0b10111110;
-          if(image_size > (131072+0x80)) {
+          // Order is MAME's. In a78_slot.cpp the mRAM bit is an OVERRIDE applied
+          // AFTER the bankswitch switch (:493), so it beats the SuperGame and
+          // VersaBoard bits: "Turrican II Circular Scroll Test" (header 0x0082)
+          // has the SuperGame bit set and is still an mRAM cart.
+          if(raw54 & 0x80) {
+            cart_type = CART_TYPE_MRAM;
+          } else if((raw54 & 0x2e) == 0x22 || (raw54 & 0x2e) == 0x26) {
+            // a78_slot.cpp:422 - switch (mapper & 0xe02e), cases 0x0022/0x0026.
+            // byte53 is 0 in this branch, so the 0xe000 half of that mask is
+            // always clear and testing the low byte against 0x2e is the same
+            // test. MAME picks MegaCart instead when the payload exceeds 256KB
+            // (:424); that variant is deliberately not implemented, since 512KB
+            // cannot fit rom_table and no file in this library needs it.
+            cart_type = CART_TYPE_VERSA;
+          } else if(image_size > (131072+0x80)) {
             cart_type = CART_TYPE_SUPERCART_LARGE;
           } else if(A78_HEADER[54] == 2 || A78_HEADER[54] == 3) {
               cart_type = CART_TYPE_SUPERCART;
