@@ -132,6 +132,10 @@ bool fs_changed;
 #define SET_DATA_MODE_OUT   gpio_set_dir_out_masked(DATA_PIN_MASK)
 #define SET_DATA_MODE_IN    gpio_set_dir_in_masked(DATA_PIN_MASK)
 
+#include "pokey.h"   // minimal POKEY audio - see the header for why this board
+                     // has no audio line routed to the Pico at all.
+
+
 #define SET_LED_ON    	gpio_init(25);gpio_set_dir(25,GPIO_OUT);gpio_put(25,true);
 #define SET_LED_OFF    	gpio_init(25);gpio_set_dir(25,GPIO_OUT);gpio_put(25,false);
 
@@ -279,7 +283,7 @@ uint8_t AR_ROM[8448*4];
 char filelist[85*MAX_NAME_LEN]; // 85 entries, MAX_NAME_LEN bytes each (incl. terminator)
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
 char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: loaded truncated, shown red in the menu
-#define MENU_FOOTER_TEXT "AOTTAv01 HR4" // 12 chars: the menu kernel renders exactly 12 per row
+#define MENU_FOOTER_TEXT "AOTTAv01 HR5" // 12 chars: the menu kernel renders exactly 12 per row
 // Colour of oversized-ROM names. The kernel reads this at runtime from menu_status[12],
 // so changing it needs no ROM patch - just this line. $66 was picked by sweeping all 16
 // hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
@@ -1035,6 +1039,62 @@ void __time_critical_func(emulate_normala78()) {
   }
 }
 
+// POKEY-cart variant of emulate_normala78(). Separate function so flat carts
+// without POKEY keep byte-identical code to the hardware-proven version.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_normala78_pokey()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  uint32_t addr=0, addr_prev=0, rawaddr=0;
+  // not_working_roms4 "Krok 21" - one general mapping instead of three hardcoded
+  // size cases, taken from MAME's a78_rom_device::read_40xx (rom.cpp:257-263):
+  // a flat cart sits at the TOP of the address space (m_base_rom = 0x10000 - size)
+  // and stays silent below its own start. The old code only handled 16k/32k/48k;
+  // any other size fell through and drove nothing at all - a blank screen. In this
+  // library that silently broke "7ix" (28KB) and "Bouncing Balls (Demo)" (8KB).
+  // See PicoA10400.ino for the equivalence proof against the three old cases.
+  //
+  // Board difference (NOT a copy of PicoA10400.ino): here BUS_PIN_MASK covers only
+  // A0-A14 and A15 is gpio 26, so the full 16-bit address has to be reassembled
+  // before it can be compared against a $0000-$FFFF boundary, and the wait for the
+  // cycle to end compares BUS15_PIN_MASK.
+  const uint32_t base_rom = (romLen >= 0x10000) ? 0x4000 : (0x10000 - (uint32_t)romLen);
+  const uint32_t lo = (base_rom < 0x4000) ? 0x4000 : base_rom;
+  const uint32_t pkbase = (uint32_t)pokey_base;   // volatile: hoist out of the loop
+  const uint32_t pkmask = (uint32_t)pokey_mask;
+
+  while (1) {
+    // wait for a stable full address (A0-A14 plus A15 on gpio 26)
+    while ((rawaddr = (gpio_get_all()&BUS15_PIN_MASK)) != addr_prev)
+      addr_prev = rawaddr;
+    addr = (rawaddr & BUS_PIN_MASK) | ((rawaddr & A15_PIN_MASK) ? 0x8000 : 0);
+    if (addr >= lo) {
+      sio_hw->gpio_out = (uint32_t)rom_table[addr - base_rom] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+      SET_DATA_MODE_OUT;
+      // wait for address bus to change
+      while ((gpio_get_all()&BUS15_PIN_MASK) == rawaddr) ;
+      SET_DATA_MODE_IN;
+    } else if ((addr & pkmask) == pkbase) {      // POKEY register window
+      // LISTEN ONLY - deliberately no read support on this path. Reads were tried
+      // on the other board and REGRESSED "3D Worldrunner Theme Melody (4000)":
+      // driving the bus gated on R/W is the shape that hung the cart in Krok 18,
+      // because one mis-read of R/W turns a POKEY write into "drive against the CPU
+      // and then block". This loop blocks in its ROM path, so it cannot afford that;
+      // the SuperGame variants never block and there reads are safe.
+      if (!(gpio_get_all() & RW_PIN_MASK)) {
+        // End-of-cycle capture, the shape proven in version 0.15: a 6502 does not
+        // drive the data lines until the second half of the cycle. Bounded at 64.
+        uint32_t last = gpio_get_all(), cur;
+        for (uint32_t g = 0; g < 64; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS15_PIN_MASK) != rawaddr) break;
+          last = cur;
+        }
+        pokey_regs[addr & 0x0F] = (uint8_t)((last >> D0_PIN) & 0xFF);
+      }
+    }
+  }
+}
+
 __attribute__((optimize("O2")))
 void __time_critical_func(emulate_absolute()) {
   __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
@@ -1110,6 +1170,396 @@ void __time_critical_func(emulate_absolute()) {
 }
 
 
+
+
+// POKEY-cart variant of emulate_supercart_ef(). A SEPARATE function so carts without POKEY
+// keep byte-identical code to the version proven on hardware.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_supercart_ef_pokey()) {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+      // Hoisted: pokey_base/pokey_mask are volatile, and reading them from
+      // memory on every pass through the cold branch is what made a cart with
+      // no POKEY at all (Alien Brigade) start glitching on the other board.
+      const uint32_t pkbase = (uint32_t)pokey_base;
+      const uint32_t pkmask = (uint32_t)pokey_mask;
+      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      uint8_t rom_in_use=1;
+      
+      while (1) {    // Get address
+             // Get address
+        rawaddr = gpio_get_all();
+        addr = rawaddr & BUS_PIN_MASK;
+        // Check for A15
+        if (rawaddr & A15_PIN_MASK) {
+            addr=addr | 0x8000;
+            // Check for A14
+            if (addr & A14_PIN_MASK) {
+                // Set the data on the bus for fixed bank 7
+                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x10000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == READ_PIN_MASK) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                }
+            } else {
+                // Set the data on the bus for active bank
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                // Check for RW
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
+                    // Read cycle
+                    if (!rom_in_use) {
+                       SET_DATA_MODE_OUT;
+                       rom_in_use = 1;
+                    }
+                } else {  // Write cycle to ROM
+                    rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
+                    // Check for bankswitch
+                    if (rawaddr == A15_PIN_MASK) {
+                        // Bankswitching write
+                        SET_DATA_MODE_IN;
+                        // Check for 0x01
+                        // Krok 20: end-of-cycle capture - see emulate_supercart_ram()
+                        // for the reasoning. Bounded at 64 turns; A15 is gpio 26 here so
+                        // the comparison uses BUS15_PIN_MASK.
+                        {
+                          uint32_t last = gpio_get_all(), cur;
+                          uint32_t full = last & BUS15_PIN_MASK;
+                          for (uint32_t g = 0; g < 64; g++) {
+                              cur = gpio_get_all();
+                              if ((cur & BUS15_PIN_MASK) != full) break;
+                              last = cur;
+                          }
+                          rawaddr = last;
+                        }
+                        switch ((rawaddr >> D0_PIN) & 0xff) {
+                        case 0:
+                            bank = 0;
+                            break;
+                        case 1:
+                            bank = 0x4000;
+                            break;
+                        case 2:
+                            bank = 0x8000;
+                            break;
+                        case 3:
+                            bank = 0xc000;
+                            break;
+                        case 4:
+                            bank = 0x10000;
+                            break;
+                        case 5:
+                            bank = 0x14000;
+                            break;
+                        case 6:
+                            bank = 0x18000;
+                            break;
+                        case 7:
+                            bank = 0x1c000;
+                            break;
+                        default:
+                            break;
+                        }
+                        rom_in_use = 0;
+                    }
+                }
+            }
+        } else {
+            // EXFIX - bank 6 is in 0x4000
+            if (addr & 0x4000) {
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + 0x18000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                rawaddr = gpio_get_all() & (READ_PIN_MASK );
+	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                } else {
+                    if (rom_in_use) {
+                        SET_DATA_MODE_IN;
+                        rom_in_use = 0;
+                    }
+                }
+            } else {
+                // $0000-$3FFF. The $0450/$0440/$0800 POKEY windows live here, below
+                // every SuperGame window, so they cannot collide with ROM/RAM.
+                if ((addr & pkmask) == pkbase) {
+                    pokey_window_service(addr, &rom_in_use);
+                } else if (rom_in_use) {
+                    SET_DATA_MODE_IN;
+                    rom_in_use = 0;
+                }
+            }
+        }
+      }
+    }
+
+// POKEY-cart variant of emulate_supercart_ram(). A SEPARATE function so carts without POKEY
+// keep byte-identical code to the version proven on hardware.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_supercart_ram_pokey()) {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+      // Hoisted: pokey_base/pokey_mask are volatile, and reading them from
+      // memory on every pass through the cold branch is what made a cart with
+      // no POKEY at all (Alien Brigade) start glitching on the other board.
+      const uint32_t pkbase = (uint32_t)pokey_base;
+      const uint32_t pkmask = (uint32_t)pokey_mask;
+      uint32_t bank=0;
+      // v0.13 (P1): romLen is volatile, so the fixed-bank index below was
+      // re-read from memory on every pass. Constant for the whole game - hoist.
+      const uint32_t fixed_base = (uint32_t)romLen - 0x8000;
+      uint32_t addr=0, addr_prev=0, rawaddr=0;
+      uint8_t rom_in_use=1;
+      // Bank-number mask derived from the real ROM size, mirroring MAME
+      // (a78_slot.cpp:74-77 + rom.cpp:388: data & m_bank_mask, where
+      // m_bank_mask = (nbanks odd) ? nbanks-2 : nbanks-1) and ProSystem/JS7800
+      // (Cartridge.js:729, which instead drops any write with bank >= size/16384).
+      // For the 128KB/8-bank carts this type actually sees, this is exactly the
+      // "& 0x07" that used to be hardcoded here; deriving it keeps PicoA10400 and
+      // Pico2A10400 identical and stays correct for 4/9/16-bank carts too.
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
+
+      while (1) {    // Get address
+             // Get address
+        rawaddr = gpio_get_all();
+        addr = rawaddr & BUS_PIN_MASK;
+        // Check for A15
+        if (rawaddr & A15_PIN_MASK) {
+            // Check for A14
+            if (addr & A14_PIN_MASK) {
+                // Set the data on the bus for fixed bank 7
+                sio_hw->gpio_out = (uint32_t)rom_table[addr + fixed_base] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == READ_PIN_MASK) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                }
+            } else {
+                // Set the data on the bus for active bank
+                //sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x7fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                // Check for RW
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
+                    // Read cycle
+                    if (!rom_in_use) {
+                       SET_DATA_MODE_OUT;
+                       rom_in_use = 1;
+                    }
+                } else {  // Write cycle to ROM
+                    rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
+                    // Check for bankswitch
+                    if (rawaddr == A15_PIN_MASK) {
+                        // Bankswitching write
+                        SET_DATA_MODE_IN;
+                        // Krok 14b BUG: rawaddr still held the RW/A15-masked value from
+                        // the test above, so inside this branch it is exactly A15_PIN_MASK
+                        // and every data bit in it is 0 - ((0x04000000 >> 15) & 0x07) is a
+                        // constant 0. A bankswitch write always selected bank 0, so no
+                        // SUPERCART_RAM cart could ever leave its first 16KB bank on this
+                        // board. Krok 19: and the byte must come from the END of the write
+                        // cycle - a 6502 does not drive the data lines until the second
+                        // half of the cycle. Bounded (see PicoA10400.ino for the cycle
+                        // arithmetic); an unbounded wait here hung the cart in Krok 18.
+                        // A15 is gpio 26 on this board and sits OUTSIDE BUS_PIN_MASK, so
+                        // end-of-cycle detection must compare BUS15_PIN_MASK.
+                        uint32_t last = gpio_get_all(), cur;
+                        uint32_t full = last & BUS15_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            cur = gpio_get_all();
+                            if ((cur & BUS15_PIN_MASK) != full) break;
+                            last = cur;
+                        }
+                        bank = ((last >> D0_PIN) & sc_bank_mask) * 0x4000;
+                        rom_in_use = 0;
+                    }
+                }
+            }
+        } else {
+            rawaddr=gpio_get_all();
+            // EXram - 16k is in 0x4000
+            if (rawaddr & 0x4000) {
+                addr= rawaddr & 0x3fff;
+                sio_hw->gpio_out = (uint32_t)ram_table[addr] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
+	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                } else {
+                  if (rawaddr == A14_PIN_MASK) {
+                     // Write cycle
+                        SET_DATA_MODE_IN;
+                        // Krok 19: end-of-cycle capture, same reasoning as the bank
+                        // register above. 'addr' is already a 14-bit offset here, so keep
+                        // a full-width address for the comparison.
+                        uint32_t wlast = gpio_get_all(), wcur;
+                        uint32_t wfull = wlast & BUS15_PIN_MASK;
+                        for (uint32_t g = 0; g < 64; g++) {
+                            wcur = gpio_get_all();
+                            if ((wcur & BUS15_PIN_MASK) != wfull) break;
+                            wlast = wcur;
+                        }
+                        ram_table[wlast & 0x3fff] = (wlast >> D0_PIN) & 0xff;
+                        rom_in_use = 0;
+                  } else {
+                    if (rom_in_use) {
+                        SET_DATA_MODE_IN;
+                        rom_in_use = 0;
+                    }
+                  }
+                }
+            } else {
+                // $0000-$3FFF. The $0450/$0440/$0800 POKEY windows live here, below
+                // every SuperGame window, so they cannot collide with ROM/RAM.
+                if ((addr & pkmask) == pkbase) {
+                    pokey_window_service(addr, &rom_in_use);
+                } else if (rom_in_use) {
+                    SET_DATA_MODE_IN;
+                    rom_in_use = 0;
+                }
+            }
+        }
+      }
+}
+
+// POKEY-cart variant of emulate_supercart_large(). A SEPARATE function so carts without POKEY
+// keep byte-identical code to the version proven on hardware.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_supercart_large_pokey()) {
+  // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
+  // libraries can install handlers on whichever core first uses them; a single
+  // preemption inside the bus-response window is one corrupted byte that can
+  // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
+  // returns, so nothing needs restoring.
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+      // Hoisted: pokey_base/pokey_mask are volatile, and reading them from
+      // memory on every pass through the cold branch is what made a cart with
+      // no POKEY at all (Alien Brigade) start glitching on the other board.
+      const uint32_t pkbase = (uint32_t)pokey_base;
+      const uint32_t pkmask = (uint32_t)pokey_mask;
+      // bank is a byte OFFSET into rom_table for the $8000-$BFFF window (not a bank
+      // number): bank=0 means file bank 0 - the same 16KB already visible at
+      // $4000-$7FFF - is what a real 9-bank SuperGame cart shows at $8000 before its
+      // first bank-select write (MAME's a78 sg9 device: device_reset() { m_bank=0; }).
+      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      uint8_t rom_in_use=1;
+
+      while (1) {    // Get address
+             // Get address
+        rawaddr = gpio_get_all();
+        addr = rawaddr & BUS_PIN_MASK;
+        // Check for A15
+        if (rawaddr & A15_PIN_MASK) {
+          addr=addr | 0x8000;
+            // Check for A14
+            if (addr & A14_PIN_MASK) {
+                // Set the data on the bus for fixed bank 7
+                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x14000] << D0_PIN;
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == READ_PIN_MASK) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                }
+            } else {
+                // Set the data on the bus for active bank
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;
+                // Check for RW
+                rawaddr = gpio_get_all() & READ_PIN_MASK;
+	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
+                    // Read cycle
+                    if (!rom_in_use) {
+                       SET_DATA_MODE_OUT;
+                       rom_in_use = 1;
+                    }
+                } else {  // Write cycle to ROM
+                    rawaddr = gpio_get_all() & (RW_PIN_MASK | A15_PIN_MASK);
+                    // Check for bankswitch
+                    if (rawaddr == A15_PIN_MASK) {
+                        // Bankswitching write
+                        SET_DATA_MODE_IN;
+                        // Krok 20: end-of-cycle capture, proven on CART_TYPE_SUPERCART_RAM
+                        // in Krok 19 - the 6502 drives the data lines only in the second
+                        // half of a write cycle, and this polling loop catches the write at
+                        // a random phase. Bounded at 64 turns; an unbounded wait hung the
+                        // cart in Krok 18. A15 is gpio 26 here, outside BUS_PIN_MASK, so
+                        // compare BUS15_PIN_MASK.
+                        {
+                          uint32_t last = gpio_get_all(), cur;
+                          uint32_t full = last & BUS15_PIN_MASK;
+                          for (uint32_t g = 0; g < 64; g++) {
+                              cur = gpio_get_all();
+                              if ((cur & BUS15_PIN_MASK) != full) break;
+                              last = cur;
+                          }
+                          rawaddr = last;
+                        }
+                        // Mask 7, not 0xF: MAME computes bank_mask=7 for a 9-bank (144KB)
+                        // image and wraps the written value against it. With 0xF a stray
+                        // write of 8..15 would select "file banks 9..16", i.e. read past
+                        // the end of rom_table into unrelated RAM - Alien Brigade writes
+                        // values it loaded from memory here, not only the immediates
+                        // 2..5 seen in its startup code, so out-of-range values cannot be
+                        // ruled out. +1: file bank 0 is already shown at $4000.
+                        bank = (((rawaddr >> D0_PIN) & 0x7) + 1) * 0x4000;
+                        rom_in_use = 0;
+                    }
+                }
+            }
+        } else {
+            // EXROM - first 16k at 0x4000
+            if (addr & 0x4000) {
+                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) ] << D0_PIN;
+                rawaddr = gpio_get_all() & (RW_PIN_MASK | A14_PIN_MASK);
+	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
+                    // Read cycle
+                    if (!rom_in_use) {
+                        SET_DATA_MODE_OUT;
+                        rom_in_use = 1;
+                    }
+                } else {
+                    if (rom_in_use) {
+                        SET_DATA_MODE_IN;
+                        rom_in_use = 0;
+                    }
+                }
+            } else {
+                // $0000-$3FFF. The $0450/$0440/$0800 POKEY windows live here, below
+                // every SuperGame window, so they cannot collide with ROM/RAM.
+                if ((addr & pkmask) == pkbase) {
+                    pokey_window_service(addr, &rom_in_use);
+                } else if (rom_in_use) {
+                    SET_DATA_MODE_IN;
+                    rom_in_use = 0;
+                }
+            }
+        }
+      }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////
 //                     HANDLE BUS
@@ -1225,7 +1675,7 @@ start:
         break;
 
      case CART_TYPE_SUPERCART_RAM: 
-      emulate_supercart_ram();
+      if (pokey_enabled) emulate_supercart_ram_pokey(); else emulate_supercart_ram();
         break;
       
     case CART_TYPE_SUPERCART:
@@ -1237,11 +1687,13 @@ start:
       // silently got RAM at $4000 instead of the ROM data it expects there.
      case CART_TYPE_SUPERCART_EF:
       // Continually check address lines and put associated data on bus.
-      emulate_supercart_ef();
+      if (pokey_enabled) emulate_supercart_ef_pokey();
+      else               emulate_supercart_ef();
         break;
     
     case CART_TYPE_NORMALA78:
-      emulate_normala78();
+      if (pokey_enabled) emulate_normala78_pokey();
+      else               emulate_normala78();
     break;
 
     case CART_TYPE_ABSOLUTE:
@@ -1740,7 +2192,7 @@ start:
       case CART_TYPE_SUPERCART_ROM: // same 9-bank shape as SUPERCART_LARGE; used to fall
                                      // through to default (no emulation at all, dead cart)
       case CART_TYPE_SUPERCART_LARGE:
-      emulate_supercart_large();
+      if (pokey_enabled) emulate_supercart_large_pokey(); else emulate_supercart_large();
         break;
 
     default:
@@ -2139,6 +2591,30 @@ int identify_cartridge(char *filename)
         Serial.print("53:");Serial.println(A78_HEADER[53],DEC);
         Serial.print("54:");Serial.println(A78_HEADER[54],DEC);
         
+        // POKEY placement, from the 16-bit header field (byte53 high, byte54 low -
+        // the order MAME, ProSystem and test7800 all agree on):
+        //   bit0  -> $4000    bit6  -> $0450    bit10 -> $0440    bit15 -> $0800
+        // Taken BEFORE the mask on the next line, which clears bit0.
+        {
+          uint16_t head_lo = A78_HEADER[54];
+          // MAME's validate_header() disables POKEY@$4000 when the same header also
+          // claims $4000 for RAM / bank 0 / bank 6 / banked RAM - they cannot share
+          // the window and the game needs its data there, not a sound chip.
+          uint8_t conflict = head_lo & 0x3d;
+          if (conflict == 0x05 || conflict == 0x09 ||
+              conflict == 0x11 || conflict == 0x21) {
+            head_lo &= (uint16_t)~0x01;
+          }
+          pokey_mask = 0xFFF0;
+          if      (head_lo & 0x0001)     { pokey_enabled = 1; pokey_base = 0x4000; }
+          else if (head_lo & 0x0040)     { pokey_enabled = 1; pokey_base = 0x0450; }
+          else if (head_lo & 0x0400)     { pokey_enabled = 1; pokey_base = 0x0440; }
+          else if (A78_HEADER[53] & 0x80){ pokey_enabled = 1; pokey_base = 0x0800;
+                                           pokey_mask = 0xF800; }  // $0800-$0FFF
+          else                           { pokey_enabled = 0; pokey_base = 0xFFFF; }
+          for (int i=0;i<16;i++) pokey_regs[i]=0;
+        }
+
         if(A78_HEADER[53] == 0) {
           A78_HEADER[54]=A78_HEADER[54]&0b10111110;
           if(image_size > (131072+0x80)) {
@@ -2722,6 +3198,10 @@ void loop()
   Serial.println("waiting commands..");
  
   while (1) {
+   // Once a POKEY cart is running, core 0 has nothing left to do - the menu is gone
+   // and core 1 never returns - so hand it to audio synthesis.
+   if (newgame && pokey_enabled) pokey_run();   // never returns
+
   if (retaddr>=CART_CMD_SEL_ITEM_n) {
     if (retaddr==CART_CMD_ROOT_DIR) {
       retaddr=0;
