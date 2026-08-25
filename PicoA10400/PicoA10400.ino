@@ -173,14 +173,11 @@ bool fs_changed;
 #define CART_TYPE_MRAM	41	// Atari 7800 flat ROM + mRAM ("masked RAM") @$4000
 #define CART_TYPE_VERSA	42	// Atari 7800 VersaBoard: SuperGame + 2x16K banked RAM
 
-#define CCM_RAM ((uint8_t*)0x10000000)
-#define CCM_SIZE (64 * 1024)
-
-#define RAM_BANKS 48
-#define CCM_BANKS 32
-
-#define MAX_RAM_BANK (RAM_BANKS - 1)
-#define MAX_CCM_BANK (MAX_RAM_BANK + CCM_BANKS)
+// CCM_RAM/CCM_SIZE/RAM_BANKS/CCM_BANKS/MAX_RAM_BANK/MAX_CCM_BANK removed
+// (OPTIMIZATION.md 2.6): UnoCart (STM32) relic, unused anywhere in this
+// file. $10000000 is XIP FLASH on an RP2040, not fast RAM - CCM_RAM was
+// not just dead, it was a live landmine for any future UnoCart port that
+// reached for it by habit.
 
 typedef struct __attribute__((packed)) {
 	uint8_t entry_lo;
@@ -210,7 +207,9 @@ typedef struct {
 	int cart_type;
 } EXT_TO_CART_TYPE_MAP;
 
-EXT_TO_CART_TYPE_MAP ext_to_cart_type_map[] = {
+// const (OPTIMIZATION.md 2.4): read-only lookup table, only ever walked
+// in identify_cartridge() - moves it from RAM (.data) to flash (.rodata).
+const EXT_TO_CART_TYPE_MAP ext_to_cart_type_map[] = {
 	{"ROM", CART_TYPE_NONE},
 	{"BIN", CART_TYPE_NONE},
 	{"A26", CART_TYPE_NONE},
@@ -254,7 +253,21 @@ unsigned int cart_size_bytes;
 
 //unsigned char rom_table[32*1024];
 char menu_status[16];
-uint8_t AR_ROM[8448*4];
+// AR_ROM overlaid onto the unused tail of rom_table (OPTIMIZATION.md 2.1),
+// instead of a separate 33792-byte array. Safe because the two never
+// overlap in a live game: the AR file-load path (identify_cartridge())
+// never touches rom_table at all - "we don't load the entire file into
+// the rom_table here", it goes straight to AR_ROM and jumps to "found" -
+// and emulate_supercharger_cartridge() never touches rom_table past
+// offset 0x40FF (ram/rom/multiload_map/multiload_buffer; read_multiload()
+// fills exactly rom_table[0x2100..0x40FF], the top of its working set).
+// That leaves 96KB of margin between the emulator's high-water mark and
+// this overlay's start. AR_ROM is a macro, not an array, from here down -
+// every place that used to size the array now reads AR_ROM_SIZE, since
+// measuring the macro directly would size the pointer expression
+// (4 bytes), not the intended capacity.
+#define AR_ROM_SIZE (8448*4)
+#define AR_ROM (rom_table + sizeof(rom_table) - AR_ROM_SIZE)
 // bugs/b01: file names were capped at 48 bytes (47 usable + terminator). SdFat's
 // getName8() correctly REFUSES to write past the buffer it's given (FsUtf::cpToMb
 // returns null when it runs out of room) - that is not a library bug. The bug was
@@ -863,6 +876,14 @@ void __time_critical_func(emulate_supercart_large()) {
       }
 }
 
+// Hardened + reordered (patch 0.26). This was the ONLY emulate_* function left
+// at the sketch's default -Os, still driving the bus through gpio_put_masked() -
+// the pair patch 0.09 replaced everywhere else, because gpio_put_masked()
+// compiles to a call into a RAM-resident helper (~25 cycles plus XIP-cache-miss
+// jitter) instead of one inlined store, on EVERY bus response. 0.13 scoped
+// Supercharger out of that pass ("needs a variant preserving A13-A15") and it was
+// never revisited; AR was also never hardware-tested until now.
+__attribute__((optimize("O2")))
 void __time_critical_func(emulate_supercharger_cartridge())  {
   // v0.13 (P2): core-1 IRQs off for the lifetime of the emulation loop. Arduino
   // libraries can install handlers on whichever core first uses them; a single
@@ -887,11 +908,10 @@ void __time_critical_func(emulate_supercharger_cartridge())  {
 
   image_size=romLen;
   multiload_count = image_size / 8448;
-  
-  memset(ram, 0, 0x1800);
-	setup_rom(rom);
-  
-  setup_multiload_map(multiload_map, multiload_count);
+
+  // NOTE: memset(ram)/setup_rom()/setup_multiload_map() used to run HERE. They
+  // now run in setup_supercharger(), called BEFORE reboot_cartridge() - see the
+  // call site in setup1() for why that ordering is mandatory.
 
   while (1) {
 		while (((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev) || (addr != addr_prev2))
@@ -906,7 +926,14 @@ void __time_critical_func(emulate_supercharger_cartridge())  {
 			else
 				value_out = addr < 0x1800 ? bank0[addr & 0x07ff] : bank1[addr & 0x07ff];
 
-			gpio_put_masked(DATA_PIN_MASK,value_out<<D0_PIN);	
+			// Masked toggle, copied from PlusCart-Pico's RP2040 DATA_OUT
+			// (ORIG/PlusCart-Pico/include/cartridge_io.h:30) - the closest reference
+			// implementation available, same chip. Stays entirely in RAM (no flash
+			// veneer) yet touches ONLY D0-D7, which is exactly the "preserving variant"
+			// patch 0.13 said this function needed: "in 2600 mode A13-A15
+			// (BUS_H_PIN_MASK) are also outputs, so the bare SIO store used here would
+			// clobber them".
+			sio_hw->gpio_togl = (sio_hw->gpio_out ^ ((uint32_t)value_out << D0_PIN)) & DATA_PIN_MASK;
 		
 			SET_DATA_MODE_OUT;
 
@@ -2145,8 +2172,29 @@ start:
    int ret=set_sys_clock_khz(EMU_CLOCK_KHZ, true); // was hardcoded 400000 - see EMU_CLOCK_KHZ
   }
   if (cart_to_emulate<=32) {
+   // Raise the core voltage for 2600 emulation too. setup() runs the whole chip
+   // at 250MHz on VREG_VOLTAGE_1_15 - an ~88% overclock over the RP2040's nominal
+   // 133MHz, at a voltage its own comment flags as marginal ("set to 1_15 or 1_20
+   // if you experience some glitches"). The 7800 dispatch above already bumps to
+   // 1_30 before emulating; the 2600 dispatch never did. Voltage only: the clock
+   // is already 250MHz from setup(), so set_sys_clock_khz() is not repeated.
+   vreg_set_voltage(VREG_VOLTAGE_1_30);
+   delay(2);   // let the regulator settle before the bus loop starts
    gpio_set_dir_out_masked(BUS_H_PIN_MASK);
   }
+  // AR/Supercharger is the ONE cart type whose "ROM" is not already sitting in
+  // rom_table by this point. Every other type had its full image loaded by
+  // identify_cartridge() before we got here, so the reset vector at $1FFC/$1FFD
+  // is valid. AR's cartridge ROM is the 311-byte mini-BIOS, and it was being
+  // installed by setup_rom() INSIDE emulate_supercharger_cartridge() - i.e.
+  // AFTER the reboot below. Since reboot_cartridge() feeds the 6502 a
+  // JMP ($FFFC), the CPU was reading its reset vector out of whatever the
+  // previous game or the menu kernel had left at that offset. All FOUR
+  // reference implementations in ORIG/ get this right - UnoCart-2600,
+  // DirtyHairy-UnoCart-2600, United-Carts-of-Atari and PlusCart-Pico all call
+  // reboot AFTER setup_rom()/setup_multiload_map(). Restore that ordering.
+  if (cart_to_emulate == CART_TYPE_AR) setup_supercharger();
+
   reboot_cartridge(addr,addr_prev);
   
   //exit_cartridge(addr,addr_prev);
@@ -2796,6 +2844,19 @@ static void setup_multiload_map(uint8_t *multiload_map, uint32_t multiload_count
 	}
 }
 
+// Supercharger: install the mini-BIOS and build the multiload map. Split out of
+// emulate_supercharger_cartridge() so it can run BEFORE reboot_cartridge(),
+// which is the whole point - see the call site in setup1().
+static void setup_supercharger(void) {
+  uint8_t *ram = rom_table;
+  uint8_t *rom = ram + 0x1800;
+  uint8_t *multiload_map = rom + 0x0800;
+
+  memset(ram, 0, 0x1800);
+  setup_rom(rom);
+  setup_multiload_map(multiload_map, (uint32_t)romLen / 8448);
+}
+
 static void read_multiload(uint8_t *buffer, uint8_t physical_index) {
 
   int start=physical_index * 8448;
@@ -3058,7 +3119,7 @@ int identify_cartridge(char *filename)
   if (ext[1]>96) ext[1]=ext[1]-32;
   ext[2]=filename[pos+3];
   if (ext[2]>96) ext[2]=ext[2]-32;
-  EXT_TO_CART_TYPE_MAP *p = ext_to_cart_type_map;
+  const EXT_TO_CART_TYPE_MAP *p = ext_to_cart_type_map;
   char test[3];
 	while (p->ext) {
     memcpy(test,p->ext,3);
@@ -3078,11 +3139,11 @@ int identify_cartridge(char *filename)
 	if ((cart_type == CART_TYPE_NONE) && ((image_size % 8448) == 0))
 		cart_type = CART_TYPE_AR;
 	if (cart_type == CART_TYPE_AR) {
-        if (image_size > sizeof(AR_ROM)) {
+        if (image_size > AR_ROM_SIZE) {
           Serial.print("ERROR: Supercharger image (");Serial.print(image_size);
-          Serial.print(" bytes) exceeds AR_ROM capacity (");Serial.print(sizeof(AR_ROM));
+          Serial.print(" bytes) exceeds AR_ROM capacity (");Serial.print(AR_ROM_SIZE);
           Serial.println(" bytes), truncating to prevent memory corruption");
-          image_size = sizeof(AR_ROM);
+          image_size = AR_ROM_SIZE;
         }
         for (int i=0;i<image_size;i++) {
         int readbyte=file.read();
@@ -3773,10 +3834,22 @@ void loop()
   Serial.println("waiting commands..");
  
   while (1) {
-   // Once a POKEY cart is running, core 0 has nothing useful left to do - the menu
-   // is gone and core 1 never returns - so hand it to audio synthesis. This also
-   // stops the marquee loop from touching SRAM while core 1 is answering the bus.
-   if (newgame && pokey_enabled) pokey_run();   // never returns
+   // Once ANY cart is running, core 0 has nothing useful left to do - the menu is
+   // gone and every emulate_* function on core 1 is an infinite loop that never
+   // returns, whatever the cart type. The block below this point renders the menu
+   // marquee (renderEntry(): reads filelist[], writes menu_ram[], both in SRAM) and
+   // handles menu commands - real work only while the ATARI is running the menu
+   // kernel, but still executed every pass here regardless, because menuletto never
+   // resets to false once the menu has been browsed (which it always has, before any
+   // game can be selected). For a POKEY cart this was already worked around by
+   // handing core 0 to audio synthesis, which incidentally also stops it touching
+   // that SRAM - but the fix only ever covered POKEY carts, not "any game is
+   // running". This is the same class of core0/core1 SRAM contention the POKEY
+   // carve-out exists to avoid.
+   if (newgame) {
+     if (pokey_enabled) pokey_run();   // never returns
+     continue;                          // no cart type ever hands control back here
+   }
 
   if (retaddr>=CART_CMD_SEL_ITEM_n) {
     if (retaddr==CART_CMD_ROOT_DIR) {

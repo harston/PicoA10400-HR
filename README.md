@@ -29,6 +29,11 @@
   on the Pico 2 board too, because the DPC makes no sound of its own: it hands the
   console a volume level and the game does the rest._
 
+- **Supercharger cassettes play**
+  _The Starpath/Arcadia titles — **Communist Mutants from Space**, **Dragonstomper**,
+  **Escape from the Mindmaster** and the rest of the tape library — now load and run
+  on an Atari 2600, multi-load games included. They never worked on this cart before._
+
 - **Three more cartridge types supported**
   _**mRAM** and **VersaBoard** on the 7800, **4KSC** on the 2600 — boards the cart
   simply did not answer before, so they showed nothing at all. The **Rescue On
@@ -61,6 +66,9 @@
   USB drive until the next power cycle. The emulation clock was lowered to 250MHz
   after measurements showed a higher one bought no timing margin at all, so the chip
   runs cooler and calmer.
+
+_Supercharger titles run on an Atari 2600; on an Atari 7800 in its 2600 mode they
+do not, and that one is not solved._
 
 _Not fixed, and out of the cartridge's reach: an NTSC ROM on a PAL console may run
 too fast and show interference along the bottom of the screen — use a PAL version
