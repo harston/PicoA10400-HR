@@ -15,9 +15,18 @@
 // Kod jest tu przeniesiony w calosci, zeby oba szkice pozostaly zgodne (CLAUDE.md)
 // i zeby przechwytywanie rejestrow POKEY dzialalo identycznie. Synteza tez sie
 // wykonuje. Zeby ja USLYSZEC, trzeba fizycznie polaczyc POKEY_AUDIO_PIN z pinem 18
-// zlacza - domyslnie ustawiony na GP25, bo to jedyny pin dostepny programowo, ktory
-// nie obsluguje magistrali (dioda LED na plytce Pico). Bez takiego przewodu ta
-// czesc kodu nic nie robi poza miganiem dioda w rytm dzwieku.
+// zlacza - ustawiony na GP25, bo to jedyny pin dostepny programowo, ktory nie
+// obsluguje magistrali (dioda LED na plytce Pico). Bez takiego przewodu ta czesc
+// kodu nic nie robi poza zmiana jasnosci diody w rytm dzwieku.
+//
+// BODGE (NIEPRZETESTOWANY): wylutuj diode LED plytki Pico i poprowadz przewod
+// z GP25 do pinu 18 (AUD IN) slotu 7800. Nikt tego dotad nie zbudowal ani nie
+// zmierzyl - to sciezka zaproponowana, nie zweryfikowana. Dioda jest usuwana,
+// bo inaczej wisi na wyjsciu rownolegle do wejscia audio konsoli. Wyjscie jest
+// surowym PWM bez filtru dolnoprzepustowego, tak samo jak na PicoA10400.
+//
+// YM2151 uzywa TEGO SAMEGO pinu (ym2151.h, YM_AUDIO_PIN) - jeden bodge obsluguje
+// oba uklady, bo nigdy nie graja jednoczesnie.
 //
 #ifndef POKEY_H
 #define POKEY_H

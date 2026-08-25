@@ -894,7 +894,17 @@ static inline int32_t next_sample() {
 // ---------------------------------------------------------------------------
 #ifndef YM_HOST_TEST
 
-#define YM_AUDIO_PIN    29          // ExtAudio -> 7800 connector pin 18, as POKEY
+// GP25, matching POKEY on this board. GP25 is the on-board LED pin, not a bus
+// pin, and it is NOT routed to the cartridge connector. A classic Pico 2
+// (RP2350A) on the standard Raspberry Pi Pico footprint brings out only
+// GP0-22 and GP26-28 - 26 pins - and the 7800 bus uses every one of them
+// (A0-A15 + D0-D7 + RW + CLK = 26). No GPIO is left to carry audio out to
+// the console, which is why this cannot simply be routed like on PicoA10400.
+// To actually HEAR this: remove the on-board LED and run a wire from GP25 to
+// pin 18 (AUD IN) of the 7800 slot. UNTESTED - no such bodge has been built
+// or measured. Without it ym_run() still synthesises, and the only visible
+// effect is the LED changing brightness with the music. See pokey.h.
+#define YM_AUDIO_PIN    25
 #define YM_PWM_WRAP     511         // 9-bit duty; carrier = clk_sys/512 = 488kHz
 #define YM_VOLUME_SHIFT 7           // 16-bit signed -> 9-bit unsigned duty
 

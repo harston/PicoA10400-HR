@@ -2219,8 +2219,9 @@ start:
   // Same shape as PicoA10400 (CLAUDE.md: keep the two in step). This board's
   // gate is >=33 so it never had the NORMALA78 hole the other one did, but the
   // structure is kept identical so a future edit cannot reintroduce it here.
-  // Note the raised clock buys nothing audible on THIS board - there is no audio
-  // line, so ym_run() synthesises into a pin that goes nowhere. If heat ever
+  // Note the raised clock buys nothing audible on THIS board unless the GP25
+  // bodge described in pokey.h has been fitted - the cartridge audio line is
+  // not routed here, so ym_run() synthesises into the LED pin. If heat ever
   // matters here, this is the one branch to drop.
   if (ym_enabled) {
    vreg_set_voltage(VREG_VOLTAGE_1_25);
