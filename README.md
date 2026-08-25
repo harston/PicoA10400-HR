@@ -16,6 +16,22 @@
   this board and simply unused. The synthesis runs on the core that sits idle once a
   game starts, so the picture costs nothing for the sound._
 
+- **FM sound — the YM2151 is emulated**
+  _The FM chip from Atari's XM expansion module is carried on the board by a few 7800
+  titles — **1942**, **Wonder Boy**, **Pac-Man Collection 40th Anniversary**,
+  **Block'Em Sock'Em** and some forty music demos — and all of them used to play in
+  silence. It is now emulated in software, again with no extra hardware. There is no
+  useful "roughly right" FM, so this is a full port of MAME's core rather than an
+  approximation, checked against it sample for sample. The dozen largest images are
+  still over the 144KB limit and stay out of reach._
+
+- **Carts that declare an extra chip now get their real mapper**
+  _A cartridge announcing a POKEY or a YM2151 in its `.a78` header was read as a plain
+  flat ROM whatever its actual bankswitching, which is why **Wonder Boy** and both
+  **Pac-Man Collection 40th Anniversary** dumps never started. Those two header bits
+  say what else sits on the board, not how it banks, and are now decoded the way MAME
+  does it._
+
 - **Many fixes in cartridge types**
   _Every type's mapping was verified against MAME and the ProSystem emulator, and
   many games work now that would not start at all before — **Double Dragon**,
@@ -74,15 +90,14 @@ _Not fixed, and out of the cartridge's reach: an NTSC ROM on a PAL console may r
 too fast and show interference along the bottom of the screen — use a PAL version
 where one exists. Some 2600 schemes stay out of range for a harder reason — **DPC+**
 and **CDFJ** cartridges carry their own ARM program and expect a processor in the
-cartridge to run it, which is what a Harmony has and this board does not. The
-**YM2151** FM chip used by some 7800 homebrew is not emulated either, so those
-titles stay silent._
+cartridge to run it, which is what a Harmony has and this board does not._
 
 _One POKEY is emulated, so the handful of demos wiring up two get roughly half their
 parts. The audio line exists only on **PicoA10400** — the Pico 2 board uses the
 standard Raspberry Pi Pico footprint, where the cartridge bus consumes every
-available pin, so **Pico2A10400 stays silent** no matter what the cartridge asks for.
-DPC music is the exception and plays on both boards, for the reason given above._
+available pin, so **Pico2A10400 stays silent** whether the cartridge asks for a POKEY
+or a YM2151. DPC music is the exception and plays on both boards, for the reason
+given above._
 
 _The DPC music generator is driven from a free-running clock rather than from the
 console's own cycles. Games where music is an accompaniment — Pitfall II among them —
