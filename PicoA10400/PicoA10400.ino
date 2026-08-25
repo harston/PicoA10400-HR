@@ -120,6 +120,9 @@ bool fs_changed;
 #define SET_DATA_MODE_OUT   gpio_set_dir_out_masked(DATA_PIN_MASK)
 #define SET_DATA_MODE_IN    gpio_set_dir_in_masked(DATA_PIN_MASK)
 
+#include "ym2151.h"  // YM2151 (OPM) FM synthesis, same audio pin. Included
+                     // BEFORE pokey.h, because pokey_window_service() hands
+                     // the $04xx window over to it for a YM cart.
 #include "pokey.h"   // minimal POKEY audio on GPIO29 (cart pin 18) - see
                      // pokey_feasibility/. Included here, after the pin masks,
                      // because pokey_capture_write() uses them.
@@ -297,21 +300,34 @@ char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: l
 // Everything else - menu, USB, 2600 types - keeps the 250MHz/1.15V set in setup().
 //
 // not_working_roms4 "Krok 13/17": the 400000 this used to be is ~3x past the RP2040's
-// 133MHz spec, and the measured timing budget says it buys nothing. Response path in
-// emulate_supercart_ram() is 18 instructions (objdump), and MARIA's tightest cartridge
-// access interval is ~279ns (maria.cpp cost model at 7.159MHz):
+// 133MHz spec, and the measured timing budget says it buys nothing FOR BUS TIMING.
+// Response path in emulate_supercart_ram() is 18 instructions (objdump), and MARIA's
+// tightest cartridge access interval is ~279ns (maria.cpp cost model at 7.159MHz):
 //     400MHz -> 45ns typical / 107ns worst case   (~6x margin)
 //     250MHz -> 72ns typical / 172ns worst case   (~3.9x margin)
 // Both fit comfortably, and both are faster than the 150-250ns mask ROMs MARIA was
-// designed against. So this is a pure stability experiment: if artifacts drop at
-// 250MHz, the overclock was CAUSING them rather than preventing them - which is also
-// what upstream's own "set to 1_15 or 1_20 if you experience some glitches" comment
-// in setup() hints at. Deliberately a single-variable change: the voltage below stays
-// at 1.30V, so any difference is attributable to the clock alone (a higher voltage at
-// a lower clock only widens internal timing margin, it cannot cause logic errors).
-// If 250000 helps, the follow-ups worth trying are 200000, and then dropping the
-// voltage to VREG_VOLTAGE_1_20 to cut heat.
+// designed against. So dropping from 400 to 250 was a pure stability experiment: if
+// artifacts dropped at 250MHz, the overclock was CAUSING them rather than preventing
+// them - which is also what upstream's own "set to 1_15 or 1_20 if you experience
+// some glitches" comment in setup() hints at.
+//
+// 2026-08-24: briefly raised to 300000 on the theory that YM2151 synthesis on core 0
+// was compute-bound. That was a guess, and it was WRONG - the real cause was a
+// truncated timestamp in ym2151.h's pacing loop, which made it free-run instead of
+// waiting (see the YM_PERIOD_US_FRAC comment there). The 300MHz build also came back
+// from hardware with NO audio at all, i.e. it regressed something rather than fixing
+// anything - unsurprising, since unlike every previous clock change here this one is
+// an ACTUAL PLL reconfiguration performed on core 1 while core 0 is already running,
+// not the no-op re-set of an already-current value. Reverted, and it stays reverted
+// unless a measurement (ym2151.h YM_REPORT_RATE) actually shows core 0 short of
+// cycles at 250MHz.
 #define EMU_CLOCK_KHZ 250000
+
+// YM_CLOCK_KHZ - the core clock used while a YM2151 cart plays - is defined in
+// ym2151.h, next to the sample rate that motivates it. It has to live there
+// because that header is included long before this point and its own benchmark
+// reports against it.
+
 
 // Marquee: the highlighted entry scrolls when its name is longer than the 12 columns
 // a row can show. Only that row moves - moving the cursor away restores the plain
@@ -1323,6 +1339,7 @@ void __time_critical_func(emulate_normala78_pokey()) {
   const uint32_t lo = (base_rom < 0x4000) ? 0x4000 : base_rom;
   const uint32_t pkbase = (uint32_t)pokey_base;   // volatile: hoist out of the loop
   const uint32_t pkmask = (uint32_t)pokey_mask;
+  const uint32_t ymon   = (uint32_t)ym_enabled;  // ditto - never read in the loop
 
   while (1) {
     while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
@@ -1337,6 +1354,13 @@ void __time_critical_func(emulate_normala78_pokey()) {
       SET_DATA_MODE_OUT;
       while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
       SET_DATA_MODE_IN;
+    } else if ((addr & pkmask) == pkbase && ymon) {
+      // YM2151 window ($0460/$0461). This one CANNOT be listen-only: 32 of the 45
+      // YM carts sit in "BIT $0461 / BMI *-3" waiting for the BUSY bit to clear
+      // and write nothing until they see it. ym_window_service_blocking() answers
+      // in the same drive/wait/release shape this loop uses for ROM, so it does
+      // not change how the loop behaves - see ym2151.h.
+      ym_window_service_blocking(addr);
     } else if ((addr & pkmask) == pkbase) {      // POKEY register window
       // LISTEN ONLY - deliberately no read support on this path.
       // Reads were tried here and REGRESSED "3D Worldrunner Theme Melody (4000)",
@@ -2167,9 +2191,20 @@ start:
   ballout:
      delay(12); // 16 or 12 don't remove!!!
   
-  if (cart_to_emulate>=35) {
+  // A YM2151 cart needs the higher clock whatever its mapper happens to be, so
+  // this test is on ym_enabled and NOT nested inside the one below.
+  // 2026-08-24: it was nested, and "cart_to_emulate>=35" silently excluded
+  // CART_TYPE_NORMALA78 (33) - which is what 29 of the 45 YM carts in this
+  // library are, "OutRun - Last Wave" and "UN Squadron" among them. Those two
+  // were reported still warbling after the clock was supposedly raised; they had
+  // in fact been getting neither the clock NOR the 1.30V, and YM_LOG.TXT still
+  // reading clk_sys=250000 is what gave it away.
+  if (ym_enabled) {
    vreg_set_voltage(VREG_VOLTAGE_1_30);
-   int ret=set_sys_clock_khz(EMU_CLOCK_KHZ, true); // was hardcoded 400000 - see EMU_CLOCK_KHZ
+   int ret=set_sys_clock_khz(YM_CLOCK_KHZ, true);
+  } else if (cart_to_emulate>=35) {
+   vreg_set_voltage(VREG_VOLTAGE_1_30);
+   int ret=set_sys_clock_khz(EMU_CLOCK_KHZ, true);
   }
   if (cart_to_emulate<=32) {
    // Raise the core voltage for 2600 emulation too. setup() runs the whole chip
@@ -2182,6 +2217,10 @@ start:
    delay(2);   // let the regulator settle before the bus loop starts
    gpio_set_dir_out_masked(BUS_H_PIN_MASK);
   }
+  // Clock and voltage are now whatever this cart is going to run at, so core 0
+  // may start synthesising. See emu_clock_ready in ym2151.h.
+  emu_clock_ready = 1;
+
   // AR/Supercharger is the ONE cart type whose "ROM" is not already sitting in
   // rom_table by this point. Every other type had its full image loaded by
   // identify_cartridge() before we got here, so the reset vector at $1FFC/$1FFD
@@ -3105,6 +3144,12 @@ int identify_cartridge(char *filename)
 	int cart_type = CART_TYPE_NONE;
   int bytes_read;
   char A78_HEADER[0X80];
+  // Cleared here, not in the a78 branch: a 2600 file inspected after a 7800 one
+  // must not inherit the previous cart's aux chip. (pokey_enabled has always had
+  // that flaw; it is harmless in practice because a game never hands core 1 back,
+  // so only the LAST identify before newgame can matter - but there is no reason
+  // to add a second one.)
+  ym_enabled = 0;
 	Serial.print("Identify:");Serial.println(filename);
   
   if (!(file.open(filename))) Serial.println("Open error");
@@ -3231,6 +3276,37 @@ int identify_cartridge(char *filename)
         }
         for (int i=0;i<16;i++) pokey_regs[i]=0;
         Serial.print("POKEY base:");Serial.println(pokey_base,HEX);
+
+        // YM2151 (OPM) at $0460/$0461 - byte53 bit 3, "ym2151 at $460/$461" in
+        // both MAME (xm.cpp) and ProSystem/JS7800 (Cartridge.js:443). 45 files in
+        // this library declare it, among them 1942, Wonder Boy, Pac-Man Collection
+        // 40th Anniversary and Block'Em Sock'Em.
+        //
+        // The chip belongs to Atari's XM expansion module, and 37 of the 45 write
+        // the XM's enable register at $0470 before using it. We deliberately do NOT
+        // decode $0470: a cartridge that carries its own YM2151 has no such
+        // register, so the chip is simply always present. That serves both groups -
+        // the $0470 write becomes a harmless store into open bus.
+        //
+        // Reusing pokey_base/pokey_mask is not a hack, it is the whole point: every
+        // emulate_*_pokey() loop already tests one aux-chip window in the
+        // $0000-$3FFF branch, and pokey_window_service() forwards to ym2151.h when
+        // ym_enabled is set. Only one aux chip is emulated either way; the single
+        // header here that declares both (Pit Fighter prototype, 0x2813) has its
+        // POKEY disabled by the $4000 conflict rule above in any case.
+        ym_enabled = (A78_HEADER[53] & 0x08) ? 1 : 0;
+        if (ym_enabled) {
+          pokey_enabled = 1;          // selects the listening emulate_* variant
+          pokey_base    = 0x0460;
+          pokey_mask    = 0xFFFE;     // exactly two bytes, as MAME's XM decodes
+          Serial.println("YM2151 @ $0460");
+#if YM_REPORT_RATE
+          // Measure core 0's FM throughput HERE, where writing a file is safe -
+          // no game is running yet and this function is already doing file I/O.
+          // See ym2151.h for why it cannot be done from inside ym_run().
+          ym_benchmark_and_log();
+#endif
+        }
 
         // MAME picks the bankswitch scheme from (byte53<<8 | byte54) & 0xe02e and
         // only afterwards overrides it, and only for byte53 EXACTLY 0x01
@@ -3873,6 +3949,7 @@ void loop()
    // running". This is the same class of core0/core1 SRAM contention the POKEY
    // carve-out exists to avoid.
    if (newgame) {
+     if (ym_enabled)    ym_run();      // never returns
      if (pokey_enabled) pokey_run();   // never returns
      continue;                          // no cart type ever hands control back here
    }

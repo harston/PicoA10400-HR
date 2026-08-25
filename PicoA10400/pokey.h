@@ -123,6 +123,12 @@ static inline __attribute__((always_inline)) uint8_t pokey_read_reg(uint32_t reg
 // the one that survives, which is end-of-cycle capture for free.
 static inline __attribute__((always_inline))
 void pokey_window_service(uint32_t addr, uint8_t *rom_in_use) {
+  // A YM2151 cart reuses this whole mechanism: identify_cartridge() points
+  // pokey_base/pokey_mask at $0460/$0461 and sets pokey_enabled, so every
+  // emulate_*_pokey() loop already routes the window here without a single
+  // change at the call sites. Only one aux chip is emulated, so this is a
+  // choice, not a merge - see ym2151.h.
+  if (ym_enabled) { ym_window_service(addr, rom_in_use); return; }
   uint32_t g = gpio_get_all();
   if (g & RW_PIN_MASK) {                                   // read cycle
     sio_hw->gpio_out = (uint32_t)pokey_read_reg(addr & 0x0F) << D0_PIN;
