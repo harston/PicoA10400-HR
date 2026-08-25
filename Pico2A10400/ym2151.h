@@ -1,13 +1,13 @@
 // ym2151.h - Yamaha YM2151 (OPM) FM synthesis for Pico2A10400
 //
-// !!! TA PLYTKA NIE MA PODLACZONEJ LINII AUDIO !!!
-// Ta sama sytuacja co w pokey.h: Pico2A10400 uzywa standardowej stopki Raspberry
-// Pi Pico, ktora nie wyprowadza GP29, wiec siec ExtAudio od pinu 18 zlacza konczy
-// sie w powietrzu. Synteza dziala, ale nie ma czym jej wypuscic.
+// !!! THIS BOARD HAS NO AUDIO LINE CONNECTED !!!
+// Same situation as in pokey.h: Pico2A10400 uses the standard Raspberry Pi Pico
+// footprint, which does not expose GP29, so the ExtAudio net from connector pin 18
+// ends in mid-air. The synthesis does run, there is just nothing to output it to.
 //
-// Kod jest tu przeniesiony w calosci, zeby oba szkice pozostaly zgodne (CLAUDE.md),
-// i CZESC MAGISTRALOWA MA ZNACZENIE takze tutaj: bez odpowiedzi na $0460/$0461
-// kartridz YM zawisa w petli wykrywania ukladu zamiast dzialac bezglosnie.
+// The code is carried over here in full so both sketches stay in sync (CLAUDE.md),
+// and the BUS-SIDE PART MATTERS here too: without a response on $0460/$0461 a YM
+// cartridge hangs in its chip-detection loop instead of running silently.
 //
 // WHAT THIS IS FOR
 // ----------------

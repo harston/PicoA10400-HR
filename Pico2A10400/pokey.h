@@ -1,32 +1,32 @@
 // pokey.h - minimal POKEY audio synthesis for Pico2A10400
 //
-// !!! TA PLYTKA NIE MA PODLACZONEJ LINII AUDIO !!!
+// !!! THIS BOARD HAS NO AUDIO LINE CONNECTED !!!
 //
-// Odczytane ze schematu Pico2A10400.pdf: plytka uzywa STANDARDOWEJ stopki
-// Raspberry Pi Pico (symbol U3), ktora wyprowadza tylko GPIO 0-22 i 26-28 - razem
-// 26 pinow. Magistrala 7800 zjada je co do jednego: A0-A15 (16) + D0-D7 (8) + RW +
-// CLK = 26. Etykieta sieci "ExtAudio" istnieje przy pinie 18 zlacza kartridzowego
-// (U2), ale NIE MA odpowiednika po stronie Pico - siec konczy sie w powietrzu.
+// Read off the Pico2A10400.pdf schematic: the board uses the STANDARD Raspberry
+// Pi Pico footprint (symbol U3), which exposes only GPIO 0-22 and 26-28 - 26 pins
+// total. The 7800 bus eats every one of them: A0-A15 (16) + D0-D7 (8) + RW + CLK
+// = 26. The "ExtAudio" net label exists at pin 18 of the cartridge connector (U2),
+// but there is NO counterpart on the Pico side - the net ends in mid-air.
 //
-// Dla porownania PicoA10400 uzywa "purpurowego klona", ktory wyprowadza dodatkowo
-// GP23/24/25/29, i tam pin 18 jest poprowadzony do GP29 (patrz
-// pokey_feasibility/README.md) - dlatego dzwiek dziala na tamtej plytce.
+// For comparison, PicoA10400 uses a "purple clone" that additionally exposes
+// GP23/24/25/29, and there pin 18 is routed to GP29 (see
+// pokey_feasibility/README.md) - which is why sound works on that board.
 //
-// Kod jest tu przeniesiony w calosci, zeby oba szkice pozostaly zgodne (CLAUDE.md)
-// i zeby przechwytywanie rejestrow POKEY dzialalo identycznie. Synteza tez sie
-// wykonuje. Zeby ja USLYSZEC, trzeba fizycznie polaczyc POKEY_AUDIO_PIN z pinem 18
-// zlacza - ustawiony na GP25, bo to jedyny pin dostepny programowo, ktory nie
-// obsluguje magistrali (dioda LED na plytce Pico). Bez takiego przewodu ta czesc
-// kodu nic nie robi poza zmiana jasnosci diody w rytm dzwieku.
+// The code is carried over here in full so both sketches stay in sync (CLAUDE.md)
+// and so POKEY register capture behaves identically. The synthesis does run too.
+// To actually HEAR it, physically wire POKEY_AUDIO_PIN to connector pin 18 -
+// it is set to GP25, the only pin available in software that does not serve
+// the bus (the LED on the Pico board). Without that wire this part of the code
+// does nothing but vary the LED's brightness in time with the sound.
 //
-// BODGE (NIEPRZETESTOWANY): wylutuj diode LED plytki Pico i poprowadz przewod
-// z GP25 do pinu 18 (AUD IN) slotu 7800. Nikt tego dotad nie zbudowal ani nie
-// zmierzyl - to sciezka zaproponowana, nie zweryfikowana. Dioda jest usuwana,
-// bo inaczej wisi na wyjsciu rownolegle do wejscia audio konsoli. Wyjscie jest
-// surowym PWM bez filtru dolnoprzepustowego, tak samo jak na PicoA10400.
+// BODGE (UNTESTED): desolder the Pico board's LED and run a wire from GP25 to
+// pin 18 (AUD IN) of the 7800 slot. Nobody has built or measured this yet - it
+// is a proposed path, not a verified one. The LED is removed because otherwise
+// it hangs on the output in parallel with the console's audio input. The output
+// is raw PWM with no low-pass filter, same as on PicoA10400.
 //
-// YM2151 uzywa TEGO SAMEGO pinu (ym2151.h, YM_AUDIO_PIN) - jeden bodge obsluguje
-// oba uklady, bo nigdy nie graja jednoczesnie.
+// YM2151 uses the SAME pin (ym2151.h, YM_AUDIO_PIN) - one bodge serves both
+// chips, since they never play at the same time.
 //
 #ifndef POKEY_H
 #define POKEY_H
@@ -34,7 +34,7 @@
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
 
-#define POKEY_AUDIO_PIN   25        // LED na plytce - pin 18 NIE jest tu poprowadzony
+#define POKEY_AUDIO_PIN   25        // LED on the board - pin 18 is NOT routed here
 #define POKEY_SAMPLE_RATE 32000
 #define POKEY_PWM_WRAP    255       // 8-bit PWM; carrier = clk_sys / 256
 
