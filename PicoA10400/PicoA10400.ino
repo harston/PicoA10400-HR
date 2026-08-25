@@ -3232,7 +3232,31 @@ int identify_cartridge(char *filename)
         for (int i=0;i<16;i++) pokey_regs[i]=0;
         Serial.print("POKEY base:");Serial.println(pokey_base,HEX);
 
-        if(A78_HEADER[53] == 0) {
+        // MAME picks the bankswitch scheme from (byte53<<8 | byte54) & 0xe02e and
+        // only afterwards overrides it, and only for byte53 EXACTLY 0x01
+        // (Activision) or 0x02 (Absolute) - a78_slot.cpp:409-490. Bits 2 and 3 of
+        // byte53, POKEY at $0440 and YM2151 at $0460, are outside that mask: they
+        // say what ELSE is on the board, not how it banks.
+        //
+        // Gating this whole chain on "byte53 == 0" therefore dropped every cart
+        // that declares one of those chips straight through to the flat-ROM path.
+        // Measured over the 2345 headers in ROMS/7800, this change plus the
+        // byte54==8 fix below moves 22 files and no others:
+        //   16  YM2151 carts onto their real board - Wonder Boy (SuperGame+RAM),
+        //       Pac-Man Collection 40th x2 (SuperGame), Block'Em Sock'Em
+        //       (9-bank), and 12 that are 256KB-1MB and stay unplayable for the
+        //       unrelated reason that rom_table holds 144KB
+        //    4  flat 48KB carts off the 9-bank SuperCart path (byte54==8)
+        //    2  dual-POKEY LZSS demos onto SuperGame+RAM, which is what MAME
+        //       gives header 0x0446
+        // The Activision/Absolute tests stay on the RAW byte, so headers like
+        // 0x05 (Impossible Mission [f1]) keep landing where they land today.
+        uint8_t map53 = A78_HEADER[53] & (uint8_t)~0x0C;
+        if(A78_HEADER[53] == 1) {
+          cart_type = CART_TYPE_ACTIVISION;
+        } else if(A78_HEADER[53] == 2) {
+          cart_type = CART_TYPE_ABSOLUTE;
+        } else if(map53 == 0) {
           // Keep the raw low byte: the mask on the next line clears bit 0 and
           // bit 6, and bit 6 (POKEY @$0450) is what selects the _pokey variant
           // for a VersaBoard. Bits 7 and 5, which pick the mapper itself, do
@@ -3261,19 +3285,21 @@ int identify_cartridge(char *filename)
               cart_type = CART_TYPE_SUPERCART_EF;
           } else if(A78_HEADER[54] == 4 || A78_HEADER[54] == 5 || A78_HEADER[54] == 6 || A78_HEADER[54] == 7) {
             cart_type = CART_TYPE_SUPERCART_RAM;
-          } else if(A78_HEADER[54] == 8 || A78_HEADER[54] == 9 || A78_HEADER[54] == 10 || A78_HEADER[54] == 11) {
+          } else if(A78_HEADER[54] == 10 || A78_HEADER[54] == 11) {
+              // MAME's switch has a case for 0x000a (A78_TYPEA - SuperGame with
+              // bank 6 at $4000, Alien Brigade/Crossbow) but NONE for 0x0008, so
+              // that value leaves m_type at its initial A78_TYPE0: a plain flat
+              // cart. Byte54 bit 3 on its own means "ROM at $4000", which for a
+              // non-bankswitched board is simply a 48K image - and every one of
+              // the 21 files in ROMS/7800 that masks to 0x08 is exactly 49152
+              // bytes. Serving them as a 9-bank SuperCart, which is what this
+              // branch used to do, cannot have worked.
               cart_type = CART_TYPE_SUPERCART_ROM;
           } else {
             cart_type = CART_TYPE_NORMALA78;
           }
-        } else { 
-        if(A78_HEADER[53] == 1) {
-          cart_type = CART_TYPE_ACTIVISION;
-        } else if(A78_HEADER[53] == 2) {
-          cart_type = CART_TYPE_ABSOLUTE;
-          } else {
+        } else {
           cart_type = CART_TYPE_NORMALA78;
-          }
         }
       Serial.println("7800 cart");
       goto close_exit;
