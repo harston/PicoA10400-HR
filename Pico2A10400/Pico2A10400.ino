@@ -1339,10 +1339,59 @@ void __time_critical_func(emulate_normala78_pokey()) {
   const uint32_t pkmask = (uint32_t)pokey_mask;
   const uint32_t ymon   = (uint32_t)ym_enabled;  // ditto - never read in the loop
 
+#if POKEY_DIAG_E6
+  // E6 DIAGNOSTIC BUILD (pokey.h) - carried here to keep both sketches in step;
+  // the experiment is run on PicoA10400. Same idea: non-blocking, and OE held
+  // across consecutive reads via rom_in_use instead of released after every
+  // fetch, in the shape emulate_supercart_ram() already proves on hardware.
+  // See PicoA10400.ino for the full reasoning and the 0.18 regression it
+  // avoids. The one board difference stays: A15 is gpio 26, outside
+  // BUS_PIN_MASK, so the full address is reassembled before the range test.
+  uint8_t rom_in_use = 0;
   while (1) {
+    uint32_t raw = gpio_get_all();
+    rawaddr = raw & BUS15_PIN_MASK;
+    addr = (rawaddr & BUS_PIN_MASK) | ((rawaddr & A15_PIN_MASK) ? 0x8000 : 0);
+    if (addr >= lo) {
+      sio_hw->gpio_out = (uint32_t)rom_table[addr - base_rom] << D0_PIN;
+      if (raw & RW_PIN_MASK) {
+        if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+      } else if (rom_in_use) {
+        SET_DATA_MODE_IN; rom_in_use = 0;
+      }
+    } else {
+      if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+      if ((addr & pkmask) == pkbase && ymon) {
+        ym_window_service_blocking(addr);
+      } else if ((addr & pkmask) == pkbase) {
+        if (!(gpio_get_all() & RW_PIN_MASK)) {
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS15_PIN_MASK) != rawaddr) break;
+            last = cur;
+          }
+          uint32_t pkreg = addr & 0x0F;
+          pokey_capture_write(pkreg, (uint8_t)((last >> D0_PIN) & 0xFF));
+        }
+      }
+    }
+  }
+  (void)addr_prev;
+#else
+  while (1) {
+#if POKEY_DIAG_E7
+    // E7 DIAGNOSTIC BUILD (pokey.h) - see PicoA10400.ino. THREE matching samples
+    // instead of two, and nothing else changed.
+    do {
+      while ((rawaddr = (gpio_get_all()&BUS15_PIN_MASK)) != addr_prev)
+        addr_prev = rawaddr;
+    } while ((gpio_get_all()&BUS15_PIN_MASK) != rawaddr);
+#else
     // wait for a stable full address (A0-A14 plus A15 on gpio 26)
     while ((rawaddr = (gpio_get_all()&BUS15_PIN_MASK)) != addr_prev)
       addr_prev = rawaddr;
+#endif
     addr = (rawaddr & BUS_PIN_MASK) | ((rawaddr & A15_PIN_MASK) ? 0x8000 : 0);
     if (addr >= lo) {
       sio_hw->gpio_out = (uint32_t)rom_table[addr - base_rom] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
@@ -1374,11 +1423,11 @@ void __time_critical_func(emulate_normala78_pokey()) {
           last = cur;
         }
         uint32_t pkreg = addr & 0x0F;
-        pokey_regs[pkreg] = (uint8_t)((last >> D0_PIN) & 0xFF);
-        if (pkreg == 0x09) pokey_stimer_seq = pokey_stimer_seq + 1;   // strobe, see pokey.h
+        pokey_capture_write(pkreg, (uint8_t)((last >> D0_PIN) & 0xFF));   // see pokey.h
       }
     }
   }
+#endif  // POKEY_DIAG_E6
 }
 
 // mRAM ("masked RAM") - MAME's A78_TYPE8, test7800's external/mram.go. A FLAT
@@ -2157,6 +2206,17 @@ void __time_critical_func(setup1()) {   //HandleBUS()
 //	multicore_lockout_victim_init();	
     gpio_init_mask(ALL_GPIO_MASK);
     gpio_set_dir_in_masked(ALWAYS_IN_MASK);
+    // Drive the eight data lines harder than the RP2040 default. BUS_DRIVE_STRENGTH
+    // is 8mA and was MEASURED on hardware (pokey.h has the full record): the 4mA
+    // default is marginal for this bus - the title that streams data hardest
+    // (LZSS Player) would not boot at all, and at 2mA three more titles came
+    // back with distorted sound. This does NOT fix the smear band, which is
+    // unchanged at every drive level. Slew rate is already SLOW by default - set
+    // explicitly so the pad configuration is not split between code and defaults.
+    for (uint gp = D0_PIN; gp < D0_PIN + 8; gp++) {
+      gpio_set_drive_strength(gp, BUS_DRIVE_STRENGTH);
+      gpio_set_slew_rate(gp, GPIO_SLEW_RATE_SLOW);
+    }
 
 // We require the menu to do a write to $1FF4 to unlock the comms area.
 // This is because the 7800 bios accesses this area on console startup, and we wish to ignore these
@@ -2228,7 +2288,21 @@ start:
   if (ym_enabled) {
    vreg_set_voltage(VREG_VOLTAGE_1_25);
    int ret=set_sys_clock_khz(YM_CLOCK_KHZ, true);
-  } else if (cart_to_emulate>=33) {
+  }
+  // 0.33: a POKEY cart gets the raised clock, same as a YM2151 cart. Confirmed
+  // on hardware on the OTHER board (experiment E2, 2026-08-27): the flickering
+  // lines on Bentley Bear / Donkey Kong PK-XM / Commando were present at
+  // 250MHz and gone at 300MHz. Unlike PicoA10400, this board's >=33 gate below
+  // already hands every POKEY cart the raised voltage, so here the change is
+  // the CLOCK alone - which is in fact the half that carried the result there.
+  //
+  // After the ym_enabled test on purpose: identify_cartridge() sets
+  // pokey_enabled for YM carts too, so testing it first would capture those.
+  else if (pokey_enabled) {
+   vreg_set_voltage(VREG_VOLTAGE_1_25);
+   int ret=set_sys_clock_khz(POKEY_CLOCK_KHZ, true);
+  }
+  else if (cart_to_emulate>=33) {
    vreg_set_voltage(VREG_VOLTAGE_1_25);
    int ret=set_sys_clock_khz(EMU_CLOCK_KHZ, true);
   }
@@ -2258,6 +2332,17 @@ start:
   // reference implementations in ORIG/ get this right - UnoCart-2600,
   // DirtyHairy-UnoCart-2600, United-Carts-of-Atari and PlusCart-Pico all call
   // reboot AFTER setup_rom()/setup_multiload_map(). Restore that ordering.
+  // E5 DIAGNOSTIC BUILD (pokey.h): route every cart to its PLAIN bus loop, so
+  // core 1 behaves like a cart with no POKEY while core 0 keeps synthesising -
+  // the mirror image of E4. Music stops (pokey_regs[] never receives a write);
+  // judge picture only. See PicoA10400.ino for which cart shapes this is safe
+  // on and which it is not.
+#if POKEY_DIAG_E5
+#define POKEY_BUS_ON 0
+#else
+#define POKEY_BUS_ON pokey_enabled
+#endif
+
   if (cart_to_emulate == CART_TYPE_AR) setup_supercharger();
 
   reboot_cartridge(addr,addr_prev);
@@ -2271,7 +2356,7 @@ start:
         break;
 
      case CART_TYPE_SUPERCART_RAM: 
-      if (pokey_enabled) emulate_supercart_ram_pokey(); else emulate_supercart_ram();
+      if (POKEY_BUS_ON) emulate_supercart_ram_pokey(); else emulate_supercart_ram();
         break;
       
     case CART_TYPE_SUPERCART:
@@ -2283,12 +2368,12 @@ start:
       // silently got RAM at $4000 instead of the ROM data it expects there.
      case CART_TYPE_SUPERCART_EF:
       // Continually check address lines and put associated data on bus.
-      if (pokey_enabled) emulate_supercart_ef_pokey();
+      if (POKEY_BUS_ON) emulate_supercart_ef_pokey();
       else               emulate_supercart_ef();
         break;
     
     case CART_TYPE_NORMALA78:
-      if (pokey_enabled) emulate_normala78_pokey();
+      if (POKEY_BUS_ON) emulate_normala78_pokey();
       else               emulate_normala78();
     break;
 
@@ -2303,7 +2388,7 @@ start:
     case CART_TYPE_VERSA:
       // Only "Mario Bros (Ice Stress Test)" (header 0x0062) takes the _pokey path
       // in this library; the other four VersaBoard files declare no POKEY.
-      if (pokey_enabled) emulate_versa_pokey();
+      if (POKEY_BUS_ON) emulate_versa_pokey();
       else               emulate_versa();
     break;
 
@@ -2847,7 +2932,7 @@ start:
       case CART_TYPE_SUPERCART_ROM: // same 9-bank shape as SUPERCART_LARGE; used to fall
                                      // through to default (no emulation at all, dead cart)
       case CART_TYPE_SUPERCART_LARGE:
-      if (pokey_enabled) emulate_supercart_large_pokey(); else emulate_supercart_large();
+      if (POKEY_BUS_ON) emulate_supercart_large_pokey(); else emulate_supercart_large();
         break;
 
     default:
@@ -3972,7 +4057,13 @@ void loop()
    // carve-out exists to avoid.
    if (newgame) {
      if (ym_enabled)    ym_run();      // never returns
+#if !POKEY_DIAG_E4
      if (pokey_enabled) pokey_run();   // never returns
+#endif
+     // E4 DIAGNOSTIC BUILD (pokey.h): with pokey_run() skipped, core 0 spins
+     // here for the rest of the game - exactly what it does for a cart with no
+     // POKEY. Bus side untouched, so "core 0 is synthesising" is the single
+     // variable removed. No sound.
      continue;                          // no cart type ever hands control back here
    }
 

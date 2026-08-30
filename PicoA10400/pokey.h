@@ -137,6 +137,279 @@
 #define POKEY_SAMPLE_RATE 32000
 #define POKEY_PWM_WRAP    511       // 9-bit PWM; carrier = clk_sys / 512
 
+// POKEY_CLOCK_KHZ - the core clock used while a POKEY cart plays. Lives here,
+// next to the reason for it, exactly as YM_CLOCK_KHZ lives in ym2151.h.
+//
+// MEASURED ON HARDWARE, not assumed (2026-08-27, experiment E2 below). POKEY
+// carts showed thin flickering lines that YM2151 carts on this same pin, these
+// same emulate_*() loops and this same console did not - and the raised clock
+// was one of only two things YM did differently. Giving POKEY carts the same
+// 300MHz removed those lines completely on all three banked-mapper titles that
+// showed them (Bentley Bear, Donkey Kong PK-XM, Commando). The attribution is
+// clean: all three are cart types >=35, so they were ALREADY running at 1.30V
+// before this change - the clock was the only variable that moved for them.
+//
+// This is NOT the "raise the clock and hope" that 2026-08-24 got wrong (see
+// EMU_CLOCK_KHZ's comment in the .ino): it is the same 300MHz YM has been
+// shipping on this board since 0.29, and the artifact it removes was observed
+// present at 250MHz (both the 0.32 build and the E3 build) and absent at
+// 300MHz, on the same three files.
+#define POKEY_CLOCK_KHZ   300000
+
+// --- DIAGNOSTIC BUILD SWITCHES ----------------------------------------------
+// All default to 0, so an ordinary build never contains any of them. Each one
+// removes exactly ONE variable from the picture-artifact investigation, so a
+// symptom that survives it cannot be caused by the thing it removed.
+//
+// WHAT THE FIRST TWO ALREADY SETTLED (hardware, 2026-08-27):
+//
+//   E2  POKEY carts get YM's 300MHz/1.30V. RESULT: the thin flickering LINES
+//       vanished; the left-edge BAND did not. ADOPTED AS PRODUCTION above, so
+//       there is no POKEY_DIAG_E2 switch - it would be a no-op. To re-run that
+//       comparison against a future baseline, put POKEY_CLOCK_KHZ back to
+//       250000 and rebuild; that is the whole of what E2 was.
+//   E3  Synthesis runs at full rate but the audio pin is never driven, leaving
+//       it the plain input a non-POKEY cart leaves it. RESULT: every artifact
+//       class survived - lines (Bentley, still at 250MHz in this build), band
+//       (LZSS), flicker (R-Type). THE AUDIO SIGNAL IS EXONERATED: the artifacts
+//       are not the raw PWM on pin 18, so no RC filter and no carrier change is
+//       called for. (R-Type still made sound here. Not a leak from this path -
+//       it writes 16 TIA audio registers, i.e. the console's OWN sound chip,
+//       which nothing in a cartridge can switch off.)
+//
+// WHAT IS STILL OPEN, AND WHAT E4/E5 ARE FOR:
+//
+//   The left-edge band survives BOTH the clock change and a dead audio pin, so
+//   it is neither. Two candidates remain, and E2/E3 cannot separate them
+//   because both of those builds leave BOTH candidates running:
+//     (a) CORE 0 - a POKEY cart is the only case where core 0 synthesises
+//         continuously, contending with core 1's rom_table reads for SRAM and
+//         pulling 16KB of poly tables through the XIP cache. This is the
+//         unknown POKEY_IMPROVEMENT.md 9 and YM2151.md 9 both flagged and
+//         neither measured.
+//     (b) THE BUS-SIDE WINDOW - the POKEY address decode and write capture
+//         inside the emulate_*_pokey() loops.
+//
+//   E4  Core 0 never enters pokey_run(). Bus side untouched.
+//   E5  The mirror image: core 0 keeps synthesising, but core 1 runs the plain
+//       emulate_*() loop, so the bus side is byte-identical to a cart with no
+//       POKEY.
+//
+//   RESULT (hardware, 2026-08-27): THE BAND SURVIVED BOTH. The pair was meant
+//   to say which of (a)/(b) it was; instead it ruled out the whole question.
+//   pokey_enabled gates exactly three things in this firmware - the clock
+//   branch, POKEY_BUS_ON, and the pokey_run() call - and the band outlived all
+//   three (the clock at both 250 and 300MHz, the window under E5, the
+//   synthesis under E4). There is no fourth. So NO POKEY-SPECIFIC BEHAVIOUR
+//   EXPLAINS IT.
+//
+//   The sharpest form of that is E5: there, Bloodfighter is served by
+//   emulate_normala78() - the same machine code, byte for byte, that serves
+//   the non-POKEY carts whose picture is clean. Under identical firmware code
+//   one file bands and another does not, so the difference is IN THE ROM, not
+//   in this code. The open question is therefore no longer "which POKEY
+//   behaviour causes the band" but "is the band about POKEY at all", which
+//   needs no new switch: TEST_ROMS_PASEK/2_KONTROLA runs matched non-POKEY
+//   titles on the PRODUCTION build. See that README.
+//
+//   Both switches are SILENT by design (E4 computes nothing, E5 never sees a
+//   register write), so they judge picture only. Kept, though spent, so the
+//   pair can be re-run against a future baseline.
+//
+// E6 - WHAT THE CYCLE BUDGET POINTED AT
+//
+//   With POKEY excluded and the demos themselves exonerated, the band was
+//   measured off the console photographs: the first ~47 of 320 pixels on every
+//   line carry the PREVIOUS line's content, the step is exactly one scanline,
+//   and it sits at the same place at 250MHz and at 300MHz
+//   (TEST_ROMS_PASEK/pomiar_zalamania/).
+//
+//   The cycle budget then ruled out the obvious reading of that
+//   (TEST_ROMS_PASEK/budzet_cyklowy/): against MARIA's tightest 282ns fetch
+//   interval we answer in 97-176ns - 1.6-2.3x of margin, and FASTER than the
+//   150-250ns mask ROMs this console was designed around. We are not too slow,
+//   which is independently why the 250->300MHz move did not shift the band by
+//   a pixel, and why shortening this path further would buy nothing.
+//
+//   What the same disassembly did show is that emulate_normala78() clears OE
+//   after EVERY fetch and then needs two matching address reads before it can
+//   drive again - roughly 37 core cycles with the data lines undriven, on every
+//   fetch of a DMA burst. The SuperGame loops do not do this: rom_in_use holds
+//   OE across consecutive reads.
+//
+//   E6 rebuilds the flat loop in that same, already-hardware-proven shape:
+//   non-blocking, one bus sample per pass, byte put out by address, and R/W
+//   used only to decide whether the drivers are enabled. It changes WHEN we
+//   drive, never WHICH byte we serve.
+//
+//   The 0.18 regression this deliberately avoids: the note on the POKEY branch
+//   in the .ino warns that "blocking ROM path + R/W gating" is what broke
+//   3D Worldrunner. E6 gates on R/W but does NOT block anywhere - the same
+//   combination emulate_supercart_ram() has shipped since 0.15.
+//
+//   RESULT (hardware, 2026-08-28): FAILED, AND MADE THINGS WORSE. The band
+//   stayed on all three flat titles, and the SOUND broke on every one of them
+//   (Ballblazer, clean and audible before, came back distorted; White Lamp went
+//   silent). Do not ship this shape.
+//
+//   The cause was a design error of mine, not a property of the console:
+//   holding OE meant the loop could no longer block, and dropping the blocking
+//   wait ALSO dropped the wait for a stable address. The POKEY window test
+//   ((addr & pkmask) == pkbase) then ran on a RAW sample, so an address caught
+//   mid-transition could land in the window and inject a garbage byte into
+//   pokey_regs[]. White Lamp suffered most because its $0800 window is 2KB
+//   wide rather than 16 bytes - by far the biggest target. E6's picture result
+//   is therefore weakened too: it removed one candidate cause and introduced
+//   another, since ROM was also being served off an unstable address.
+//
+// E7 - THE ONE THING E6 ACCIDENTALLY PROVED
+//
+//   E6's failure is itself evidence: removing the two-matching-samples filter
+//   was enough to corrupt the register file, which means the address lines
+//   really do glitch and our sampling of them really does matter. The shipping
+//   loop has that filter, but it is weak - two samples, about 27ns apart at
+//   300MHz. A glitch that survives two samples lands not only in the POKEY
+//   window but in the rom_table INDEX, i.e. in the picture.
+//
+//   E7 therefore turns exactly ONE dial and nothing else: THREE matching
+//   samples instead of two. The blocking wait stays, the OE release after each
+//   fetch stays, the POKEY branch stays - the diff is one extra confirming
+//   read. Budget allows it: the third sample costs ~8 core cycles (~27ns at
+//   300MHz) against 1.6-2.3x of headroom we already measured.
+//
+//   Band gone -> address glitching was the cause, and the fix is to carry a
+//   stronger filter into production (and into the SuperGame loops, which have
+//   NO stability check at all - they sample once per pass).
+//   Band unchanged -> the cartridge side is exhausted and the next question is
+//   about MARIA's own bus behaviour, which we do not model.
+//   Sound must stay clean on Ballblazer and Camouflage: unlike E6, E7 does not
+//   touch how the POKEY window is reached, so a repeat of E6's distortion would
+//   mean the extra sample itself is harmful.
+//   LZSS and R-Type are SuperGame carts, so neither E6 nor E7 touches them:
+//   they are the built-in negative control and MUST look exactly as today.
+//
+// Build with ./build.sh PicoA10400-E3 (or -E4 / -E5).
+#ifndef POKEY_DIAG_E3
+#define POKEY_DIAG_E3 0
+#endif
+#ifndef POKEY_DIAG_E4
+#define POKEY_DIAG_E4 0
+#endif
+#ifndef POKEY_DIAG_E5
+#define POKEY_DIAG_E5 0
+#endif
+#ifndef POKEY_DIAG_E6
+#define POKEY_DIAG_E6 0
+#endif
+#ifndef POKEY_DIAG_E7
+#define POKEY_DIAG_E7 0
+#endif
+#ifndef POKEY_DIAG_E8
+#define POKEY_DIAG_E8 0
+#endif
+
+// --- POKEY_DIGI_QUEUE: sub-sample timing for sample ("digi") playback -------
+// POKEY_IMPROVEMENT.md 5.4 predicted this and deliberately deferred it: "digi
+// streams through VOLUME_ONLY are limited by our sample rate - writes faster
+// than 32kHz are lost. A timestamped queue, like YM2151's, would be the cure,
+// but YM needed one for a different reason ($08 = KEY ON/OFF is an event).
+// POKEY is state. Note it and do not build it until some title forces it."
+//
+// A title has now forced it. "R-Type - Deep Mix" is a sample-mixing demo and
+// its sound comes back distorted/incomplete on hardware; Bloodfighter (covox)
+// and LZSS Player stream samples the same way. The defect is not only lost
+// writes: even when a write survives, the flat register file makes the engine
+// see it at the START of the next 32kHz sample instead of when it happened, so
+// every transition is quantised by up to 31us. That is audible as distortion.
+//
+// WHAT THIS CHANGES. Registers 0-7 (AUDF1..AUDC4 - the ones a sample player
+// hammers) stop going into pokey_regs[] from core 1 and travel as timestamped
+// events instead. Core 0 replays them at their exact instant inside the sample
+// window, which the event-driven engine already handles natively: it advances
+// to an arbitrary tick with pk_run_to() and its output is the time-weighted
+// average over the window, so a transition placed correctly inside the window
+// is integrated correctly rather than aliased.
+//
+// WHAT IT DELIBERATELY DOES NOT CHANGE. AUDCTL (8), STIMER (9) and SKCTL ($0F)
+// keep the existing once-per-sample snapshot path. They are control registers
+// written rarely, the resync/freeze machinery hangs off them, and giving them
+// sub-sample placement would mean per-event freeze bookkeeping for no audible
+// gain. If the queue is FULL the write falls back to the old direct path, so a
+// burst can lose timing precision but never loses the write itself.
+//
+// NOT COVERED BY tools/pokey_selftest/: that test drives the engine directly
+// and POKEY_DIGI_QUEUE is forced off under POKEY_HOST_TEST, so the queue's
+// timing logic is verified by listening, not by the differential test. The
+// engine itself is untouched.
+#ifndef POKEY_DIGI_QUEUE
+#define POKEY_DIGI_QUEUE 0
+#endif
+#ifdef POKEY_HOST_TEST
+#undef POKEY_DIGI_QUEUE
+#define POKEY_DIGI_QUEUE 0
+#endif
+// --- BUS_DRIVE_STRENGTH: how hard the eight data lines are driven ----------
+// MEASURED ON HARDWARE, not reasoned about. This is the third time in this
+// project that a value had to be measured rather than argued (see the PAL
+// palette and POKEY_CLOCK_KHZ) - and the reasoned guess was wrong again.
+//
+// WHAT THIS FIXES - AND WHAT IT DOES NOT. The firmware had never configured
+// pad electrics at all: every pin sat on the RP2040 default of 4mA since the
+// project started. Four builds were measured, one instruction apart:
+//    2mA   sound distorted in 3 titles, LZSS Player would not boot
+//    4mA   LZSS Player would not boot (this is what production shipped)
+//    8mA   every title runs correctly, LZSS Player boots
+//   12mA   same as 8mA, no further improvement
+// So the bus is CAPACITIVE (edge connector, cable, MARIA inputs) and 4mA was
+// marginal: enough for most titles, not enough for the one that streams data
+// hardest. The first hypothesis - ringing on an unterminated line, cured by
+// WEAKER edges - was backwards, which 2mA settled immediately.
+//
+// IT DOES NOT FIX THE SMEAR BAND. The vertical band down the left edge of the
+// picture (~47 of 320 pixels, showing the previous scanline's content) is
+// UNCHANGED at 2, 4, 8 and 12mA. Drive strength is now on the same list as
+// clock speed in both directions, the audio pin, core 0 synthesis, the bus-side
+// POKEY window, holding OE between fetches and address sample strength (E2-E7):
+// measured, and ruled out. Nothing left in the firmware plausibly explains it.
+//
+// WHY 8 AND NOT 12. 8mA is the lowest level at which everything works, and
+// there is no reason to drive harder than the load needs: the board has no
+// series resistors, emulate_normala78() does not test R/W so it drives during
+// write cycles too, and 12mA would roughly triple both that contention current
+// and the ground bounce from eight lines switching at once. Nothing about 12mA
+// looked bad on hardware - it is simply unnecessary.
+//
+// SCOPE. Data lines only (D0..D7). The address lines are inputs, where drive
+// strength does nothing, and the audio pin was not part of the measurement, so
+// it is deliberately left alone.
+#define BUS_DRIVE_STRENGTH GPIO_DRIVE_STRENGTH_8MA
+
+// E8 diagnostic: override the production level to re-run the measurement.
+// Switched on by its VALUE, not by a separate level flag: 0 = production,
+// otherwise the drive strength in mA (2, 4, 8 or 12). ONE macro rather than
+// two because arduino-cli's library discovery breaks when a single
+// --build-property carries two -D options separated by a space - the sketch
+// then fails to find SdFat.h, which is a confusing way to learn that.
+// Building with POKEY_DIAG_E8=8 must reproduce the production binary exactly;
+// POKEY_DIAG_E8=4 reproduces the pre-0.34 behaviour for an A/B comparison.
+#if   POKEY_DIAG_E8 == 0
+/* the production value above stands */
+#elif POKEY_DIAG_E8 == 2
+#undef  BUS_DRIVE_STRENGTH
+#define BUS_DRIVE_STRENGTH GPIO_DRIVE_STRENGTH_2MA
+#elif POKEY_DIAG_E8 == 4
+#undef  BUS_DRIVE_STRENGTH
+#define BUS_DRIVE_STRENGTH GPIO_DRIVE_STRENGTH_4MA
+#elif POKEY_DIAG_E8 == 8
+#undef  BUS_DRIVE_STRENGTH
+#define BUS_DRIVE_STRENGTH GPIO_DRIVE_STRENGTH_8MA
+#elif POKEY_DIAG_E8 == 12
+#undef  BUS_DRIVE_STRENGTH
+#define BUS_DRIVE_STRENGTH GPIO_DRIVE_STRENGTH_12MA
+#else
+#error "POKEY_DIAG_E8 must be 0 (production) or a drive strength: 2, 4, 8 or 12"
+#endif
+
 // --- bus-side state, unchanged from the first version -----------------------
 // Register file, written by core 1 from the bus, read by core 0. Plain volatile
 // bytes are enough: these are state, not events, so a late or reordered update is
@@ -165,6 +438,38 @@ volatile uint16_t pokey_mask    = 0xFFF0;
 // on every write to offset 9 regardless of value; core 0 reacts to a CHANGE in
 // it, which a "last write wins" byte cannot represent for a repeated strobe.
 volatile uint32_t pokey_stimer_seq = 0;
+
+#if POKEY_DIGI_QUEUE
+#include "hardware/timer.h"
+#define POKEY_Q_SIZE 128                      /* power of two */
+typedef struct { uint32_t t_us; uint8_t reg; uint8_t val; } pk_ev_t;
+static volatile pk_ev_t pokey_queue[POKEY_Q_SIZE];
+static volatile uint32_t pk_q_head = 0;       // written by core 1 only
+static volatile uint32_t pk_q_tail = 0;       // written by core 0 only
+#endif
+
+// Capture one POKEY register write off the bus. Single point so the queue and
+// the plain register file cannot drift apart. always_inline for the same reason
+// everything else on this path is: see the note above pokey_read_reg().
+static inline __attribute__((always_inline))
+void pokey_capture_write(uint32_t reg, uint8_t val) {
+#if POKEY_DIGI_QUEUE
+  if (reg < 8) {                              // AUDF/AUDC - the digi registers
+    uint32_t h = pk_q_head, n = h + 1u;
+    if ((uint32_t)(n - pk_q_tail) <= POKEY_Q_SIZE) {
+      uint32_t i = h & (POKEY_Q_SIZE - 1u);
+      pokey_queue[i].t_us = timer_hw->timerawl;
+      pokey_queue[i].reg  = (uint8_t)reg;
+      pokey_queue[i].val  = val;
+      pk_q_head = n;
+      return;                                 // timing channel ONLY - core 0
+    }                                         // applies it into pokey_regs[]
+    // queue full: fall through and take the old path rather than lose the write
+  }
+#endif
+  pokey_regs[reg] = val;
+  if (reg == 0x09) pokey_stimer_seq = pokey_stimer_seq + 1;   // strobe, see above
+}
 
 // --- AUDC bits ---
 #define POKEY_NOTPOLY5    0x80
@@ -248,8 +553,7 @@ void pokey_window_service(uint32_t addr, uint8_t *rom_in_use) {
   } else {                                                 // write cycle
     if (*rom_in_use) { SET_DATA_MODE_IN; *rom_in_use = 0; }
     uint32_t reg = addr & 0x0F;
-    pokey_regs[reg] = (uint8_t)((g >> D0_PIN) & 0xFF);
-    if (reg == 0x09) pokey_stimer_seq = pokey_stimer_seq + 1;   // strobe, see above
+    pokey_capture_write(reg, (uint8_t)((g >> D0_PIN) & 0xFF));
   }
 }
 #endif // POKEY_HOST_TEST
@@ -601,6 +905,9 @@ static inline uint16_t pokey_next_sample(void) {
   static uint8_t  primed = 0;
   static uint8_t  was_running = 1;   // matches the power-on default - see identify_cartridge()
   static uint32_t frac = 0;
+#if POKEY_DIGI_QUEUE
+  static uint32_t pk_win_us = 0;     // real time at the END of the previous window
+#endif
 
   uint8_t audctl = pokey_regs[8];
   uint8_t skctl  = pokey_regs[0x0F];
@@ -632,6 +939,51 @@ static inline uint16_t pokey_next_sample(void) {
   frac &= 0xFFFFu;
 
   if (running) {
+#if POKEY_DIGI_QUEUE
+    // Replay the register writes that happened DURING the window we are about
+    // to render, each at its own instant, instead of pretending they all
+    // happened at its start. The engine needs no help for this - pk_run_to()
+    // already advances to an arbitrary tick, and because the sample it emits is
+    // the time-weighted average over the whole window, a transition placed at
+    // the right tick is integrated correctly instead of being aliased.
+    //
+    // Rendering is one period BEHIND real time on purpose: at the moment this
+    // runs, only events already in the past exist, so the window that can be
+    // reconstructed exactly is the one that has just elapsed. Costs 31us of
+    // latency, which nothing here can hear.
+    {
+      const uint32_t target = pk_now + elapsed;
+      uint32_t now_us = time_us_32();
+      uint32_t win0   = pk_win_us ? pk_win_us : now_us;   // first call: empty window
+      pk_win_us = now_us;
+      uint32_t span_us = now_us - win0;
+      if (span_us == 0) span_us = 1;
+      // Clamp so the multiply below cannot overflow after a stall (a hiccup
+      // could otherwise make span_us enormous). 1000us is ~32 sample periods;
+      // anything beyond that is not a window worth reconstructing anyway.
+      if (span_us > 1000u) span_us = 1000u;
+      while (pk_q_tail != pk_q_head) {
+        uint32_t i = pk_q_tail & (POKEY_Q_SIZE - 1u);
+        uint32_t t = pokey_queue[i].t_us;
+        if ((int32_t)(t - now_us) >= 0) break;            // belongs to a later window
+        uint32_t off = (int32_t)(t - win0) > 0 ? (t - win0) : 0u;
+        if (off > span_us) off = span_us;
+        // Proportional placement inside the window: using the window's ACTUAL
+        // microsecond span rather than the nominal 31.25us keeps events in the
+        // right place even when the pacing loop wakes up a little late.
+        // 32-bit on purpose: off <= span_us <= 1000 and elapsed <= 56, so the
+        // product is at most 56000 and fits easily. A uint64_t here would pull
+        // in the 64-bit software divide instead of the 32-bit one - the exact
+        // trap the note above this function's own division warns about.
+        uint32_t tick = pk_now + (off * elapsed) / span_us;
+        if ((int32_t)(tick - target) > 0) tick = target;
+        if ((int32_t)(tick - pk_now) > 0) pk_run_to(tick, audctl, skctl);
+        pokey_regs[pokey_queue[i].reg] = pokey_queue[i].val;
+        pk_recompute_level();      // volume/waveform may have changed mid-window
+        pk_q_tail = pk_q_tail + 1u;
+      }
+    }
+#endif
     pk_run_to(pk_now + elapsed, audctl, skctl);
   } else {
     // Held in reset: no channel may borrow and the poly phase pins at 0 (see
@@ -673,8 +1025,30 @@ static inline void pokey_audio_init(void) {
 // same bug 2026-08-24 found and fixed in ym2151.h's pacing - see that file's
 // header for the "time_us_32() << 16 throws away the top 16 bits" trap this
 // form avoids by keeping the fraction in ITS OWN accumulator.
+#if POKEY_DIAG_E3
+// E3 only: somewhere for the sample to go now that the pin does not get it.
+// volatile so the compiler cannot work backwards from "nobody reads this" and
+// delete the synthesis itself - which would turn E3 into a test of an idle
+// core 0 rather than a test of a silent pin.
+static volatile uint16_t pokey_diag_sink = 0;
+#endif
+
 static inline void pokey_run(void) {
+  // Core 1 now performs a REAL PLL reconfiguration for a POKEY cart (250 ->
+  // POKEY_CLOCK_KHZ), where before 0.33 it merely re-set the 250MHz already in
+  // force - a no-op with nothing to race against. Core 0 can reach this
+  // function before core 1 gets there, and configuring PWM against a clock
+  // that is about to change underneath it is exactly what came back from
+  // hardware on 2026-08-24 as "no audio at all". Same bounded wait, same
+  // reason as ym_run() - see emu_clock_ready in ym2151.h. Bounded because a
+  // flag that never arrives must cost a slightly wrong carrier, not silence
+  // forever.
+  uint32_t wait_t0 = time_us_32();
+  while (!emu_clock_ready && (uint32_t)(time_us_32() - wait_t0) < 200000u)
+    tight_loop_contents();
+#if !POKEY_DIAG_E3
   pokey_audio_init();
+#endif
   const uint32_t period_us_int  = 31u;
   const uint32_t period_us_frac = 16384u;   /* (1000000<<16)/32000 - (31<<16) */
   uint32_t next_us = time_us_32();
@@ -682,7 +1056,15 @@ static inline void pokey_run(void) {
   while (1) {
     uint32_t now = time_us_32();
     if ((int32_t)(now - next_us) >= 0) {
+#if POKEY_DIAG_E3
+      // Full-rate synthesis, pin untouched: pokey_audio_init() was skipped, so
+      // GPIO stays the plain input it is under a cart with no POKEY at all.
+      // That is the point - it makes a POKEY cart electrically identical, on
+      // this one pin, to the carts whose picture is clean.
+      pokey_diag_sink = pokey_next_sample();
+#else
       pwm_set_gpio_level(POKEY_AUDIO_PIN, pokey_next_sample());
+#endif
       frac_us += period_us_frac;
       next_us += period_us_int + (frac_us >> 16);
       frac_us &= 0xFFFFu;
