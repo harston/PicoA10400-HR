@@ -16,6 +16,13 @@
   this board and simply unused. The synthesis runs on the core that sits idle once a
   game starts, so the picture costs nothing for the sound._
 
+  _The emulation has since been rebuilt around how the chip actually works, and that
+  turned up two faults rather than rough edges: **everything had been playing an octave
+  too low**, and one whole class of sound — the paired 16-bit channels, used by more
+  than a quarter of the POKEY library — **made no sound at all**. Both are fixed, along with
+  the filters, the noise generators and two-tone mode. The result is checked against
+  MAME's own POKEY clock by clock, not by ear._
+
 - **FM sound — the YM2151 is emulated**
   _The FM chip from Atari's XM expansion module is carried on the board by a few 7800
   titles — **1942**, **Wonder Boy**, **Pac-Man Collection 40th Anniversary**,
@@ -61,6 +68,15 @@
   _Reading the bus at the wrong point in the CPU's write cycle caused flickering
   artifacts during gameplay; with that fixed you should get a visibly cleaner picture._
 
+  _Two more were tracked down on a real console afterwards. Cartridges with a POKEY
+  showed brief flickering lines — **Bentley Bear's Crystal Quest**, **Donkey Kong
+  PK-XM**, **Commando** — which are gone now that those carts run the faster clock the
+  FM ones already used. And the cartridge's data lines had been driven at the chip's
+  default strength since the project began, which turned out to be marginal for this
+  bus: the title that streams data hardest, **LZSS Player**, would not start at all.
+  Driving them harder fixes it. Both were established by shipping builds that changed
+  one thing at a time and testing them on the console, not by reasoning about it._
+
 - **ROMs of unusual sizes now run**
   _Carts other than 16/32/48KB — 8KB and 28KB among them — used to give a white
   screen. They are now mapped the way real hardware does it, whatever the size._
@@ -81,10 +97,21 @@
   Several buffer overflows were fixed, including one where a large ROM corrupted the
   USB drive until the next power cycle. The emulation clock was lowered to 250MHz
   after measurements showed a higher one bought no timing margin at all, so the chip
-  runs cooler and calmer.
+  runs cooler and calmer — with one exception since added: cartridges carrying a POKEY
+  or a YM2151 run at 300MHz, because on those the extra margin turned out to be worth
+  something on screen.
 
 _Supercharger titles run on an Atari 2600; on an Atari 7800 in its 2600 mode they
 do not, and that one is not solved._
+
+_A few music demos — **Bloodfighter**, **LZSS Player**, **RMT POKEY Player**, **White
+Lamp** — show a narrow band of smearing down the left edge of the picture, about a
+seventh of the screen wide. It is still there and it is not for want of looking: the
+clock in both directions, the audio pin, the sound synthesis, the cartridge's POKEY
+window, the bus timing and all four available drive strengths were each tested
+separately on a real console, and none of them moves it. An emulator does not
+reproduce it either. Whatever it is, it is not in the firmware, so it is out of reach
+from this side._
 
 _Not fixed, and out of the cartridge's reach: an NTSC ROM on a PAL console may run
 too fast and show interference along the bottom of the screen — use a PAL version
