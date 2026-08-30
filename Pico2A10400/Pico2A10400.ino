@@ -1373,7 +1373,9 @@ void __time_critical_func(emulate_normala78_pokey()) {
           if ((cur & BUS15_PIN_MASK) != rawaddr) break;
           last = cur;
         }
-        pokey_regs[addr & 0x0F] = (uint8_t)((last >> D0_PIN) & 0xFF);
+        uint32_t pkreg = addr & 0x0F;
+        pokey_regs[pkreg] = (uint8_t)((last >> D0_PIN) & 0xFF);
+        if (pkreg == 0x09) pokey_stimer_seq = pokey_stimer_seq + 1;   // strobe, see pokey.h
       }
     }
   }
@@ -3285,6 +3287,12 @@ int identify_cartridge(char *filename)
                                            pokey_mask = 0xF800; }  // $0800-$0FFF
           else                           { pokey_enabled = 0; pokey_base = 0xFFFF; }
           for (int i=0;i<16;i++) pokey_regs[i]=0;
+          // SKCTL defaults to "released" (running), not the real chip's power-on
+          // 0x00 (held in reset): 53/434 library files declaring POKEY never
+          // write SKCTL at all, and a literal power-on-silent chip would leave
+          // every one of them mute forever. Every file that DOES write SKCTL
+          // still gets its own value the instant it writes it - see pokey.h.
+          pokey_regs[0x0F] = 0x03;
         }
 
         // YM2151 (OPM) at $0460/$0461 - byte53 bit 3, "ym2151 at $460/$461" in
