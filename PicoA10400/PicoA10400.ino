@@ -175,6 +175,12 @@ bool fs_changed;
 #define CART_TYPE_SUPERCART	40	// Atari 7800 supercart bs
 #define CART_TYPE_MRAM	41	// Atari 7800 flat ROM + mRAM ("masked RAM") @$4000
 #define CART_TYPE_VERSA	42	// Atari 7800 VersaBoard: SuperGame + 2x16K banked RAM
+// UA Ltd. 8K bankswitching. Numbered ABOVE the 7800 block only because that
+// block was numbered first - UA and UASW are 2600 types and must be dispatched
+// as such. Every numeric test on the cart type (the clock/voltage branches in
+// setup1()) therefore names them explicitly; see is2600 there.
+#define CART_TYPE_UA	43	// 8k, hotspots BELOW $1000 ($0220 / $0240)
+#define CART_TYPE_UASW	44	// 8k UA with the two banks swapped (Stella "UASW")
 
 // CCM_RAM/CCM_SIZE/RAM_BANKS/CCM_BANKS/MAX_RAM_BANK/MAX_CCM_BANK removed
 // (OPTIMIZATION.md 2.6): UnoCart (STM32) relic, unused anywhere in this
@@ -246,6 +252,8 @@ const EXT_TO_CART_TYPE_MAP ext_to_cart_type_map[] = {
 	{"DF", CART_TYPE_DF},
 	{"DFS", CART_TYPE_DFSC},
 	{"4KSC", CART_TYPE_4KSC},
+	{"UA", CART_TYPE_UA},
+	{"UAS", CART_TYPE_UASW},
   {"FA2", CART_TYPE_FA2},
   {"A78", CART_TYPE_A78},
 	{0,0}
@@ -2279,6 +2287,15 @@ start:
   // were reported still warbling after the clock was supposedly raised; they had
   // in fact been getting neither the clock NOR the 1.30V, and YM_LOG.TXT still
   // reading clk_sys=250000 is what gave it away.
+  // Which dispatch a cart takes used to be a pure numeric test, because every
+  // 2600 type happened to sit below the 7800 block. CART_TYPE_UA/UASW broke
+  // that: they are 2600 types numbered after it, and without this they would
+  // take the 7800 clock and never get BUS_H driven low - which the 2600 loops
+  // rely on, since they compare the full 16-bit port against 13-bit addresses.
+  const bool is2600 = (cart_to_emulate <= 32)
+                      || (cart_to_emulate == CART_TYPE_UA)
+                      || (cart_to_emulate == CART_TYPE_UASW);
+
   if (ym_enabled) {
    vreg_set_voltage(VREG_VOLTAGE_1_30);
    int ret=set_sys_clock_khz(YM_CLOCK_KHZ, true);
@@ -2305,11 +2322,11 @@ start:
    vreg_set_voltage(VREG_VOLTAGE_1_30);
    int ret=set_sys_clock_khz(POKEY_CLOCK_KHZ, true);
   }
-  else if (cart_to_emulate>=35) {
+  else if (!is2600 && cart_to_emulate>=35) {
    vreg_set_voltage(VREG_VOLTAGE_1_30);
    int ret=set_sys_clock_khz(EMU_CLOCK_KHZ, true);
   }
-  if (cart_to_emulate<=32) {
+  if (is2600) {
    // Raise the core voltage for 2600 emulation too. setup() runs the whole chip
    // at 250MHz on VREG_VOLTAGE_1_15 - an ~88% overclock over the RP2040's nominal
    // 133MHz, at a voltage its own comment flags as marginal ("set to 1_15 or 1_20
@@ -2809,6 +2826,88 @@ start:
      }
   	}
       break;
+    case CART_TYPE_UA:
+    case CART_TYPE_UASW: {
+      // UA Ltd. 8K. The one thing that makes this different from every other
+      // 2600 mapper here: the hotspots are BELOW $1000, i.e. at A12 = 0, in
+      // the address space the TIA and the RIOT live in. Same shape as
+      // CART_TYPE_3F, which also has to watch A12 = 0 - except that 3F reads
+      // the bank number off the DATA bus, while UA takes it from the address
+      // alone, so no data sampling is needed here at all.
+      //
+      // DECODE, from Stella CartUA.cxx checkSwitchBank(): the board compares
+      // only A12, A9, A6 and A5.
+      //
+      //     (addr & $1260) == $0220  ->  bank 0   (low 4K)
+      //     (addr & $1260) == $0240  ->  bank 1   (high 4K)
+      //
+      // A11, A10 and A8 are not connected to the decode at all, and A7 is
+      // left out because the Brazilian (Digivision) boards drive it: their
+      // $02A0/$02C0 pair is bit-for-bit the same decode as $0220/$0240.
+      // This is not a guess - "Fathon (Brasil) (Digivision)" boots through
+      // `STA $02A0 / JMP $300C` in its high bank, which only reaches live
+      // code if $02A0 selects bank 0, and $02A0 & $0260 == $0220. The same
+      // masking is what makes `BIT $FB0` (Jumper, Digivision Beamrider) and
+      // the $FA0/$FC0 pair of the 0FA0 scheme land on the right banks.
+      //
+      // Masking with $0260 rather than $1260 below is safe and one bit
+      // cheaper: this branch already knows A12 is 0. Note that it also
+      // ignores A13-A15, which on a 2600 the firmware drives low itself
+      // (gpio_set_dir_out_masked(BUS_H_PIN_MASK) in the is2600 dispatch) -
+      // so unlike 3F's exact `addr == 0x003F` compare, this one does not
+      // depend on that.
+      //
+      // Nothing here can false-trigger on ordinary console traffic: zero page
+      // and the stack have A9 = 0, and every RIOT I/O register ($280-$297)
+      // has A6 = A5 = 0, so they all mask to $0200. And whatever would fool
+      // this decode would equally fool the real cartridge.
+      //
+      // UASW swaps which hotspot picks which half of the file. It is never
+      // auto-detected (Stella carries it as an md5 override for two Digivision
+      // dumps); reach it by renaming the file to *.UAS.
+      cartPages = romLen / 4096;
+      {
+      unsigned char *half0 = &rom_table[0];
+      unsigned char *half1 = &rom_table[(cartPages > 1) ? 4096 : 0];
+      unsigned char *lowBank  = (cart_to_emulate == CART_TYPE_UASW) ? half1 : half0;
+      unsigned char *highBank = (cart_to_emulate == CART_TYPE_UASW) ? half0 : half1;
+      // Power-on bank is the FIRST half of the file in both variants - what
+      // Stella's startBank() gives. UASW swaps the hotspots, not the image,
+      // and "Mickey (Digivision)" depends on it: neither half's RESET path
+      // touches a hotspot, so whichever half is live at power-on is the one
+      // that runs.
+      bankPtr = half0;
+      addr = 0; addr_prev = 0; addr_prev2 = 0;
+      while (1) {
+        while (((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev) || (addr != addr_prev2))
+        { // three matching samples, as in CART_TYPE_3F: a half-settled address
+          // is only a wasted ROM byte in the A12-high path, but in the A12-low
+          // path it would latch the wrong bank.
+          addr_prev2 = addr_prev;
+          addr_prev = addr;
+        }
+        // got a stable address
+        if (addr & 0x1000) { // A12 high - normal ROM access
+          gpio_put_masked(DATA_PIN_MASK,bankPtr[addr&0xFFF]<<D0_PIN);
+          SET_DATA_MODE_OUT;
+          // wait for address bus to change
+          while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+          SET_DATA_MODE_IN;
+        } else {           // A12 low - the hotspots live here
+          uint32_t hs = addr & 0x0260;
+          if (hs == 0x0220 || hs == 0x0240) {
+            // Confirm before latching. The 6507 holds an address for a whole
+            // bus cycle (~838ns), a transition glitch does not - and a wrong
+            // bank here is a crash. Same guard patch 0.12 needed for the
+            // Activision bank register.
+            if ((gpio_get_all() & 0x1260) == hs)
+              bankPtr = (hs == 0x0220) ? lowBank : highBank;
+          }
+        }
+      }
+      }
+      }
+      break;
     case CART_TYPE_AR:
          emulate_supercharger_cartridge();
       break;
@@ -3122,6 +3221,66 @@ int isProbably3F(int size, unsigned char *bytes)
 	// at least two banks
 	unsigned char signature[] = { 0x85, 0x3F };  // STA $3F
 	return searchForBytes(bytes, size, signature, 2, 2);
+}
+
+int isProbablyUA(int size, unsigned char *bytes)
+{	// UA Ltd. bankswitching puts its hotspots BELOW $1000: $0220 selects the
+	// low 4K bank, $0240 the high one. The Brazilian (Digivision) boards use
+	// the shifted pair $02A0/$02C0, which is the same decode - see
+	// emulate_ua_cartridge() for why A7 does not matter.
+	// Signature list from Stella CartDetector.cxx isProbablyUA(), MINUS its
+	// seventh entry { 0x2C, 0xB0, 0x0F } (BIT $FB0). That one exists for the
+	// Digivision Beamrider dump, which Stella cannot run as plain UA anyway -
+	// its DefProps.hxx entry forces UASW, so the signature's own autodetect
+	// answer is wrong for its own target. In this library it matches nothing
+	// but "Jumper 8k 0.28" (4 files), and Jumper is a REAL F8 cart: simulated
+	// on the 6502, it bank-switches 143 times by running through $1FF8/$1FF9
+	// and keeps a kernel going, while under UA it hits BRK immediately.
+	// Keeping the signature would therefore trade zero gains for a regression.
+	unsigned char signature[6][3] = {
+			{ 0x8D, 0x40, 0x02 },  // STA $240 (Funky Fish, Pleiades)
+			{ 0xAD, 0x40, 0x02 },  // LDA $240 (Hobo)
+			{ 0xBD, 0x1F, 0x02 },  // LDA $21F,X (Gingerbread Man, Grandma's Revenge)
+			{ 0x2C, 0xC0, 0x02 },  // BIT $2C0 (Time Pilot)
+			{ 0x8D, 0xC0, 0x02 },  // STA $2C0 (Fathom, Vanguard, Galaxian)
+			{ 0xAD, 0xC0, 0x02 }   // LDA $2C0 (Mickey, Zaxxon, Super Soccer)
+		};
+	for (int i = 0; i < 6; ++i)
+		if(searchForBytes(bytes, size, signature[i], 3, 1))
+			return 1;
+	return 0;
+}
+
+int usesF8Hotspots(int size, unsigned char *bytes)
+{	// Absolute access to the F8 hotspots $1FF8/$1FF9 (or their $FFF8/$FFF9
+	// mirror). NOT a Stella function - it exists to keep one file out of the
+	// UA branch.
+	//
+	// "Super Soccer (Digivision)" (md5 0e7e7334..., 8 copies in the library)
+	// carries a dead `LDA $02C0 / JMP $F400` stub at $1FE0 and therefore
+	// matches isProbablyUA(). It is an F8 cart: its RESET vector ($1FFC =
+	// $FFEC) lands on `LDA $FFF8 / JMP $F000`, i.e. select bank 0 and jump
+	// into it, and the image holds four absolute F8-hotspot accesses.
+	// Stella reaches the same verdict, but only through an explicit md5
+	// override in DefProps.hxx ("F8") - autodetection alone calls it UA.
+	// We have no md5 at load time, so the override is expressed as this test.
+	//
+	// Measured over every 8192-byte file in the library (12148 of them):
+	// of the 126 files isProbablyUA() accepts, Super Soccer's 8 are the ONLY
+	// ones with an F8 hotspot access. The 18 genuine UA images have none.
+	// Applied inside the UA branch only, so it can move a file back to F8 and
+	// can never move one away from it.
+	unsigned char op[6] = { 0xAD, 0x8D, 0x2C, 0x0C, 0xBD, 0x9D };  // LDA/STA/BIT/NOP/LDA,X/STA,X
+	unsigned char sig[3];
+	for (int o = 0; o < 6; ++o)
+		for (int lo = 0xF8; lo <= 0xF9; ++lo)
+			for (int hi = 0; hi < 2; ++hi) {
+				sig[0] = op[o]; sig[1] = (unsigned char)lo;
+				sig[2] = hi ? 0xFF : 0x1F;
+				if (searchForBytes(bytes, size, sig, 3, 1))
+					return 1;
+			}
+	return 0;
 }
 
 int isProbably3E(int size, unsigned char *bytes)
@@ -3556,6 +3715,13 @@ int identify_cartridge(char *filename)
 			cart_type = CART_TYPE_3E;
 		else if (isProbably3F(bytes_read, rom_table)) 
       cart_type = CART_TYPE_3F;
+		// Stella runs isProbablyUA() exactly here: after 3F, before FE
+		// (CartDetector.cxx, the 8K bucket). usesF8Hotspots() is our stand-in
+		// for the md5 override Stella needs for Super Soccer - see that
+		// function for the measurement.
+		else if (isProbablyUA(bytes_read, rom_table)
+		         && !usesF8Hotspots(bytes_read, rom_table))
+			cart_type = CART_TYPE_UA;
     else if (isProbablyFE(bytes_read, rom_table) && !f8)
 			cart_type = CART_TYPE_FE;
 		else if (isProbably0840(bytes_read, rom_table))

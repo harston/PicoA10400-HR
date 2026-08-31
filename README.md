@@ -57,6 +57,14 @@
   **Escape from the Mindmaster** and the rest of the tape library — now load and run
   on an Atari 2600, multi-load games included. They never worked on this cart before._
 
+- **UA Ltd cartridges run — 16 more titles**
+  _**Pleiades**, **Funky Fish**, **Time Pilot**, **Vanguard**, **Zaxxon**, **Galaxian**,
+  **Fathom**, **Gingerbread Man**, **Hobo** and the Brazilian Digivision conversions were
+  read as ordinary F8 carts: the menu listed them, they started, and the game did not
+  work. They pick a bank through an address below the cartridge window, which nothing
+  here had been watching for. **Mickey** wants its two banks the other way round — rename
+  that file to `.UAS`._
+
 - **Three more cartridge types supported**
   _**mRAM** and **VersaBoard** on the 7800, **4KSC** on the 2600 — boards the cart
   simply did not answer before, so they showed nothing at all. The **Rescue On
