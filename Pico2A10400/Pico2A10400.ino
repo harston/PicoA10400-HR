@@ -2361,6 +2361,7 @@ start:
 #endif
 
   if (cart_to_emulate == CART_TYPE_AR) setup_supercharger();
+  if (cart_to_emulate == CART_TYPE_CV) setup_cv();
 
   reboot_cartridge(addr,addr_prev);
   
@@ -2510,6 +2511,62 @@ start:
             // wait for address bus to change
             while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
             SET_DATA_MODE_IN;
+          }
+        }
+      }
+       break;
+
+    // CommaVid (CV): 2K ROM + 1K RAM. isProbablyCV() has been detecting these
+    // since forever, but there was no case here, so every CommaVid file was a
+    // dead cartridge. setup_cv() has already built the 4K window inside
+    // rom_table before the reboot; see there for the memory map and for where
+    // each half of it was verified.
+    //
+    // ONE compare on the hot path. Both reads - RAM at $1000-$13FF and ROM at
+    // $1800-$1FFF - come out of the same array at the same mask, so only the
+    // write port needs testing for. That is one test fewer than the reference
+    // loop in PlusCart-Pico, which nests "ROM or RAM" inside "read or write".
+    //
+    // A READ of the write port is served as a write here (garbage sampled off
+    // the bus lands in RAM), which is what PlusCart-Pico does too; Stella
+    // returns the RAM byte and MAME returns ROM. Three references, three
+    // answers - so no game can depend on it. It is also what the real board
+    // does: the 2600 cartridge port carries no R/W line, so a CommaVid board
+    // has to derive write-enable from the address alone and cannot tell a read
+    // of $1400-$17FF from a write to it either.
+    case CART_TYPE_CV:
+      data=0; data_prev=0;
+      while (1) {
+        while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+          addr_prev = addr;
+        // got a stable address
+        if (addr & 0x1000) {                  // A12 high
+          // A11:A10 pick the quadrant of the 4K window: 0 = $1000-$13FF RAM
+          // read, 1 = $1400-$17FF RAM write, 2 and 3 = ROM. Only quadrant 1 is
+          // a write, and the other three are all reads of the same array at
+          // the same mask - so one test decides everything.
+          //
+          // Written as a double shift, not as (addr & 0x0C00) == 0x0400, and
+          // with the read side as the fall-through, both for reasons read out
+          // of the .elf rather than assumed. This switch is register-starved:
+          // the mask form compiled to "mov r6,ip / ldr r7,[sp,#8] / ands /
+          // cmp" - the $0400 it compares against was reloaded from the stack
+          // on every single bus cycle - and the read side sat behind an extra
+          // unconditional branch. The shift form needs no constant at all
+          // (lsls #20, lsrs #30, cmp #1) and this ordering puts the common
+          // path first. Same 210-cycle-per-bus-cycle budget either way; this
+          // just stops spending it for nothing.
+          if (((addr << 20) >> 30) != 1) {    // RAM read port, or ROM
+            gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0xFFF]<<D0_PIN);
+            SET_DATA_MODE_OUT;
+            // wait for address bus to change
+            while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+            SET_DATA_MODE_IN;
+          } else {                            // $1400-$17FF: RAM write port
+            // read last data on the bus before the address lines change
+            while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+            { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
+            rom_table[addr&0x3FF] = data_prev;
           }
         }
       }
@@ -3104,6 +3161,63 @@ static void setup_supercharger(void) {
   setup_multiload_map(multiload_map, (uint32_t)romLen / 8448);
 }
 
+// CommaVid (CV): 2K ROM + 1K RAM on one 4K window, no bankswitching.
+//
+//   $1000-$13FF  RAM read port    (1K)
+//   $1400-$17FF  RAM write port   (the same 1K, offset by $400)
+//   $1800-$1FFF  ROM              (2K)
+//
+// TODO.md had the two ports the other way round. Every reference in ORIG/
+// agrees it is read low / write high, and they were checked against each other
+// rather than trusted one at a time:
+//   * Stella - CartCV.hxx class comment, and CartEnhanced.cxx:71 where
+//     myRamWpHigh = true yields myWriteOffset = $400, myReadOffset = 0;
+//   * MAME - a26_rom_cv_device in vcs/rom.cpp: read_rom() answers from RAM only
+//     for offset < $400, write_bank() accepts writes only in $400-$7FF;
+//   * all four flashcart firmwares - PlusCart-Pico
+//     (cartridge_emulation.cpp:1199), UnoCart-2600, the DirtyHairy fork and
+//     United-Carts-of-Atari carry the same "$F000-$F3FF 1K RAM read,
+//     $F400-$F7FF 1K RAM write" comment over the same loop.
+//
+// The 4K window is laid out inside rom_table itself, so the hot loop needs no
+// second base pointer and no second bounds test: one compare picks out the
+// write port and everything else is a single indexed read of
+// rom_table[addr & 0xFFF].
+//
+// A 4K CV FILE ALREADY HAS EXACTLY THAT LAYOUT. Stella's CartridgeCV
+// constructor reads the first 1K of a 4K image as the initial RAM contents and
+// the last 2K as the ROM - which is byte-for-byte the window this loop wants.
+// Verified against the library rather than assumed: for 8 of the 9 distinct 4K
+// images here, the last 2K hashes equal to a 2K CV ROM we already have
+// (MagiCard or Video Life). So for a 4K file this function does nothing at all.
+//
+// STELLA IS THE ONLY REFERENCE THAT DOES THIS. All four flashcart firmwares in
+// ORIG/ run isProbablyCV() for 2K images ONLY (PlusCart-Pico main.cpp:789 is
+// the one our own detection was copied from), and their loader puts cart_ram
+// AFTER the image, uninitialised - so none of them can load a MagiCard save.
+// That is where our gap came from, and it is why the 4K branch below is worth
+// having rather than being a curiosity.
+//
+// A 2K file is the ROM alone: move it up into the $1800 half and clear the RAM
+// half. Anything shorter is tiled across the 2K, as CartridgeCV does for
+// size < 2K. That is unreachable from auto-detection (which only assigns CV to
+// a 2048- or 4096-byte image) but reachable by renaming a file to *.CV.
+//
+// Must run BEFORE reboot_cartridge(), for the same reason setup_supercharger()
+// must: reboot feeds the 6502 a JMP ($FFFC), so the CPU fetches its reset
+// vector from $1FFC/$1FFD as soon as that retires, and for a 2K image the byte
+// it needs is not at rom_table[0xFFC] until the move below has happened.
+static void setup_cv(void) {
+  if (romLen >= 4096) return;    // 4K image: already in window layout
+
+  int n = (romLen > 0 && romLen < 2048) ? romLen : 2048;
+  memmove(&rom_table[0x800], &rom_table[0], n);
+  for (int i = n; i < 2048; i += n)
+    memcpy(&rom_table[0x800 + i], &rom_table[0x800],
+           (i + n <= 2048) ? n : (2048 - i));
+  memset(&rom_table[0], 0, 0x800);
+}
+
 static void read_multiload(uint8_t *buffer, uint8_t physical_index) {
 
   int start=physical_index * 8448;
@@ -3675,7 +3789,47 @@ int identify_cartridge(char *filename)
 	}
 	else if (image_size == 4*1024)
 	{
-  	cart_type = isProbably4KSC(rom_table) ? CART_TYPE_4KSC : CART_TYPE_4K;
+    // Stella runs isProbablyCV() in the 4K bucket as well, ahead of 4KSC
+    // (CartDetector.cxx:51), because a 4K CommaVid file is "1K saved RAM image
+    // + 2K ROM" - the format MagiCard's own save produces. We only ran it for
+    // 2K, so 50 files in the library (every MagiCard sample program and picture,
+    // and both Video Life dumps that carry saved RAM) came out as a plain 4K
+    // cart: the ROM half was served correctly at $1800-$1FFF, but $1000-$17FF
+    // answered with a mirror of the ROM instead of with RAM.
+    //
+    // BUT ONLY THE ROM HALF IS SEARCHED, WHICH IS WHERE THIS DIFFERS FROM
+    // STELLA - and the difference was forced by a hardware test, not by taste.
+    // 0.36 searched the whole 4K image, as Stella does, and that misclassified
+    // "Image Patricia with Horse" (SnailSoft, 2 copies in the library): the
+    // picture came out noisy and kept degrading on the real console. It is not
+    // a CommaVid cart at all. It is a plain 4K one whose PICTURE DATA happens
+    // to contain the bytes 9D FF F3 at offset $0D3 - inside the half a real CV
+    // file would use for saved RAM, i.e. for data, never for code.
+    //
+    // Simulated read pattern, which is what identifies it (tools/cv_sim/):
+    // every genuine CommaVid title reads ONLY $1000-$13FF and writes ONLY
+    // $1400-$17FF, the split port doing exactly what it is for. Image Patricia
+    // reads BOTH halves in equal measure (16542 / 16698 accesses) and writes
+    // neither - the signature of a cart that simply has 4K of ROM. Served as
+    // CV, its reads of $1400-$17FF decode as writes here, so the firmware
+    // stops driving the bus AND scribbles the sampled floating value into the
+    // RAM the picture lives in. That is the noise that showed up on the TV.
+    //
+    // The rule is not a special case for one file: the signature is an
+    // INSTRUCTION THE ROM EXECUTES, and in this file format the ROM is the
+    // last 2K. Bytes 0-2047 are a RAM image - data - so searching them can
+    // only produce false positives.
+    //
+    // Scope, counted over the library rather than estimated: of the 37721
+    // files of exactly 4096 bytes, 50 match anywhere and 48 match in the ROM
+    // half. The two that drop out are the two copies of Image Patricia. All 8
+    // distinct genuine images keep their match (MagiCard's at $E71, Video
+    // Life's at $9A3). The 2K bucket is untouched - there the whole image IS
+    // the ROM.
+  	if (isProbablyCV(2048, &rom_table[2048]))
+  		cart_type = CART_TYPE_CV;
+  	else
+  		cart_type = isProbably4KSC(rom_table) ? CART_TYPE_4KSC : CART_TYPE_4K;
 	}
 	else if (image_size == 8*1024)
 	{

@@ -65,6 +65,18 @@
   here had been watching for. **Mickey** wants its two banks the other way round — rename
   that file to `.UAS`._
 
+- **CommaVid cartridges run — 17 more titles**
+  _**MagiCard**, **Video Life** and the MagiCard sample programs answered nothing at all:
+  the menu listed them, the cartridge started, and the screen stayed black. These boards
+  carry a kilobyte of RAM alongside a 2KB ROM, read through one window and written
+  through another, and none of that was being served. They run now._
+
+  _A 4KB CommaVid file is not a doubled ROM — it is MagiCard's own save format, a
+  kilobyte of stored RAM followed by the program, which is how the sample programs and
+  the saved screens are distributed. Those files now show what was saved in them instead
+  of a mirror of their own code. No other flashcart firmware this project draws on loads
+  them; only Stella does._
+
 - **Three more cartridge types supported**
   _**mRAM** and **VersaBoard** on the 7800, **4KSC** on the 2600 — boards the cart
   simply did not answer before, so they showed nothing at all. The **Rescue On
@@ -96,7 +108,7 @@
 
 - **Easier browsing**
   - _The listing is sorted: directories first, then alphabetically._
-  - _Vanish in folders holding hundreds of files._
+  - _Subdirectories no longer vanish in folders holding hundreds of files._
   - _The full file name scrolls under the cursor, despite the 12-character row._
   - _Long ROM names display and load correctly._
   - _When the listing does not fit, the footer shows how many entries you can see._

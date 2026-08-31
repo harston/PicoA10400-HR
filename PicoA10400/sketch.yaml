@@ -1,0 +1,6 @@
+# boot2=boot2_w25q128jvxq_4_padded_checksum verified byte-for-byte identical
+# to the boot2 stage baked into the officially published PicoA10400.ino.uf2
+# (git commit e0f8c66c, upstream author, Nov 2024) - do not change this
+# without re-running that byte comparison (see menu_rom_analysis or ask
+# for the verification script in scratchpad history).
+default_fqbn: rp2040:rp2040:generic:flash=16777216_15728640,usbstack=tinyusb,boot2=boot2_w25q128jvxq_4_padded_checksum

@@ -1,0 +1,1 @@
+default_fqbn: rp2040:rp2040:rpipico2:flash=4194304_3145728,usbstack=tinyusb
