@@ -340,14 +340,26 @@ char menu_status[16];
 // of a string starting with '\0' is 0), and loading (LoadGame() rebuilds the path
 // from this same corrupted string, so it silently re-opens the current directory
 // instead of the file). Fix: give the buffer enough room that real names never hit
-// SdFat's failure path in the first place. 80 covers the longest name currently in
-// ROMS/ (61) with margin; raise it if a longer name ever needs it. Verified via the
-// L<len>C<code> footer diagnostic (see bugs/b01/worklog.md) on real hardware.
-#define MAX_NAME_LEN 80
+// SdFat's failure path in the first place. Verified via the L<len>C<code> footer
+// diagnostic (see bugs/b01/worklog.md) on real hardware.
+//
+// 80 was picked when ROMS/ held nothing longer than 61 characters. That bound came
+// back: measured over the whole 71288-file library, 8960 names (12.6%) are 80 bytes
+// or longer, and every one of them was listed corrupted. 128 brings that down to 936
+// files (1.3%, 266 distinct titles) for 4080 bytes of SRAM - the knee of the curve:
+// up to 128 a repaired file costs well under a byte, past it the price per file goes
+// 3.6 and then 21 bytes (204 would cover the whole library - the longest name in it
+// is 203 - but costs 10616 bytes). Names that still do not fit are no longer a silent
+// corruption: getName()'s return value is checked, and such an entry is drawn as
+// MENU_LONGNAME_TEXT in OVERSIZED_COLOUR. Raise this if those 936 ever matter.
+#define MAX_NAME_LEN 128
 char filelist[85*MAX_NAME_LEN]; // 85 entries, MAX_NAME_LEN bytes each (incl. terminator)
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
-char direntry_toobig[85]; // 1 if filelist[n] is a file larger than rom_table: loaded truncated, shown red in the menu
+char direntry_toobig[85]; // 1 if filelist[n] cannot be used as listed: file larger than rom_table (loaded truncated), or a name too long to read; shown red in the menu
 #define MENU_FOOTER_TEXT "AOTTAv01 HR8" // 12 chars: the menu kernel renders exactly 12 per row
+// Stand-in name for a directory entry whose real name does not fit in MAX_NAME_LEN.
+// 12 chars, uppercase only: the row shows exactly 12 and the font has no lowercase.
+#define MENU_LONGNAME_TEXT "NAME TOO LNG"
 // Colour of oversized-ROM names. The kernel reads this at runtime from menu_status[12],
 // so changing it needs no ROM patch - just this line. $66 was picked by sweeping all 16
 // hues on the actual PAL TV: hue 6 is the red family here, and luminance 6 keeps it
@@ -399,8 +411,12 @@ int marquee_row=-1;         // row being scrolled, -1 = none
 int marquee_tick=0;
 uint32_t marquee_last=0;
 uint8_t ram_table[32*1024];
-char path[128];
- char filetoopen[256]; // must hold path[128] + filename (up to MAX_NAME_LEN-1 chars) + terminator; was 50, which overflowed with long names or subdirectories
+// Deepest directory in ROMS/ needs 120 bytes including the trailing '/', so 128 still
+// fits with margin; filetoopen is sized FROM these two so it can never be the shorter
+// one again (path <= MAX_PATH_LEN-1 chars + name <= MAX_NAME_LEN-1 chars + terminator).
+#define MAX_PATH_LEN 128
+char path[MAX_PATH_LEN];
+ char filetoopen[MAX_PATH_LEN+MAX_NAME_LEN]; // was 50, which overflowed with long names or subdirectories; a too-short buffer here truncates the path and the file silently fails to open
  
 char menu_ram[1024];	// < NUM_DIR_ITEMS * 12 (85 max)
 char isfor7800=0;
@@ -5252,8 +5268,12 @@ void LoadGame(int numfile) {
     Serial.print(" new path:");root.printName(&Serial);Serial.println(" ");
   } else {
   if (!file.open(filetoopen)) {
+    // Never hang here. Two cases reach this line: a listing gone stale because files
+    // were changed over USB while the menu was up, and the MENU_LONGNAME_TEXT
+    // placeholder, which matches no file on purpose. Returning leaves newgame==0, so
+    // the caller rebuilds the listing and the selection simply does nothing.
     Serial.println("open error");
-    while(1);
+    return;
   }
   
   if (file.isDir()) {
@@ -5424,7 +5444,18 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
             memset(filename,32,sizeof(filename));
             // MAX_NAME_LEN-1 usable chars + terminator: see the bugs/b01 note by the
             // filelist declaration for why this must stay >= the longest real ROM name.
-            file.getName(filename, MAX_NAME_LEN);
+            // getName() returns 0 when the name does not fit, and SdFat's failure path
+            // (FatLib/FatName.cpp) then zeroes byte 0 ONLY - not the byte it reached -
+            // leaving '\0' followed by real characters 1..n. That single byte breaks
+            // sorting, marquee and loading at once, and does it silently. The entry
+            // cannot be opened from the listing either way, so show a placeholder and
+            // flag it rather than a row that lies about which file it is.
+            bool namefits = file.getName(filename, MAX_NAME_LEN);
+            if (!namefits) {
+              memset(filename,32,sizeof(filename));
+              memcpy(filename,MENU_LONGNAME_TEXT,12);
+              filename[12]=0;
+            }
             filename[sizeof(filename)-1]=0; // force null-terminator so later strcat can't run past this buffer
             for(int x=0;x<MAX_NAME_LEN;x++) filelist[contfile*MAX_NAME_LEN+x]=filename[x];
             direntry_isdir[contfile] = isdir ? 1 : 0;
@@ -5437,7 +5468,7 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
             char *ext = strrchr(filename, '.');
             if (ext && (ext[1]=='a'||ext[1]=='A') && ext[2]=='7' && ext[3]=='8' && payload>=0x80)
               payload -= 0x80;
-            direntry_toobig[contfile] = (!isdir && payload > sizeof(rom_table)) ? 1 : 0;
+            direntry_toobig[contfile] = (!namefits || (!isdir && payload > sizeof(rom_table))) ? 1 : 0;
             contfile++;
           }
           file.close();

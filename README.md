@@ -129,8 +129,19 @@
   - _The listing is sorted: directories first, then alphabetically._
   - _Subdirectories no longer vanish in folders holding hundreds of files._
   - _The full file name scrolls under the cursor, despite the 12-character row._
-  - _Long ROM names display and load correctly._
+  - _Long ROM names display and load correctly — now up to 127 characters._
   - _When the listing does not fit, the footer shows how many entries you can see._
+
+  _That last limit had been 79, and in a full library about one file in eight is longer
+  than that. Every one of them was listed as a broken row: it sorted to the top, would
+  not scroll and would not start — while the game itself was perfectly fine. It took a
+  console to find, because nothing in the firmware reports it. A name too long for the
+  new limit is now drawn as `NAME TOO LNG` in the colour oversized ROMs get, so a name
+  the cart cannot read says so instead of posing as a file you can pick._
+
+  _And picking an entry the cart cannot open no longer hangs it. That used to need a
+  power cycle, and you could trigger it just by changing files over USB while the menu
+  was still on screen._
 
 - **Stability**
   Several buffer overflows were fixed, including one where a large ROM corrupted the
