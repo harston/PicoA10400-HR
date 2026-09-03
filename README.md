@@ -77,6 +77,25 @@
   of a mirror of their own code. No other flashcart firmware this project draws on loads
   them; only Stella does._
 
+- **Bankset cartridges run on the 7800 — 9 more files, StoneAge among them**
+  _A Bankset cart holds two complete images in one file: one for the processor, one for
+  the video chip, at the very same addresses, and the console's HALT line picks between
+  them. The official Bankset test suite and **StoneAge (Final)**, a finished homebrew
+  game, were read as ordinary flat carts, so the half meant for the video chip was being
+  fed to the processor. All nine files that fit in memory run now, picture and sound._
+
+  _Getting there needed one thing no source documents: the HALT line has to be trusted
+  only after it has stayed asserted for several bus accesses in a row, because the
+  processor keeps using the bus for a moment after the video chip has claimed it. The
+  official RAM test demo then needed two further rounds before its music came back — it
+  plays its song out of cartridge RAM, and the cart was losing every write the 6502 makes
+  with an indexed address. That demo still shows a little flicker on its on-screen text._
+
+  _The five 2x128K titles — **Bubble Bobble** among them — do not fit: 256KB of image
+  cannot coexist with everything else in the RP2040's 256KB of RAM, so those load the
+  processor's half only and run with the wrong graphics. Bankset needs the HALT line,
+  which the Pico 2 board does not have._
+
 - **Three more cartridge types supported**
   _**mRAM** and **VersaBoard** on the 7800, **4KSC** on the 2600 — boards the cart
   simply did not answer before, so they showed nothing at all. The **Rescue On

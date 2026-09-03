@@ -132,6 +132,47 @@ bool fs_changed;
 #define SET_DATA_MODE_OUT   gpio_set_dir_out_masked(DATA_PIN_MASK)
 #define SET_DATA_MODE_IN    gpio_set_dir_in_masked(DATA_PIN_MASK)
 
+// --- Bankset (7800): HALT ---------------------------------------------------
+// BANKSET_HAS_HALT says whether the console's HALT line physically reaches this
+// board. It is the ONE thing the two sketches cannot share, and it is a board
+// fact, not a preference:
+//
+//   PicoA10400  - the purple RP2040 clone exposes GPIO23/24/25, and the shipped
+//                 gerbers route the cartridge connector's Halt pin (U2 pad 2) to
+//                 header pin 14, which on that clone is GPIO24. Verified in
+//                 GERBER-PicoA10400.zip: the Halt net has a pad AND traces, and
+//                 pin 14 sits between pin 13 (unrouted = GP25/LED) and pin 15
+//                 (/D7 = GPIO23), which pins the numbering down.
+//   Pico2A10400 - a genuine Pico 2 does not break GPIO23/24/25 out at all, and
+//                 GERBER-Pico2A10400.zip leaves the Halt net as a single
+//                 unconnected pad on the connector. There is no free header GPIO
+//                 left on that board either (0-14 address, 15-22 data, 26-28
+//                 A15/RW/CLK), so this is not a firmware choice to make.
+//
+// With BANKSET_HAS_HALT 0 the Bankset loops still run and still map the cart
+// correctly - they just always serve Sally's half, so a Bankset game boots and
+// plays with the wrong graphics instead of not booting at all. That is strictly
+// better than the flat mapping these files get today, and it is all the Pico 2
+// hardware allows.
+// Overridable from the compile line so a single build can ask "is the HALT
+// line usable at all?": build.sh target PicoA10400-BSSA passes
+// -DBANKSET_HAS_HALT=0 and installs <Sketch>.ino_BSSA.uf2, which maps every
+// Bankset board correctly but always serves Sally's half.
+#ifndef BANKSET_HAS_HALT
+#define BANKSET_HAS_HALT 0
+#endif
+
+// /HALT is asserted LOW - Maria pulls it down to take the bus, the way RDY
+// stops a 6502 - so HALT low selects Maria's half. NOT yet confirmed on our own
+// hardware, so it is overridable from the compile line: build.sh targets
+// PicoA10400-BSHI / Pico2A10400-BSHI pass -DBANKSET_HALT_ACTIVE_LOW=0 and
+// install the result as <Sketch>.ino_BSHI.uf2, next to the production build.
+// A wrong guess here is not subtle - the reset vector itself comes out of the
+// wrong half - so one hardware test settles it.
+#ifndef BANKSET_HALT_ACTIVE_LOW
+#define BANKSET_HALT_ACTIVE_LOW 1
+#endif
+
 #include "ym2151.h"  // YM2151 (OPM) FM synthesis, same audio pin. Included
                      // BEFORE pokey.h, because pokey_window_service() hands
                      // the $04xx window over to it for a YM cart.
@@ -193,6 +234,15 @@ bool fs_changed;
 // setup1()) therefore names them explicitly; see is2600 there.
 #define CART_TYPE_UA	43	// 8k, hotspots BELOW $1000 ($0220 / $0240)
 #define CART_TYPE_UASW	44	// 8k UA with the two banks swapped (Stella "UASW")
+// Bankset (7800): one file, two complete images - the first half for Sally,
+// the second for Maria, selected by the console's HALT line. Four boards, the
+// same four MAME's a78_slot.cpp switch(mapper & 0xe02e) picks between; the
+// POKEY/YM variants are not separate types here because pokey_base already
+// carries that.
+#define CART_TYPE_BANKSET	45	// flat 2x32K / 2x48K / 2x52K
+#define CART_TYPE_BANKSET_RAM	46	// flat + 2x16K banked RAM at $4000
+#define CART_TYPE_BANKSET_SG	47	// SuperGame, 2x(64K..256K)
+#define CART_TYPE_BANKSET_SG_RAM	48	// SuperGame + 2x16K banked RAM at $4000
 
 // CCM_RAM/CCM_SIZE/RAM_BANKS/CCM_BANKS/MAX_RAM_BANK/MAX_CCM_BANK removed
 // (OPTIMIZATION.md 2.6): UnoCart (STM32) relic, unused anywhere in this
@@ -2185,6 +2235,1015 @@ void __time_critical_func(emulate_supercart_large_pokey()) {
 #pragma GCC push_options
 #pragma GCC optimize ("O3")
 
+// ===========================================================================
+// Bankset (7800) - TODO.md "Pozycja 3"
+// ===========================================================================
+//
+// A Bankset cartridge carries TWO complete images in one file: the first half
+// is what Sally (the 6502) sees, the second half is what Maria (the video DMA
+// engine) sees at the very same addresses. The cartridge picks between them
+// combinationally from the console's HALT line - there is no register and no
+// state, so all this firmware has to do is sample HALT in the same
+// gpio_get_all() that gives it the address. That is what BANKSET_MARIA_OFFSET
+// below does, in four single-cycle instructions and no branch.
+//
+// Sources (both transcribed, then cross-checked against each other by
+// tools/bankset_sim/):
+//   * MAME  ORIG/MAME-A7800/src/devices/bus/a7800/bankset.cpp - the reference
+//     implementation, by the scheme's own author (Mike Saarna). Header ->
+//     board selection is a78_slot.cpp:409-470, "switch (mapper & 0xe02e)".
+//   * test7800 ORIG/test7800/hardware/memory/external/banksets.go - an
+//     independent implementation; agrees on every mapping we need.
+//
+// HALT POLARITY. /HALT is asserted LOW: Maria pulls it down to take the bus
+// away from Sally, exactly the way RDY stops a 6502. So HALT low = serve
+// Maria's half. This is the one fact here that is NOT verified on our own
+// hardware, so it is a single #define (BANKSET_HALT_ACTIVE_LOW) and there is
+// a diagnostic build with the opposite sense - see build.sh, target
+// PicoA10400-BSHI. A wrong guess is unmistakable rather than subtle: the
+// reset vector itself would come from the wrong half, so the cart would not
+// boot at all.
+//
+// UNCONNECTED HALT. The pad default on an RP2040 is pull-DOWN, i.e. a floating
+// HALT would read "asserted" and every fetch would come from Maria's half.
+// setup_bankset() therefore switches the pin to pull-UP, so a board that does
+// not route HALT degrades to "Sally's half always" - the game boots and only
+// the graphics are wrong - instead of failing at the reset vector.
+
+// Maria's half is at + (romLen/2) for as long as HALT says Maria owns the bus.
+// Written branchlessly: (bit - 1) is 0 when the bit is set and 0xFFFFFFFF when
+// it is clear, so the AND either passes `half` through or zeroes it. On the
+// Pico 2 board the HALT line is not routed at all (see the comment on
+// BANKSET_HAS_HALT), and this collapses to a compile-time 0.
+#if BANKSET_HAS_HALT
+#if BANKSET_HALT_ACTIVE_LOW
+#define BANKSET_MARIA_OFFSET(raw, half) \
+  ((half) & ((((raw) >> HALT_PIN) & 1u) - 1u))
+#else
+#define BANKSET_MARIA_OFFSET(raw, half) \
+  ((half) & (0u - (((raw) >> HALT_PIN) & 1u)))
+#endif
+#else
+#define BANKSET_MARIA_OFFSET(raw, half) (0u)
+#endif
+
+// --- diagnostic switches, both default OFF -----------------------------------
+//
+// BANKSET_DIAG_CHARWIN ("is HALT usable AT ALL?") - apply the HALT selection
+// ONLY inside $E000-$E7FF and serve Sally's half everywhere else.
+//
+// Why that window: the official Bankset demo draws in MARIA's character mode
+// with CHARBASE = $E0, so every glyph MARIA fetches comes from $E000-$E7FF,
+// and SALLY never executes from there (in Sally's half that region is all
+// zeroes - measured, tools/bankset_sim/dump_display_list.py). So this build
+// cannot corrupt the CPU: the demo is guaranteed to run and paint its purple
+// background ($60, measured with dump_colors.py). The only question left on
+// screen is whether the TEXT appears - which happens if and only if the HALT
+// line is a usable "MARIA owns the bus" indicator at the moment MARIA fetches.
+//
+// BANKSET_TRACK_HALT ("follow HALT the way the real board does") - a real
+// Bankset cartridge is combinational: its ROM output follows HALT for the whole
+// bus cycle. The production loop samples HALT ONCE, with the address, and then
+// holds that byte until the address changes. If HALT moves mid-cycle - which it
+// must, at both ends of every DMA burst - the console latches a byte from the
+// wrong half. This build keeps the output live instead, re-reading HALT and
+// re-driving inside the wait, which is what the hardware being emulated does.
+#ifndef BANKSET_DIAG_CHARWIN
+#define BANKSET_DIAG_CHARWIN 0
+#endif
+#ifndef BANKSET_TRACK_HALT
+#define BANKSET_TRACK_HALT 0
+#endif
+
+#if BANKSET_DIAG_CHARWIN
+#define BANKSET_SEL(raw, half, addr) \
+  ((((addr) & 0xF800u) == 0xE000u) ? BANKSET_MARIA_OFFSET(raw, half) : 0u)
+#else
+#define BANKSET_SEL(raw, half, addr) BANKSET_MARIA_OFFSET(raw, half)
+#endif
+
+// BANKSET_STICKY_N ("trust HALT only after it has been low for a WHILE").
+//
+// The hardware said, in this order: BSCH works (so HALT reads correctly while
+// MARIA fetches), production hangs (so SALLY's fetches get MARIA's half), and
+// BSTR hangs too (so it is not a matter of WHEN inside the cycle we sample -
+// following HALT for the whole cycle changes nothing). The only reading left is
+// that HALT is low for the ENTIRE duration of some Sally accesses, i.e. Sally
+// is still using the bus after MARIA has asserted HALT and before MARIA
+// actually starts fetching.
+//
+// A rule based on the level alone cannot separate those. A rule based on how
+// LONG the level has held can: a DMA burst holds HALT low across many
+// consecutive accesses, while the leaked Sally cycles sit at its very start. So
+// count consecutive stable addresses seen with HALT low, and only switch to
+// Maria's half once that run reaches N.
+//
+// The error is deliberately asymmetric. Serving Sally's half to MARIA costs one
+// wrong graphics byte; serving MARIA's half to SALLY costs one wrong opcode,
+// which is fatal. N therefore biases towards Sally: the first N-1 fetches of
+// each burst come from Sally's half, which at worst blanks the leading
+// character of a row.
+//
+// MEASURED ON HARDWARE, 2026-09-02 (PAL console), swept the way the E8
+// drive-strength experiment was:
+//
+//     N = 2   yellow screen - still hangs
+//     N = 8   WORKS - the Bankset demos AND StoneAge, a real game
+//
+// So the leaked Sally window is longer than 2 accesses and no longer than 8,
+// and 8 is the production default. It costs nothing visible because the counter
+// runs on EVERY bus access, not only cartridge ones: MARIA reads its display
+// list and character codes from console RAM at the start of each burst, which
+// saturates the run long before it fetches a single glyph from the cartridge.
+//
+// 0 disables it (the pre-0.38 behaviour, kept for bisecting). Any value can be
+// swept from the compile line: build.sh targets PicoA10400-BSK<n>.
+#ifndef BANKSET_STICKY_N
+#define BANKSET_STICKY_N 8
+#endif
+
+// A board without the HALT line has nothing to be hysteretic ABOUT: the Maria
+// offset is a compile-time zero there, and the counter would only reference a
+// HALT_PIN_MASK that such a board does not define. Force it off.
+//
+// This is not hypothetical - promoting the default from 0 to 8 broke the Pico 2
+// build outright, and it went unnoticed for one round because the build output
+// was being filtered for success lines instead of checked for an exit status.
+// tools/rebuild_all_bankset.sh now reports failures.
+#if !BANKSET_HAS_HALT
+#undef BANKSET_STICKY_N
+#define BANKSET_STICKY_N 0
+#endif
+
+// R/W sampled TWICE and OR-ed: "read" wins.
+//
+// patches/PicoA10400_0.15.txt, "WHAT TO WATCH OUT FOR", is explicit that making
+// the data output conditional on a SINGLE R/W sample costs the design its
+// tolerance for one bad sample, and that three hardware failures on this board
+// were traced to exactly one mis-read. Reshaping emulate_bankset_ram() put such
+// a single-sample test in front of its $4000-$7FFF and $C000-$FFFF windows -
+// and $C000-$FFFF is where the 6502 vectors and interrupt handlers live. On
+// "Bankset Test 2x32K RAM Pokey800" the NMI vector is $F8E5 and the music
+// player runs from that handler, so one mis-read there costs an opcode inside
+// the routine that makes the sound: picture fine, music gone. Which is exactly
+// what hardware reported, and it is why the FLAT loop - which never gates its
+// drive on R/W at all - keeps its sound (StoneAge).
+//
+// Two samples, OR-ed, restore the tolerance without giving up the write
+// capture: one spurious "write" no longer steals a fetch, while one spurious
+// "read" during a real write costs a captured byte - a pixel, not an opcode.
+// Same asymmetry as the HALT hysteresis, for the same reason.
+#define BANKSET_IS_READ() \
+  ((gpio_get_all() | gpio_get_all()) & RW_PIN_MASK)
+
+// Hold the data lines through a READ - and ONLY through a read.
+//
+// A 6502 does not always change the address between a read and a write. An
+// indexed store (STA abs,X / abs,Y / (zp),Y) performs a READ cycle at the
+// target address right before the WRITE cycle (the "dummy read", cycle 4 of
+// STA abs,Y - it happens whether or not the index crosses a page), and every
+// read-modify-write instruction (INC/DEC/ASL/LSR/ROL/ROR abs) reads its
+// operand and then writes at the same address twice. Between those cycles
+// only R/W moves. A wait keyed on the address alone - the flat loop's
+// "while (address unchanged)" - is right for ROM, where nothing ever writes,
+// and wrong for RAM: it keeps driving straight through the write cycle and
+// never captures the byte.
+//
+// That is exactly how "Bankset Test 2x32K RAM Pokey800" lost its music. It
+// copies its 4 KB song into cartridge RAM with STA $4000,Y (sixteen pages,
+// $809B-$8144) and the player then reads the song from there ($8146: song
+// address $4000 handed to the init at $F27C). Every byte of that copy was
+// lost, the player read zeros, and the POKEY got nothing but the silence
+// pattern - while the picture, which lives in console RAM and ROM, stayed
+// perfect. tools/bankset_sim/dummy_read_probe.py replays both loops against
+// the 6502's bus timing: the shipped one drives against Sally for 228 ns of
+// every indexed store and captures nothing; this one captures the byte.
+//
+// Exits with wr = 1 when R/W read LOW in two consecutive samples while the
+// address stayed (a confirmed write at this address, still in progress), and
+// wr = 0 when the address moved on. Two samples for the same reason
+// BANKSET_IS_READ() takes two: one spurious "write" must not drop the drive
+// in the middle of a real fetch. Should a spurious pair still slip through,
+// the cost is bounded - the drive is released a few ns early and the byte
+// "captured" is the one the bus still holds, i.e. our own, so the cell is
+// written back with the value it already had.
+// 0.40 adds the third parameter. While MARIA owns the bus there is nothing to
+// watch for: MARIA only ever READS, so a "write" sampled inside one of its
+// fetches is a mis-read, and acting on one costs the whole fetch - we stop
+// driving, spend the rest of the cycle in the capture loop, and MARIA latches
+// whatever the bus still holds. That is one wrong 8-pixel row of one character,
+// i.e. a short horizontal dash that comes and goes. See BANKSET_MARIA_NOW in
+// emulate_bankset_ram() for the measurement this comes from.
+#define BANKSET_HOLD_WHILE_READ(addr, wr, maria)                               \
+  do {                                                                         \
+    (wr) = 0u;                                                                 \
+    for (;;) {                                                                 \
+      uint32_t h1_ = gpio_get_all();                                           \
+      if ((h1_ & BUS_PIN_MASK) != (addr)) break;                               \
+      if ((maria) || (h1_ & RW_PIN_MASK)) continue;                            \
+      uint32_t h2_ = gpio_get_all();                                           \
+      if ((h2_ & BUS_PIN_MASK) != (addr)) break;                               \
+      if (!(h2_ & RW_PIN_MASK)) { (wr) = 1u; break; }                          \
+    }                                                                          \
+  } while (0)
+
+// SALLY OWNS THE BUS - the rule the reference implementation states as an
+// assertion. test7800's banksets.go:128 begins its Access() with
+//
+//     if write && ext.hlt { panic("MARIA should not be writing to memory") }
+//
+// i.e. a write while HALT is asserted is IMPOSSIBLE: MARIA only ever reads, and
+// SALLY is off the bus. So any "write" we see with HALT asserted is not a write
+// at all - it is an undriven bus, and an undriven bus reads as zero, because the
+// RP2040 pads default to pull-down.
+//
+// NOTE (0.39): the evidence originally cited here was misread. The thousands of
+// zero-byte captures on "Bankset Test 2x32K RAM Pokey800" were REAL writes by a
+// real music player; the data was zero because the song itself had been lost on
+// the way into cartridge RAM. The RULE above is unaffected - it comes from the
+// reference implementation, not from that measurement - and 0.40 puts it to its
+// proper use, on the READ path, where ignoring R/W during a MARIA fetch is what
+// keeps the fetch (see BANKSET_MARIA_NOW in emulate_bankset_ram()).
+//
+// Gating the capture on "Sally owns the bus" throws all of them away and costs
+// nothing real, because a genuine POKEY write can only ever happen when Sally is
+// driving. On a board without a HALT line this collapses to a compile-time 1.
+#if BANKSET_HAS_HALT
+#if BANKSET_HALT_ACTIVE_LOW
+#define BANKSET_SALLY_OWNS(raw)  ((raw) & HALT_PIN_MASK)
+#else
+#define BANKSET_SALLY_OWNS(raw)  (!((raw) & HALT_PIN_MASK))
+#endif
+#else
+#define BANKSET_SALLY_OWNS(raw)  (1)
+#endif
+
+// BANKSET_DIAG_TONE ("do the POKEY writes reach this loop at all?").
+//
+// "Bankset Test 2x32K RAM Pokey800" has a correct picture and no music, and the
+// music player is known to exist: scan_pokey_stores.py finds stores to $0815
+// and $0818,Y in Sally's half, reached from the NMI handler at $F8E5. What is
+// not known is whether those writes reach the bus loop.
+//
+// This build makes the answer audible without depending on the data at all.
+// The cart's own initialisation routine writes the POKEY 29 times (all zeroes,
+// measured), so the counter has to clear that before it means anything: after
+// the 64th captured write - which only a running PLAYER can produce - a fixed
+// audible tone is forced into pokey_regs[] and capturing stops, so the tone
+// stays.
+//
+//     tone after a moment -> the player's writes ARE reaching the loop, and the
+//                            fault is downstream (data or synthesis)
+//     silence             -> they are NOT reaching it, and the fault is in how
+//                            this loop sees the $0800 window
+// Prog jest WARTOSCIA tego przelacznika, nie stala w kodzie - bo dobranie go
+// zle raz juz zepsulo wniosek. Rutyna inicjalizujaca tego kartridza wykonuje
+// DOKLADNIE 29 zapisow (zmierzone, dump_pokey_writes.py), wiec prog 64 lezy
+// zaledwie 35 nad nia: kilkanascie przypadkowych przechwycen wystarczy, zeby go
+// przekroczyc, a wtedy ton nie mowi nic o odtwarzaczu. Prog rzedu tysiecy moze
+// osiagnac wylacznie cos, co pisze bez przerwy.
+#ifndef BANKSET_DIAG_TONE
+#define BANKSET_DIAG_TONE 0
+#endif
+
+// BANKSET_DIAG_PKFIRST - handle the aux-chip window on the first sample, in the
+// RAM loop only. See the block it inserts, in emulate_bankset_ram().
+#ifndef BANKSET_DIAG_PKFIRST
+#define BANKSET_DIAG_PKFIRST 0
+#endif
+
+// BANKSET_DIAG_NORMALLOOP - route the banked-RAM Bankset cart through the
+// ordinary emulate_normala78_pokey() instead. See the dispatch in setup1().
+#ifndef BANKSET_DIAG_NORMALLOOP
+#define BANKSET_DIAG_NORMALLOOP 0
+#endif
+
+#if BANKSET_DIAG_TONE
+static uint32_t bankset_pk_seen = 0;
+#define BANKSET_CAPTURE(reg, val)                                              \
+  do {                                                                         \
+    uint32_t n_ = ++bankset_pk_seen;                                           \
+    if (n_ == (uint32_t)BANKSET_DIAG_TONE) {                                                           \
+      pokey_regs[0x00] = 60;      /* AUDF1 */                                  \
+      pokey_regs[0x01] = 0xA8;    /* AUDC1: pure tone, volume 8 */             \
+      pokey_regs[0x08] = 0x00;    /* AUDCTL */                                 \
+      pokey_regs[0x0F] = 0x03;    /* SKCTL released */                         \
+    } else if (n_ < (uint32_t)BANKSET_DIAG_TONE) {                             \
+      pokey_capture_write((reg), (val));                                       \
+    }                                                                          \
+  } while (0)
+#else
+#define BANKSET_CAPTURE(reg, val) pokey_capture_write((reg), (val))
+#endif
+
+// BANKSET_DIAG_TONE2 ("czy dociera JAKIKOLWIEK rozkaz zrobienia dzwieku?").
+//
+// _BSAU pokazalo, ze zapisy docieraja i synteza gra; bramka "tylko zapisy" nic
+// nie zmienila. Zostaly WARTOSCI. Ta sonda arm-uje slyszalny ton dopiero wtedy,
+// gdy przechwycimy zapis do rejestru GLOSNOSCI (AUDC1/2/3/4 = 1,3,5,7)
+// z niezerowa glosnoscia w bitach 0-3 - czyli jedyny rodzaj zapisu, ktory
+// w ogole moze cos zagrac.
+//
+//     ton    -> rozkazy glosnosci DOCIERAJA poprawnie; wina jest dalej
+//               (czestotliwosc, AUDCTL, albo interpretacja w syntezie)
+//     cisza  -> do rejestrow AUDCx trafiaja same zera; przechwytujemy zle DANE
+#ifndef BANKSET_DIAG_TONE2
+#define BANKSET_DIAG_TONE2 0
+#endif
+
+#if BANKSET_DIAG_TONE2
+static uint32_t bankset_pk_armed = 0;
+#undef BANKSET_CAPTURE
+#define BANKSET_CAPTURE(reg, val)                                              \
+  do {                                                                         \
+    uint32_t r_ = (uint32_t)(reg), v_ = (uint32_t)(val);                       \
+    if (!bankset_pk_armed &&                                                   \
+        (r_ == 1u || r_ == 3u || r_ == 5u || r_ == 7u) && (v_ & 0x0Fu)) {      \
+      pokey_regs[0x00] = 60;      /* AUDF1 */                                  \
+      pokey_regs[0x01] = 0xA8;    /* AUDC1: pure tone, volume 8 */             \
+      pokey_regs[0x08] = 0x00;    /* AUDCTL */                                 \
+      pokey_regs[0x0F] = 0x03;    /* SKCTL released */                         \
+      bankset_pk_armed = 1;                                                    \
+    } else if (!bankset_pk_armed) {                                            \
+      pokey_capture_write(r_, (uint8_t)v_);                                    \
+    }                                                                          \
+  } while (0)
+#endif
+
+// BANKSET_DIAG_TONE3 ("czy widzimy JAKIKOLWIEK niezerowy bajt danych?").
+//
+// _BSA2 dalo cisze: zaden zapis do rejestru glosnosci z niezerowa wartoscia nie
+// dotarl. Zostaja dwie mozliwosci i ta sonda je rozdziela - arm-uje ton przy
+// pierwszym przechwyconym zapisie o NIEZEROWYM BAJCIE DANYCH, obojetnie do
+// ktorego rejestru. Rutyna inicjalizujaca tego kartridza pisze same zera
+// (zmierzone), wiec nie moze tego wywolac.
+//
+//     ton   -> niezerowe dane DOCIERAJA; probkowanie magistrali dziala, a
+//              problemem jest to, ktore zapisy widzimy
+//     cisza -> KAZDY przechwycony bajt to $00; probkujemy dane ZANIM procesor
+//              je wystawi (pady RP2040 maja domyslnie sciaganie do masy, wiec
+//              nienapedzana magistrala czyta sie jako zero)
+#ifndef BANKSET_DIAG_TONE3
+#define BANKSET_DIAG_TONE3 0
+#endif
+
+#if BANKSET_DIAG_TONE3
+static uint32_t bankset_pk_armed3 = 0;
+#undef BANKSET_CAPTURE
+#define BANKSET_CAPTURE(reg, val)                                              \
+  do {                                                                         \
+    uint32_t r_ = (uint32_t)(reg), v_ = (uint32_t)(val);                       \
+    if (!bankset_pk_armed3 && v_ != 0u) {                                      \
+      pokey_regs[0x00] = 60;      /* AUDF1 */                                  \
+      pokey_regs[0x01] = 0xA8;    /* AUDC1: pure tone, volume 8 */             \
+      pokey_regs[0x08] = 0x00;                                                 \
+      pokey_regs[0x0F] = 0x03;                                                 \
+      bankset_pk_armed3 = 1;                                                   \
+    } else if (!bankset_pk_armed3) {                                           \
+      pokey_capture_write(r_, (uint8_t)v_);                                    \
+    }                                                                          \
+  } while (0)
+#endif
+
+// BANKSET_DIAG_TONE4 ("czy do AUDCx trafia COKOLWIEK niezerowego?").
+//
+// _BSAU4096 pokazalo, ze zapisy odtwarzacza docieraja tysiacami (inicjalizacja
+// robi 29). _BSA2 pokazalo, ze zaden z nich nie niesie niezerowej GLOSNOSCI
+// (bity 0-3 rejestru AUDCx). Ta sonda pyta o slabszy warunek: czy do AUDC1/2/3/4
+// trafia w ogole jakikolwiek niezerowy bajt - bo AUDCx niesie tez bity ksztaltu
+// fali (zwykle $A0), ktore odtwarzacz musi ustawiac.
+//
+//     ton   -> bajty AUDCx docieraja, ale z wyzerowana MLODSZA POLOWKA;
+//              czytamy dane czesciowo - problem w probkowaniu magistrali
+//     cisza -> do AUDCx nie trafia NIC niezerowego, mimo tysiecy przechwycen;
+//              czyli trafiaja tam bajty z innych zapisow albo same zera
+#ifndef BANKSET_DIAG_TONE4
+#define BANKSET_DIAG_TONE4 0
+#endif
+
+#if BANKSET_DIAG_TONE4
+static uint32_t bankset_pk_armed4 = 0;
+#undef BANKSET_CAPTURE
+#define BANKSET_CAPTURE(reg, val)                                              \
+  do {                                                                         \
+    uint32_t r_ = (uint32_t)(reg), v_ = (uint32_t)(val);                       \
+    if (!bankset_pk_armed4 &&                                                  \
+        (r_ == 1u || r_ == 3u || r_ == 5u || r_ == 7u) && v_ != 0u) {          \
+      pokey_regs[0x00] = 60;                                                   \
+      pokey_regs[0x01] = 0xA8;                                                 \
+      pokey_regs[0x08] = 0x00;                                                 \
+      pokey_regs[0x0F] = 0x03;                                                 \
+      bankset_pk_armed4 = 1;                                                   \
+    } else if (!bankset_pk_armed4) {                                           \
+      pokey_capture_write(r_, (uint8_t)v_);                                    \
+    }                                                                          \
+  } while (0)
+#endif
+
+// BANKSET_DIAG_TONE5 - jak TONE, ale liczy WYLACZNIE przechwycenia
+// z NIEZEROWYM bajtem danych. Prog jest wartoscia.
+//
+// Ostatni czysty rozdzial. Wiadomo juz, ze przechwytujemy tysiace zapisow
+// w 32-bajtowym oknie $0800-$081F (_BSAU4096 uzbraja ton takze PO zawezeniu),
+// a mimo to zaden nie niesie niezerowego bajtu do AUDCx (_BSA2, _BSA5).
+// Sonda TONE3 pytala o to samo, ale z progiem 1 - odpalala wiec na rutynie
+// inicjalizujacej, ktora pisze SKCTL=$03. Z progiem rzedu tysiecy inicjalizacja
+// (29 zapisow) nie ma szans.
+//
+//     ton   -> tysiace przechwycen ma sensowne DANE; czytanie magistrali
+//              dziala, a bledny jest NUMER REJESTRU
+//     cisza -> po inicjalizacji KAZDY przechwycony bajt to $00; czytamy dane
+//              systematycznie jako zero
+#ifndef BANKSET_DIAG_TONE5
+#define BANKSET_DIAG_TONE5 0
+#endif
+
+#if BANKSET_DIAG_TONE5
+static uint32_t bankset_pk_nz = 0;
+#undef BANKSET_CAPTURE
+#define BANKSET_CAPTURE(reg, val)                                              \
+  do {                                                                         \
+    uint32_t r_ = (uint32_t)(reg), v_ = (uint32_t)(val);                       \
+    if (v_ != 0u) bankset_pk_nz++;                                             \
+    if (bankset_pk_nz == (uint32_t)BANKSET_DIAG_TONE5) {                       \
+      pokey_regs[0x00] = 60;                                                   \
+      pokey_regs[0x01] = 0xA8;                                                 \
+      pokey_regs[0x08] = 0x00;                                                 \
+      pokey_regs[0x0F] = 0x03;                                                 \
+      bankset_pk_nz++;                                                         \
+    } else if (bankset_pk_nz < (uint32_t)BANKSET_DIAG_TONE5) {                 \
+      pokey_capture_write(r_, (uint8_t)v_);                                    \
+    }                                                                          \
+  } while (0)
+#endif
+
+
+
+
+// Maria-half offset for the three loops that are NOT the flat one. The flat
+// loop keeps its own inline form, byte for byte as it was tested at N=8 - the
+// counter there also ticks while the loop is parked on a sub-$4000 address, and
+// that is part of what was measured, so it is deliberately not "tidied up".
+//
+// Here the run counts DISTINCT ADDRESSES, which is the same measure of the
+// thing that actually matters: how many consecutive bus accesses have carried
+// HALT low. A high sample resets it immediately - errors are biased towards
+// Sally, because a wrong byte to MARIA is one wrong pixel and a wrong byte to
+// SALLY is a wrong opcode.
+#if BANKSET_STICKY_N
+#define BANKSET_MO(raw, lowrun, h)  (((lowrun) >= BANKSET_STICKY_N) ? (uint32_t)(h) : 0u)
+#define BANKSET_RUN_DECL            uint32_t lowrun = 0, lastaddr = 0xFFFFFFFFu
+#define BANKSET_RUN_STEP(raw, addr)                                            \
+  do {                                                                         \
+    if ((raw) & HALT_PIN_MASK) lowrun = 0;                                     \
+    else if ((addr) != lastaddr) {                                             \
+      lastaddr = (addr);                                                       \
+      if (lowrun < BANKSET_STICKY_N) lowrun++;                                 \
+    }                                                                          \
+  } while (0)
+#else
+#define BANKSET_MO(raw, lowrun, h)  BANKSET_MARIA_OFFSET(raw, (h))
+#define BANKSET_RUN_DECL            const uint32_t lowrun = 0
+#define BANKSET_RUN_STEP(raw, addr) do { } while (0)
+#endif
+
+// Bank number mask for ONE bankset half. MAME derives it from the whole file
+// (a78_rom_sg_device: nbanks odd ? nbanks-2 : nbanks-1) and then halves it on
+// every use - "m_bank_mask/2" appears in each read_40xx in bankset.cpp.
+//
+// Written out in both SuperGame loops below rather than shared in a helper ON
+// PURPOSE. GCC will not inline across an __attribute__((optimize)) boundary, so
+// a static inline helper called from an -O2 __time_critical_func lands in FLASH
+// and is reached through a RAM veneer - the exact shape PicoA10400_tune/ was
+// written to hunt down. It only ran once per game here, but the rule in this
+// file is that nothing in an emulate_* function calls into flash, and
+// tools/check_bankset_hotpath.py enforces it.
+#define BANKSET_BANK_MASK_DECL(name, rom_len)                                  \
+  const uint32_t name##_nbanks = (uint32_t)(rom_len) / 0x4000u;                \
+  const uint32_t name = ((name##_nbanks < 2u) ? 0u                             \
+                       : ((name##_nbanks & 1u) ? (name##_nbanks - 2u)          \
+                                               : (name##_nbanks - 1u))) >> 1
+
+// Flat Bankset: 2x32K, 2x48K or 2x52K, no cartridge RAM.
+// MAME a78_bankset_rom_device / _p800 / _p4000 / _52k (bankset.cpp:296-420).
+// The image is mapped to the TOP of the address space, exactly like any other
+// flat 7800 cart: origin = 0x10000 - (romLen/2). For a 52K half that origin is
+// $3000, and MAME installs a read handler there for precisely this scheme
+// (a7800.cpp:1483-1489) - the $2800-$3FFF "RAM mirror" the Software Guide
+// claims is not real on hardware, which is also how the High Score Cartridge
+// gets to put ROM at $3000.
+//
+// Shape is emulate_normala78()'s, unchanged: two matching address samples,
+// drive, block until the address moves, release. That is the loop that has
+// been through the not_working_roms4 hardware iterations for flat 7800 carts,
+// and a Bankset flat cart is a flat cart with one extra index term.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_bankset_flat()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  uint32_t raw, addr, addr_prev = 0xFFFFFFFF;
+  const uint32_t half   = (uint32_t)romLen >> 1;
+  const uint32_t origin = 0x10000u - half;
+  // Only a 52K half is allowed to answer below $4000 - that is the one size
+  // MAME gives a read_30xx handler. Anything else is clamped to the cartridge
+  // window so a malformed header can never make us drive over console RAM.
+  const uint32_t lo = (half == 0xD000u) ? 0x3000u
+                    : ((origin < 0x4000u) ? 0x4000u : origin);
+  const uint32_t pkbase = (uint32_t)pokey_base;   // volatile: hoist out of the loop
+  const uint32_t pkmask = (uint32_t)pokey_mask;
+  const uint32_t ymon   = (uint32_t)ym_enabled;
+  // A POKEY at $4000 on a 48K/52K half sits INSIDE the ROM window, so it has to
+  // be write-only there: reads must still return ROM (JS7800 calls this exact
+  // case cartridge_pokey_write_only, Cartridge.js:332). pk_ovl is the base of
+  // that 16-byte overlap, or an address the bus can never carry when there is
+  // none - so "(addr & 0xFFF0) == pk_ovl" is one AND and one compare against a
+  // register, never taken for any other cart.
+  //
+  // It must be a WINDOW, not just an upper bound: a 52K half starts at $3000,
+  // so a bare "addr < $4010" would also swallow $3000-$3FFF and capture a write
+  // there as a POKEY register.
+  const uint32_t pk_ovl = (pokey_enabled && pkbase == 0x4000u && lo <= 0x4000u)
+                        ? 0x4000u : 0xFFFFFFFFu;
+
+#if BANKSET_STICKY_N
+  uint32_t lowrun = 0;      // consecutive stable addresses seen with HALT low
+#endif
+
+  while (1) {
+    raw  = gpio_get_all();
+    addr = raw & BUS_PIN_MASK;
+    if (addr != addr_prev) { addr_prev = addr; continue; }   // need two matching samples
+    // got a stable address
+#if BANKSET_STICKY_N
+    if (raw & HALT_PIN_MASK) lowrun = 0;
+    else if (lowrun < BANKSET_STICKY_N) lowrun++;
+#define BANKSET_OFFSET_NOW  ((lowrun >= BANKSET_STICKY_N) ? half : 0u)
+#else
+#define BANKSET_OFFSET_NOW  BANKSET_SEL(raw, half, addr)
+#endif
+    if (addr >= lo) {
+      const uint32_t off = addr - origin;
+      const uint32_t idx = BANKSET_OFFSET_NOW + off;
+      if ((addr & 0xFFF0u) == pk_ovl) {
+        // POKEY window overlapping ROM: serve ROM on a read, listen on a write.
+        if (gpio_get_all() & RW_PIN_MASK) {
+          sio_hw->gpio_out = (uint32_t)rom_table[idx] << D0_PIN;
+          SET_DATA_MODE_OUT;
+          while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+          SET_DATA_MODE_IN;
+        } else {
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS_PIN_MASK) != addr) break;
+            last = cur;
+          }
+          BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+        }
+#if BANKSET_TRACK_HALT
+      } else {
+        // Keep the byte LIVE for the whole cycle, re-reading HALT each turn -
+        // the real board is combinational and does exactly this. ~7 instructions
+        // per turn at 250MHz, i.e. tens of refreshes inside MARIA's ~279ns.
+        SET_DATA_MODE_OUT;
+        do {
+          raw = gpio_get_all();
+          sio_hw->gpio_out =
+            (uint32_t)rom_table[BANKSET_OFFSET_NOW + off] << D0_PIN;
+        } while ((raw & BUS_PIN_MASK) == addr);
+        SET_DATA_MODE_IN;
+      }
+#else
+      } else {
+        sio_hw->gpio_out = (uint32_t)rom_table[idx] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+        SET_DATA_MODE_OUT;
+        while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+        SET_DATA_MODE_IN;
+      }
+#endif
+    } else if ((addr & pkmask) == pkbase && ymon) {
+      ym_window_service_blocking(addr);
+    } else if ((addr & pkmask) == pkbase) {
+      // LISTEN ONLY, same end-of-cycle capture as emulate_normala78_pokey().
+      uint32_t last = gpio_get_all(), cur;
+      for (uint32_t g = 0; g < 64; g++) {
+        cur = gpio_get_all();
+        if ((cur & BUS_PIN_MASK) != addr) break;
+        last = cur;
+      }
+      BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+    }
+  }
+}
+
+// Flat Bankset with banked RAM: 16K for Sally and 16K for Maria at $4000-$7FFF.
+// MAME a78_bankset_bankram_device / _p800 (bankset.cpp:421-520).
+//
+//   read  $4000-$7FFF -> RAM, Sally's or Maria's bank per HALT
+//   read  >= origin   -> ROM, Sally's or Maria's half per HALT
+//   write $4000-$7FFF -> Sally's RAM   ("Maria can only read, so this has to
+//                                        be Sally's bankset" - bankset.cpp:487)
+//   write $C000-$FFFF -> MARIA's RAM. This is the whole point of the scheme:
+//                        Maria's RAM is invisible to Sally, so the board gives
+//                        Sally a second window onto it that shadows the ROM.
+//
+// The two 16K banks are ram_table[0x0000..] and ram_table[0x4000..] - the same
+// 32KB array VersaBoard already uses for its two banked RAM pages, and the
+// same layout MAME uses (m_ram[offset] / m_ram[offset + 0x4000]).
+//
+// Shape is emulate_supercart_ram()'s: single sample, R/W gating, rom_in_use
+// held across a burst, end-of-cycle data capture on writes. A cart with RAM in
+// the $4000 window has to see writes, and that is the loop proven to do it.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_bankset_ram()) {
+  __asm volatile ("cpsid i" ::: "memory");
+  uint32_t raw, addr, addr_prev = 0xFFFFFFFFu;
+  const uint32_t half   = (uint32_t)romLen >> 1;
+  const uint32_t origin = 0x10000u - half;
+  const uint32_t lo     = (origin < 0x8000u) ? 0x8000u : origin;   // RAM owns $4000-$7FFF
+  const uint32_t pkbase = (uint32_t)pokey_base;
+  const uint32_t pkmask = (uint32_t)pokey_mask;
+  const uint32_t ymon   = (uint32_t)ym_enabled;
+#if BANKSET_STICKY_N
+  uint32_t lowrun = 0;
+#endif
+
+  while (1) {
+    raw  = gpio_get_all();
+    addr = raw & BUS_PIN_MASK;
+#if BANKSET_DIAG_PKFIRST
+    // Aux-chip window handled on the FIRST sample, before the address is
+    // confirmed - which is what the pre-reshape loop did, and that loop was the
+    // one that produced sound. The reshape (which fixed the picture) added the
+    // confirmation, and the music went. This isolates that one difference.
+    if (addr < 0x4000u) {
+      if ((addr & pkmask) == pkbase && ymon) {
+        ym_window_service_blocking(addr);
+      } else if ((addr & pkmask) == pkbase && !BANKSET_IS_READ()
+                 && BANKSET_SALLY_OWNS(raw)) {
+        // CAPTURE ONLY ON A WRITE. The listen-only rule this is copied from was
+        // proven on the 16-byte $4000 and 32-byte $0450 windows; a POKEY at
+        // $0800 occupies 2 KB, so an unconditional capture turns any read - or
+        // any transient address that lands in that range - into a bogus
+        // register write that persists until something overwrites it.
+        //
+        // This is the OPPOSITE trade from gating the DATA OUTPUT on R/W, which
+        // patches/PicoA10400_0.15.txt forbids: losing a real write to one bad
+        // sample costs a register update the player repeats next frame, while
+        // accepting a non-write corrupts the chip's state.
+        uint32_t last = gpio_get_all(), cur;
+        for (uint32_t g = 0; g < 64; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS_PIN_MASK) != addr) break;
+          last = cur;
+        }
+        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+      }
+      addr_prev = addr;
+      continue;
+    }
+#endif
+    if (addr != addr_prev) { addr_prev = addr; continue; }   // two matching samples
+#if BANKSET_STICKY_N
+    if (raw & HALT_PIN_MASK) lowrun = 0;
+    else if (lowrun < BANKSET_STICKY_N) lowrun++;
+#define BANKSET_OFF_RW(h)  ((lowrun >= BANKSET_STICKY_N) ? (uint32_t)(h) : 0u)
+// MARIA OWNS THE BUS RIGHT NOW. Deliberately the SAME decision that picks the
+// half, reused to decide whether R/W is worth looking at at all: if we are
+// serving MARIA's bank then we are inside a MARIA fetch, and MARIA never
+// writes - test7800's banksets.go:128 states it as an assertion
+// ("MARIA should not be writing to memory"). So in such a cycle R/W carries no
+// information, and every use of it can only lose a fetch.
+//
+// Measured on "Bankset Test 2x32K RAM Pokey800" (tools/bankset_sim/
+// maria_fetches.py, per zone): EVERY graphics byte of this demo comes from the
+// cartridge RAM window. The text at the top is zones 1 and 3, 32 bytes per
+// scanline from $7000/$7100 in MARIA's bank; the animation below it takes 32
+// bytes from console RAM and only 3-27 from the cartridge. So the text is the
+// part with the most exposure to this loop, and one lost fetch there is one
+// 8-pixel row of one character - a short horizontal dash that comes and goes.
+// That is what hardware reported for 0.39, and it could only appear in 0.39:
+// the two stores that fill MARIA's bank at $7000/$7100 are STA $F000,Y and
+// STA $F100,Y ($801F, $8025), both INDEXED, so before 0.39 all of that text
+// was lost and there was nothing on screen to glitch.
+//
+// The cost is bounded and known: a genuine Sally write is only ignored if it
+// happens after HALT has read low for BANKSET_STICKY_N consecutive accesses,
+// which is exactly the state the hysteresis was measured to mean "MARIA's burst
+// is really running" (the Sally leak is 2-8 accesses long, N=8). Inside the
+// leak BANKSET_MARIA_NOW is false and writes are captured as before.
+#define BANKSET_MARIA_NOW  (lowrun >= BANKSET_STICKY_N)
+#else
+#define BANKSET_OFF_RW(h)  BANKSET_MARIA_OFFSET(raw, (h))
+// No hysteresis: fall back to the raw HALT test, which on a board without the
+// HALT line is a compile-time zero - so this whole gate folds away and the loop
+// is byte for byte 0.39's.
+#define BANKSET_MARIA_NOW  (BANKSET_MARIA_OFFSET(raw, 1u) != 0u)
+#endif
+    if (addr >= 0x4000u) {
+      if (addr < 0x8000u) {
+        // Cartridge RAM window: MARIA's bank on a read while it owns the bus,
+        // SALLY's bank otherwise; a write is always Sally's ("Maria can only
+        // read", bankset.cpp:487).
+        //
+        // The read is held with BANKSET_HOLD_WHILE_READ, not "until the
+        // address changes": an indexed store or an RMW instruction writes at
+        // the address it has just read, with no address change in between,
+        // and the write has to be captured when R/W drops. See the macro.
+        //
+        // R/W is consulted ONLY when Sally owns the bus. In a MARIA fetch it
+        // cannot mean anything (MARIA never writes) and can only cost the
+        // fetch, so that cycle is answered the way 0.38 answered it: drive,
+        // hold until the address moves, capture nothing. This also puts the
+        // byte on the pins sooner, because the entry test is skipped.
+        const uint32_t maria_ = BANKSET_MARIA_NOW;
+        uint32_t wr;
+        if (maria_ || BANKSET_IS_READ()) {
+          sio_hw->gpio_out = (uint32_t)ram_table[BANKSET_OFF_RW(0x4000u)
+                                                 + (addr & 0x3FFFu)] << D0_PIN;
+          SET_DATA_MODE_OUT;
+          BANKSET_HOLD_WHILE_READ(addr, wr, maria_);
+          SET_DATA_MODE_IN;
+        } else {
+          wr = 1u;
+        }
+        if (wr) {
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS_PIN_MASK) != addr) break;
+            last = cur;
+          }
+          ram_table[addr & 0x3FFFu] = (uint8_t)((last >> D0_PIN) & 0xFF);
+        }
+      } else if (addr >= 0xC000u) {
+        // ROM on a read; a WRITE here is Sally filling MARIA's RAM through the
+        // $C000-$FFFF shadow - the whole point of the scheme, since Maria's
+        // bank is invisible to Sally any other way. Same hold rule as the
+        // $4000 window and for the same reason: this cart fills Maria's RAM
+        // with STA $E000,Y / STA $F000,Y ($800E-$8025), indexed stores.
+        // Same MARIA gate too - a fetch from this window is a fetch like any
+        // other, and MARIA reads here on every cart whose graphics live in the
+        // top 16K.
+        const uint32_t maria_ = BANKSET_MARIA_NOW;
+        uint32_t wr;
+        if (maria_ || BANKSET_IS_READ()) {
+          sio_hw->gpio_out = (uint32_t)rom_table[BANKSET_OFF_RW(half)
+                                                 + (addr - origin)] << D0_PIN;
+          SET_DATA_MODE_OUT;
+          BANKSET_HOLD_WHILE_READ(addr, wr, maria_);
+          SET_DATA_MODE_IN;
+        } else {
+          wr = 1u;
+        }
+        if (wr) {
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS_PIN_MASK) != addr) break;
+            last = cur;
+          }
+          ram_table[0x4000u + (addr & 0x3FFFu)] = (uint8_t)((last >> D0_PIN) & 0xFF);
+        }
+      } else if (addr >= lo) {
+        // $8000-$BFFF: plain ROM. A flat board has no bank register here, so a
+        // write means nothing and this is byte for byte the flat loop's path -
+        // no R/W test at all, which is what emulate_normala78() has always done
+        // and what 0.15 warns against "cleaning up".
+        sio_hw->gpio_out = (uint32_t)rom_table[BANKSET_OFF_RW(half)
+                                               + (addr - origin)] << D0_PIN;
+        SET_DATA_MODE_OUT;
+        while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+        SET_DATA_MODE_IN;
+      }
+    } else {
+      if ((addr & pkmask) == pkbase && ymon) {
+        ym_window_service_blocking(addr);
+      } else if ((addr & pkmask) == pkbase && !BANKSET_IS_READ()
+                 && BANKSET_SALLY_OWNS(raw)) {
+        // CAPTURE ONLY ON A WRITE. The listen-only rule this is copied from was
+        // proven on the 16-byte $4000 and 32-byte $0450 windows; a POKEY at
+        // $0800 occupies 2 KB, so an unconditional capture turns any read - or
+        // any transient address that lands in that range - into a bogus
+        // register write that persists until something overwrites it.
+        //
+        // This is the OPPOSITE trade from gating the DATA OUTPUT on R/W, which
+        // patches/PicoA10400_0.15.txt forbids: losing a real write to one bad
+        // sample costs a register update the player repeats next frame, while
+        // accepting a non-write corrupts the chip's state.
+        uint32_t last = gpio_get_all(), cur;
+        for (uint32_t g = 0; g < 64; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS_PIN_MASK) != addr) break;
+          last = cur;
+        }
+        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+      }
+    }
+  }
+}
+
+// SuperGame Bankset: each half is a bank-switched 128K (or 64K) image.
+// MAME a78_bankset_sg_device (bankset.cpp:29-88).
+//
+//   $4000-$7FFF  second-to-last bank of the half   (bank 6 of 8)
+//   $8000-$BFFF  the selected bank; a write here latches it
+//   $C000-$FFFF  last bank of the half             (bank 7 of 8)
+//   + romLen/2 to every index while Maria owns the bus.
+//
+// Shape is emulate_supercart_ef()'s, which is the loop these three windows
+// already come from - only the bank-6/bank-7 bases stop being hardcoded to a
+// 128K image, because a Bankset half can be 64K (Pit Fighter's Alt 1 header).
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_bankset_sg()) {
+  __asm volatile ("cpsid i" ::: "memory");
+  uint32_t raw, addr, bank = 0;
+  uint8_t rom_in_use = 0;
+  BANKSET_RUN_DECL;
+  const uint32_t half      = (uint32_t)romLen >> 1;
+  BANKSET_BANK_MASK_DECL(bank_mask, romLen);
+  const uint32_t last_bank = bank_mask * 0x4000u;                 // $C000-$FFFF
+  const uint32_t fix_bank  = (bank_mask ? bank_mask - 1u : 0u) * 0x4000u;  // $4000-$7FFF
+  const uint32_t pkbase = (uint32_t)pokey_base;
+  const uint32_t pkmask = (uint32_t)pokey_mask;
+  const uint32_t ymon   = (uint32_t)ym_enabled;
+
+  while (1) {
+    raw  = gpio_get_all();
+    addr = raw & BUS_PIN_MASK;
+    BANKSET_RUN_STEP(raw, addr);
+    if (addr >= 0x4000u) {
+      const uint32_t maria = BANKSET_MO(raw, lowrun, half);
+      if (addr >= 0xC000u) {
+        sio_hw->gpio_out = (uint32_t)rom_table[maria + last_bank + (addr & 0x3FFFu)] << D0_PIN;
+        if (raw & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+      } else if (addr >= 0x8000u) {
+        sio_hw->gpio_out = (uint32_t)rom_table[maria + bank + (addr & 0x3FFFu)] << D0_PIN;
+        if (raw & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else {
+          // Bankswitching write. End-of-cycle capture, bounded at 64 turns -
+          // the reasoning is in emulate_supercart_ram(); a 6502 does not drive
+          // the data lines until the second half of the cycle.
+          if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS_PIN_MASK) != addr) break;
+            last = cur;
+          }
+          bank = (((last >> D0_PIN) & 0x0Fu) & bank_mask) * 0x4000u;
+        }
+      } else {
+        sio_hw->gpio_out = (uint32_t)rom_table[maria + fix_bank + (addr & 0x3FFFu)] << D0_PIN;
+        if (raw & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+      }
+    } else {
+      if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+      if ((addr & pkmask) == pkbase && ymon) {
+        ym_window_service_blocking(addr);
+      } else if ((addr & pkmask) == pkbase && !BANKSET_IS_READ()
+                 && BANKSET_SALLY_OWNS(raw)) {
+        // CAPTURE ONLY ON A WRITE. The listen-only rule this is copied from was
+        // proven on the 16-byte $4000 and 32-byte $0450 windows; a POKEY at
+        // $0800 occupies 2 KB, so an unconditional capture turns any read - or
+        // any transient address that lands in that range - into a bogus
+        // register write that persists until something overwrites it.
+        //
+        // This is the OPPOSITE trade from gating the DATA OUTPUT on R/W, which
+        // patches/PicoA10400_0.15.txt forbids: losing a real write to one bad
+        // sample costs a register update the player repeats next frame, while
+        // accepting a non-write corrupts the chip's state.
+        uint32_t last = gpio_get_all(), cur;
+        for (uint32_t g = 0; g < 64; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS_PIN_MASK) != addr) break;
+          last = cur;
+        }
+        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+      }
+    }
+  }
+}
+
+// SuperGame Bankset with banked RAM - MAME a78_bankset_sg_bankram_device
+// (bankset.cpp:158-290). emulate_bankset_sg() with the $4000-$7FFF window
+// turned into the same two 16K RAM banks emulate_bankset_ram() uses, and the
+// $C000-$FFFF window taking Sally's writes into Maria's RAM.
+// This is the shape Bubble Bobble, Attack of the Petscii Robots and the
+// 2x128K RAM test carts want.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_bankset_sg_ram()) {
+  __asm volatile ("cpsid i" ::: "memory");
+  uint32_t raw, addr, bank = 0;
+  uint8_t rom_in_use = 0;
+  BANKSET_RUN_DECL;
+  const uint32_t half      = (uint32_t)romLen >> 1;
+  BANKSET_BANK_MASK_DECL(bank_mask, romLen);
+  const uint32_t last_bank = bank_mask * 0x4000u;
+  const uint32_t pkbase = (uint32_t)pokey_base;
+  const uint32_t pkmask = (uint32_t)pokey_mask;
+  const uint32_t ymon   = (uint32_t)ym_enabled;
+
+  while (1) {
+    raw  = gpio_get_all();
+    addr = raw & BUS_PIN_MASK;
+    BANKSET_RUN_STEP(raw, addr);
+    if (addr >= 0x4000u) {
+      if (addr < 0x8000u) {
+        // Drive first, R/W for direction only - see emulate_bankset_ram().
+        sio_hw->gpio_out = (uint32_t)ram_table[BANKSET_MO(raw, lowrun, 0x4000u)
+                                               + (addr & 0x3FFFu)] << D0_PIN;
+        if (raw & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else {
+          if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS_PIN_MASK) != addr) break;
+            last = cur;
+          }
+          ram_table[addr & 0x3FFFu] = (uint8_t)((last >> D0_PIN) & 0xFF);
+        }
+      } else if (addr < 0xC000u) {
+        sio_hw->gpio_out = (uint32_t)rom_table[BANKSET_MO(raw, lowrun, half)
+                                               + bank + (addr & 0x3FFFu)] << D0_PIN;
+        if (raw & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else {
+          if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS_PIN_MASK) != addr) break;
+            last = cur;
+          }
+          bank = (((last >> D0_PIN) & 0x0Fu) & bank_mask) * 0x4000u;
+        }
+      } else {
+        // Drive first, R/W for direction only - see emulate_bankset_ram().
+        sio_hw->gpio_out = (uint32_t)rom_table[BANKSET_MO(raw, lowrun, half)
+                                               + last_bank + (addr & 0x3FFFu)] << D0_PIN;
+        if (raw & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else {
+          if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+          uint32_t last = gpio_get_all(), cur;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS_PIN_MASK) != addr) break;
+            last = cur;
+          }
+          ram_table[0x4000u + (addr & 0x3FFFu)] = (uint8_t)((last >> D0_PIN) & 0xFF);
+        }
+      }
+    } else {
+      if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+      if ((addr & pkmask) == pkbase && ymon) {
+        ym_window_service_blocking(addr);
+      } else if ((addr & pkmask) == pkbase && !BANKSET_IS_READ()
+                 && BANKSET_SALLY_OWNS(raw)) {
+        // CAPTURE ONLY ON A WRITE. The listen-only rule this is copied from was
+        // proven on the 16-byte $4000 and 32-byte $0450 windows; a POKEY at
+        // $0800 occupies 2 KB, so an unconditional capture turns any read - or
+        // any transient address that lands in that range - into a bogus
+        // register write that persists until something overwrites it.
+        //
+        // This is the OPPOSITE trade from gating the DATA OUTPUT on R/W, which
+        // patches/PicoA10400_0.15.txt forbids: losing a real write to one bad
+        // sample costs a register update the player repeats next frame, while
+        // accepting a non-write corrupts the chip's state.
+        uint32_t last = gpio_get_all(), cur;
+        for (uint32_t g = 0; g < 64; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS_PIN_MASK) != addr) break;
+          last = cur;
+        }
+        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+      }
+    }
+  }
+}
+
+// Called from setup1() before the cart is started, next to setup_cv().
+static void setup_bankset(void) {
+  // Both 16K RAM banks start cleared. rom_table is deliberately never cleared
+  // between loads, and ram_table is not either - a Bankset cart that reads its
+  // RAM before writing it would otherwise see the previous game's data, which
+  // is not what a real board with a fresh SRAM chip does.
+  for (uint32_t i = 0; i < 0x8000u; i++) ram_table[i] = 0;
+#if BANKSET_HAS_HALT
+  // See the HALT notes at the top of this block: the RP2040 pad default is a
+  // pull-DOWN, which on a board that does not route HALT would read as
+  // "Maria owns the bus" forever.
+  gpio_pull_up(HALT_PIN);
+#endif
+}
+
 void __time_critical_func(setup1()) {   //HandleBUS()
 	
   u_int8_t data, data_prev;
@@ -2362,6 +3421,8 @@ start:
 
   if (cart_to_emulate == CART_TYPE_AR) setup_supercharger();
   if (cart_to_emulate == CART_TYPE_CV) setup_cv();
+  if (cart_to_emulate >= CART_TYPE_BANKSET && cart_to_emulate <= CART_TYPE_BANKSET_SG_RAM)
+    setup_bankset();
 
   reboot_cartridge(addr,addr_prev);
   
@@ -2390,6 +3451,42 @@ start:
       else               emulate_supercart_ef();
         break;
     
+    case CART_TYPE_BANKSET:
+      emulate_bankset_flat();
+    break;
+
+    case CART_TYPE_BANKSET_RAM:
+#if BANKSET_DIAG_NORMALLOOP
+      // CROSS-TEST, not a fix. "Black Lamp Music Demo (800)" - a NON-Bankset
+      // cart with a POKEY at $0800 - plays through emulate_normala78_pokey(),
+      // so that window works in THAT loop. The banked-RAM Bankset cart has
+      // never produced music in ANY shape of emulate_bankset_ram(). This routes
+      // it through the working loop instead, with romLen halved so Sally's half
+      // is mapped flat.
+      //
+      // The picture will be wrong - MARIA gets Sally's half, whose $E000
+      // character generator is all zeroes (measured), and the $4000-$7FFF RAM
+      // window disappears. Judge the SOUND only.
+      //
+      //   music -> the fault is in emulate_bankset_ram(), and the reference
+      //            loop handles this very cart's POKEY traffic fine
+      //   silence -> the fault is not the loop; something about this cart's
+      //            POKEY traffic differs from Black Lamp's
+      romLen = (int)((uint32_t)romLen >> 1);
+      emulate_normala78_pokey();
+#else
+      emulate_bankset_ram();
+#endif
+    break;
+
+    case CART_TYPE_BANKSET_SG:
+      emulate_bankset_sg();
+    break;
+
+    case CART_TYPE_BANKSET_SG_RAM:
+      emulate_bankset_sg_ram();
+    break;
+
     case CART_TYPE_NORMALA78:
       if (POKEY_BUS_ON) emulate_normala78_pokey();
       else               emulate_normala78();
@@ -3642,7 +4739,40 @@ int identify_cartridge(char *filename)
           else if (head_lo & 0x0040)     { pokey_enabled = 1; pokey_base = 0x0450; }
           else if (head_lo & 0x0400)     { pokey_enabled = 1; pokey_base = 0x0440; }
           else if (A78_HEADER[53] & 0x80){ pokey_enabled = 1; pokey_base = 0x0800;
-                                           pokey_mask = 0xF800; }  // $0800-$0FFF
+                                           // 32 BYTES, NOT 2KB. MAME installs
+                                           // its handler over the whole
+                                           // $0800-$0FFF slot decode
+                                           // (a7800.cpp:1511), but JS7800 -
+                                           // the implementation that actually
+                                           // plays these carts - watches only
+                                           // $0800-$081F (Cartridge.js:
+                                           // "address >= 0x0800 && address <
+                                           // 0x0820"), and that is what this
+                                           // firmware needs.
+                                           //
+                                           // The difference matters because our
+                                           // capture is LISTEN-ONLY off a live
+                                           // bus, not a decoded chip select. A
+                                           // 2KB window is 64x more addresses
+                                           // for a floating or stale bus to land
+                                           // in, and every stray hit costs twice:
+                                           // it writes a bogus value into
+                                           // pokey_regs[] AND spends up to 1us in
+                                           // the end-of-cycle capture, during
+                                           // which the loop is not watching for
+                                           // the real write.
+                                           //
+                                           // Measured on "Bankset Test 2x32K RAM
+                                           // Pokey800": thousands of captures per
+                                           // second (_BSAU4096 armed), yet not one
+                                           // carrying a non-zero AUDCx byte
+                                           // (_BSA5 silent) - the signature of a
+                                           // window catching noise instead of
+                                           // writes. Every address this cart
+                                           // really writes ($0800-$080F, $0815,
+                                           // $0818+Y) is inside the 32-byte
+                                           // window, so nothing is lost.
+                                           pokey_mask = 0xFFE0; }  // $0800-$081F
           else                           { pokey_enabled = 0; pokey_base = 0xFFFF; }
           for (int i=0;i<16;i++) pokey_regs[i]=0;
           // SKCTL defaults to "released" (running), not the real chip's power-on
@@ -3712,6 +4842,64 @@ int identify_cartridge(char *filename)
           cart_type = CART_TYPE_ACTIVISION;
         } else if(A78_HEADER[53] == 2) {
           cart_type = CART_TYPE_ABSOLUTE;
+        } else if (A78_HEADER[53] & 0x20) {
+          // ---- Bankset -------------------------------------------------
+          // MAME a78_slot.cpp:409-470 selects the board with
+          // "switch (mapper & 0xe02e)", and every case with bit 13 set is a
+          // Bankset board. The bits inside that mask are: 0x2000 banksets,
+          // 0x4000 halt-banked RAM, 0x8000 POKEY@$800, 0x0002 SuperGame,
+          // and 0x0004/0x0008/0x0020 the other $4000-window options.
+          //
+          // Placed AFTER the Activision/Absolute tests and BEFORE the
+          // "map53 == 0" chain because that chain is gated on byte53 having
+          // no mapper bits left, and bit 5 is exactly such a bit - which is
+          // why all of these files land on CART_TYPE_NORMALA78 today, i.e.
+          // with Maria's half handed to the CPU.
+          const uint16_t bs_mapper = ((uint16_t)A78_HEADER[53] << 8)
+                                   | (uint16_t)A78_HEADER[54];
+          const uint16_t bs_sel    = bs_mapper & 0xE02E;
+          const uint32_t bs_pay    = (uint32_t)image_size;      // header-declared
+          const uint32_t bs_half   = bs_pay >> 1;
+          const bool bs_supergame  = (bs_sel & 0x0002) != 0;
+          const bool bs_bankram    = (A78_HEADER[53] & 0x40) != 0;
+          // Only these seven values are Bankset boards in MAME. 0xA000
+          // (banksets + POKEY@$800, flat, no banked RAM) is deliberately NOT
+          // here: MAME has no case for it either, so such a file keeps
+          // falling through to the flat path exactly as it does today.
+          const bool bs_known = (bs_sel == 0x2000) || (bs_sel == 0x6000)
+                             || (bs_sel == 0xE000) || (bs_sel == 0x2002)
+                             || (bs_sel == 0x6002) || (bs_sel == 0xA002)
+                             || (bs_sel == 0xE002);
+          // "Fits" means every byte the header claims is actually sitting in
+          // rom_table. bytes_read is what the loader managed to store, after
+          // its own truncation to sizeof(rom_table) - so this one test covers
+          // both an oversized image and a header that lies about its length.
+          const bool bs_fits = bs_known && (bs_pay >= 0x2000)
+                            && ((bs_pay & 1) == 0)
+                            && (bs_pay <= (uint32_t)bytes_read);
+
+          if (bs_fits) {
+            if (bs_supergame) cart_type = bs_bankram ? CART_TYPE_BANKSET_SG_RAM
+                                                     : CART_TYPE_BANKSET_SG;
+            else              cart_type = bs_bankram ? CART_TYPE_BANKSET_RAM
+                                                     : CART_TYPE_BANKSET;
+          } else if (bs_known && bs_half <= (uint32_t)bytes_read) {
+            // DEGRADED MODE - the whole 2x image does not fit in rom_table but
+            // SALLY'S HALF DOES, and it is the first thing in the file, so it
+            // is complete. Serve just that half as an ordinary cart of the
+            // same shape: the game boots and runs real code, and only what
+            // Maria fetches is wrong. This is what every 2x128K Bankset title
+            // gets on an RP2040 - 256KB of image cannot coexist with the
+            // ~77KB of other globals in 264KB of SRAM, so it is a hard
+            // hardware limit, not a tuning choice.
+            Serial.println("Bankset image too large - serving Sally's half only");
+            romLen = (int)bs_half;
+            if (bs_supergame) cart_type = bs_bankram ? CART_TYPE_SUPERCART_RAM
+                                                     : CART_TYPE_SUPERCART;
+            else              cart_type = CART_TYPE_NORMALA78;
+          } else {
+            cart_type = CART_TYPE_NORMALA78;
+          }
         } else if(map53 == 0) {
           // Keep the raw low byte: the mask on the next line clears bit 0 and
           // bit 6, and bit 6 (POKEY @$0450) is what selects the _pokey variant
