@@ -90,6 +90,26 @@
   library turned it up. One warning: the 16KB dump of the same album is **partial**. Its
   own menu points at banks that are not in the file, and no firmware can repair that._
 
+- **Six more bankswitching schemes answer the bus at all — 19 more files**
+  _`DF`, `DFSC`, `EFSC`, `0840` and the Wickstead Design board behind **Pursuit of the
+  Pink Panther** were *recognised* by the firmware and then not emulated. The cartridge
+  did not misbehave — it stayed silent and the screen stayed black. They all run now._
+
+  _`DF` had a second problem underneath the first: the firmware looked for the wrong
+  four-character signature, so a `DF` cartridge had never been detected at all. Four
+  files in the library were dead for that reason alone, and nothing reported it._
+
+  _The Pink Panther prototype was the one with teeth. Its board delays every bank switch
+  by four cycles, so the jump instruction that triggers the switch still finishes reading
+  itself out of the **old** bank and only its destination comes from the new one. Get
+  that wrong and the game does not degrade — it falls over within a few frames. The only
+  dump in circulation is also a known bad one, with two of its eight 1KB segments
+  swapped, which the firmware now puts back._
+
+  _Still honestly broken: **BF** and **BFSC** cartridges are 256KB and the ROM buffer is
+  144KB, so they stay marked in red and unusable. There are eight such files and every
+  one of them is a bankswitching test program rather than a game._
+
 - **Bankset cartridges run on the 7800 — 9 more files, StoneAge among them**
   _A Bankset cart holds two complete images in one file: one for the processor, one for
   the video chip, at the very same addresses, and the console's HALT line picks between

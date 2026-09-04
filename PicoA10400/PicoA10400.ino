@@ -3259,6 +3259,34 @@ static void setup_bankset(void) {
 #endif
 }
 
+// PP / WD: the only dump of "Pursuit of the Pink Panther" in circulation is
+// 8195 bytes, and it is a KNOWN BAD DUMP - its 1K segments 2 and 3 are the
+// wrong way round. Stella repairs it in CartridgeWD's constructor rather than
+// carrying a second code path, and so do we; the three trailing bytes are not
+// part of the image and are simply left unread.
+//
+// Not cosmetic, and not assumed: with the segments left as dumped, the same
+// 200000-instruction run that is clean after the swap comes back with illegal
+// opcodes and roughly half the WSYNCs (tools/pp_sim/sweep_pp.py, the second
+// table). Swapped in place a byte at a time, so it needs no scratch buffer.
+//
+// Guarded on the length because a hand-renamed .WD file of any other size is
+// by definition not this dump and must not be rearranged.
+void setup_pp() {
+  // Clear the 64 bytes of cartridge RAM. Stella does the same in
+  // CartridgeEnhanced::reset() (initializeRAM); ram_table is shared with the
+  // SuperChip loops and is never cleared between loads, so without this the
+  // game starts on top of whatever the previous title left there - which is
+  // neither what the emulator does nor anything a board reproduces.
+  for (int i = 0; i < 64; i++) ram_table[i] = 0;
+  if (romLen != 8192 + 3) return;
+  for (int i = 0; i < 1024; i++) {
+    uint8_t t = rom_table[2048 + i];
+    rom_table[2048 + i] = rom_table[3072 + i];
+    rom_table[3072 + i] = t;
+  }
+}
+
 void __time_critical_func(setup1()) {   //HandleBUS()
 	
   u_int8_t data, data_prev;
@@ -3456,6 +3484,7 @@ start:
 
   if (cart_to_emulate == CART_TYPE_AR) setup_supercharger();
   if (cart_to_emulate == CART_TYPE_CV) setup_cv();
+  if (cart_to_emulate == CART_TYPE_PP) setup_pp();
   if (cart_to_emulate >= CART_TYPE_BANKSET && cart_to_emulate <= CART_TYPE_BANKSET_SG_RAM)
     setup_bankset();
 
@@ -3968,40 +3997,291 @@ start:
 		}
 	}
       break;
-     case CART_TYPE_EF: // FxSC (0x1FE0, 0x1FEF, 0); lowbs, highbs,issc
-    lowBS=0x1fe0; highBS=0x1fef; isSC=0;
+    // ------------------------------------------------------------------
+    // The linear-bank family: EF / EFSC, DF / DFSC, BF / BFSC.
+    //
+    // ONE loop, not six. These are the same board with a wider bank
+    // register: a contiguous run of hotspots at the top of the ROM window
+    // selects one of N 4K banks, and the SC variants add the ordinary
+    // 128-byte SuperChip at $1000-$10FF (write low, read high).
+    //
+    //   EF   $1FE0-$1FEF   16 banks    64K   Stella CartEF.cxx
+    //   DF   $1FC0-$1FDF   32 banks   128K   CartDF.cxx
+    //   BF   $1F80-$1FBF   64 banks   256K   CartBF.cxx
+    //
+    // The windows do not overlap, so nothing is lost by sharing the body,
+    // and sharing it is what keeps the cost in SRAM rather than in speed:
+    // this whole switch lives in .data, i.e. it is COPIED INTO SRAM at boot
+    // (setup1() is __time_critical_func), so every duplicated bus loop is
+    // permanently spent RAM on a board that has 29KB of it left over.
+    //
+    // Merging costs nothing on a Cortex-M0+, which is the part that makes
+    // this free rather than a trade: neither $1FE0 nor a 16-bit mask fits an
+    // 8-bit immediate, so even a constant-folded loop had to materialise
+    // them in registers first. Runtime values land in exactly the same
+    // instructions.
+    //
+    // Two shapes chosen for the hot path, both of which apply to EVERY read
+    // this loop serves:
+    //
+    //   * the window test is `(addr - bs_base) < bs_banks`, one SUB and one
+    //     CMP against a small immediate - and the SUB result IS the bank
+    //     index, so the old code's second `addr - lowBS` disappears.
+    //   * isSC is folded into a mask instead of being its own branch. An SC
+    //     cart gets sc_mask = $0F00, so `!(addr & sc_mask)` is true exactly
+    //     in $1000-$10FF (A12 is already known set here). A plain cart gets
+    //     sc_mask = $1000, which in this branch can never be zero, so the
+    //     test is always false and the SuperChip path is unreachable without
+    //     a single instruction spent testing a flag. TST+BNE either way.
+    //
+    // BF/BFSC ARE LISTED BUT CANNOT BE FED A REAL IMAGE ON THIS HARDWARE.
+    // A BF cart is 256KB and rom_table is 144KB; measured from the link map,
+    // an RP2040 build ends .bss at 0x20038B30 of 0x20040000, i.e. 29392
+    // bytes free for heap and stack together, so the missing 112KB does not
+    // exist to be found. identify_cartridge() never even reaches its 256K
+    // branch for such a file - the read is truncated to sizeof(rom_table)
+    // first, so image_size is 147456 by then and the entry is already drawn
+    // red as oversized. The cases are here because they cost two lines in
+    // the parameter switch and nothing in the loop, because renaming a file
+    // to .BF/.BFS reaches them and now yields the first 36 banks instead of
+    // a dead cartridge, and because the day rom_table can hold 256KB they
+    // are already correct.
+    case CART_TYPE_EF:
+    case CART_TYPE_EFSC:
+    case CART_TYPE_DF:
+    case CART_TYPE_DFSC:
+    case CART_TYPE_BF:
+    case CART_TYPE_BFSC: {
+      uint32_t bs_base, bs_banks, sc_mask;
+      switch (cart_to_emulate) {
+        case CART_TYPE_DF:   bs_base = 0x1FC0; bs_banks = 32; sc_mask = 0x1000; break;
+        case CART_TYPE_DFSC: bs_base = 0x1FC0; bs_banks = 32; sc_mask = 0x0F00; break;
+        case CART_TYPE_BF:   bs_base = 0x1F80; bs_banks = 64; sc_mask = 0x1000; break;
+        case CART_TYPE_BFSC: bs_base = 0x1F80; bs_banks = 64; sc_mask = 0x0F00; break;
+        case CART_TYPE_EFSC: bs_base = 0x1FE0; bs_banks = 16; sc_mask = 0x0F00; break;
+        default:             bs_base = 0x1FE0; bs_banks = 16; sc_mask = 0x1000; break;
+      }
+      // Clamp to what was actually loaded. A file truncated by
+      // identify_cartridge() has fewer banks than its scheme implies, and
+      // without this a hotspot for a bank that was never read would point
+      // bankPtr past rom_table - which on this chip is the TinyUSB
+      // descriptors, not spare memory. Ignoring the switch leaves the
+      // previous bank live, which is merely wrong rather than unbounded.
+      {
+        uint32_t have = (uint32_t)romLen / 4096;
+        if (bs_banks > have) bs_banks = have ? have : 1;
+      }
       data=0;data_prev=0;
       bankPtr = &rom_table[0];
       while (1) {
-		  while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
-			addr_prev = addr;
-		  if (addr & 0x1000)   { // A12 high
-			  if ((addr >= lowBS) && (addr <= highBS))	// bank-switch
-				  bankPtr = &rom_table[(addr-lowBS)*4*1024];
-        if (isSC && ((addr & 0x1F00) == 0x1000))
-			    {	// SC RAM access
-				  if (addr & 0x0080)
-				  {	// a read from cartridge ram
-       	    gpio_put_masked(DATA_PIN_MASK,ram_table[addr&0x7F]<<D0_PIN);	
-					  SET_DATA_MODE_OUT;
-					  // wait for address bus to change
-					  while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
-					  SET_DATA_MODE_IN;
-				  } else {	// a write to cartridge ram
-					  // read last data on the bus before the address lines change
-					  while ((gpio_get_all()&BUS_PIN_MASK) == addr) 
-            { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
-					  ram_table[addr&0x7F] = data_prev;
-				  }
-			  } else { 				// normal rom access
-     	  gpio_put_masked(DATA_PIN_MASK,bankPtr[addr&0xFFF]<<D0_PIN);	
-				SET_DATA_MODE_OUT;
-				// wait for address bus to change
-				while ((gpio_get_all()&BUS_PIN_MASK)== addr) ;
-				SET_DATA_MODE_IN;
-	  	}
-     }
-  	}
+        while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+          addr_prev = addr;
+        if (addr & 0x1000)   { // A12 high
+          uint32_t bsel = addr - bs_base;
+          if (bsel < bs_banks)                          // bank-switch
+            bankPtr = &rom_table[bsel << 12];
+          if (!(addr & sc_mask))
+          { // SuperChip window, $1000-$10FF
+            if (addr & 0x0080)
+            { // $1080-$10FF: a read from cartridge ram
+              gpio_put_masked(DATA_PIN_MASK,ram_table[addr&0x7F]<<D0_PIN);
+              SET_DATA_MODE_OUT;
+              // wait for address bus to change
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+              SET_DATA_MODE_IN;
+            } else {  // $1000-$107F: a write to cartridge ram
+              // read last data on the bus before the address lines change
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+              { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
+              ram_table[addr&0x7F] = data_prev;
+            }
+          } else {        // normal rom access
+            gpio_put_masked(DATA_PIN_MASK,bankPtr[addr&0xFFF]<<D0_PIN);
+            SET_DATA_MODE_OUT;
+            // wait for address bus to change
+            while ((gpio_get_all()&BUS_PIN_MASK)== addr) ;
+            SET_DATA_MODE_IN;
+          }
+        }
+      }
+    }
+      break;
+    // ------------------------------------------------------------------
+    // 0840 "EconoBanking". 8K, two banks, and - like UA and 3F - hotspots
+    // BELOW $1000, in the address space the TIA and the RIOT live in.
+    //
+    // DECODE, from Stella Cart0840.cxx checkSwitchBank():
+    //     (addr & $1840) == $0800  ->  bank 0
+    //     (addr & $1840) == $0840  ->  bank 1
+    // i.e. A12 clear, A11 set, and A6 IS the bank number. This branch
+    // already knows A12 is 0, so the test reduces to A11 and the bank comes
+    // straight out of bit 6 - no compare against the second hotspot at all.
+    //
+    // Nothing in ordinary console traffic reaches it: on a 2600 the TIA is
+    // selected with A12=0 and A7=0, RAM and the RIOT with A12=0 and A7=1,
+    // and all of that decodes below $0800. $0800-$0FFF is the unused mirror
+    // region, which is exactly why the board was built to use it. Anything
+    // that could fool this decode would equally fool the real cartridge.
+    //
+    // Three matching address samples, not one, and a re-read before
+    // latching - both for the reason the UA loop gives: in the A12-high path
+    // a half-settled address costs one wasted ROM byte, but here it would
+    // latch the wrong bank, and a wrong bank is a crash.
+    case CART_TYPE_0840: {
+      cartPages = romLen / 4096;
+      {
+      unsigned char *half0 = &rom_table[0];
+      unsigned char *half1 = &rom_table[(cartPages > 1) ? 4096 : 0];
+      bankPtr = half0;
+      addr = 0; addr_prev = 0; addr_prev2 = 0;
+      while (1) {
+        while (((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev) || (addr != addr_prev2))
+        {
+          addr_prev2 = addr_prev;
+          addr_prev = addr;
+        }
+        // got a stable address
+        if (addr & 0x1000) { // A12 high - normal ROM access
+          gpio_put_masked(DATA_PIN_MASK,bankPtr[addr&0xFFF]<<D0_PIN);
+          SET_DATA_MODE_OUT;
+          // wait for address bus to change
+          while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+          SET_DATA_MODE_IN;
+        } else if (addr & 0x0800) {   // A12 low, A11 high - the hotspots
+          // Confirm before latching, as in the UA loop: the 6507 holds an
+          // address for a whole bus cycle, a transition glitch does not.
+          if ((gpio_get_all() & 0x1840) == (addr & 0x1840))
+            bankPtr = (addr & 0x0040) ? half1 : half0;
+        }
+      }
+      }
+    }
+      break;
+    // ------------------------------------------------------------------
+    // PP / WD - the Wickstead Design board, one game: "Pursuit of the Pink
+    // Panther" (prototype). Stella CartWD.cxx. Unlike everything else here
+    // the window is not one bank but FOUR 1K SLOTS, filled from eight 1K
+    // segments by a fixed table, and the board has 64 bytes of RAM.
+    //
+    //   $1000-$103F  RAM read port     (CartEnhanced myReadOffset  = 0)
+    //   $1040-$107F  RAM write port    (myWriteOffset = myRamSize, because
+    //                                   CartWD sets RAM_HIGH_WP - the
+    //                                   OPPOSITE way round from a SuperChip)
+    //   $1080-$1FFF  ROM, four 1K slots; the first 128 bytes of slot 0 are
+    //                covered by the RAM and simply unreachable (myRomOffset)
+    //
+    // Hotspots are reads of $0030-$003F, below $1000 again, and the bank
+    // number is the low four bits taken mod 8.
+    //
+    // THE SWITCH IS DELAYED, AND THE DELAY IS NOT OPTIONAL. Stella only
+    // *initiates* the switch at the hotspot and lands it once more than
+    // three CPU cycles have passed. tools/pp_sim/ settles what that means
+    // here, by running the real ROM: with the switch applied immediately the
+    // run dies on 669 illegal opcodes and 20 WSYNCs, with it delayed by four
+    // bus cycles it executes 200000 instructions with ZERO illegal opcodes
+    // and 6878 WSYNCs. Sweeping the delay from 0 to 8 (sweep_pp.py), FOUR IS
+    // THE ONLY VALUE THAT RUNS.
+    //
+    // And the ROM says why, without reference to any simulator arithmetic
+    // (trace_hotspot.py). The dominant idiom at five of the eight hotspot
+    // sites is:
+    //
+    //     $D677  LDA $3B      3 cycles, the hotspot read is the last of them
+    //     $D679  JMP $3200    3 cycles: opcode, operand lo, operand hi
+    //     ...    the jump TARGET is fetched on the 4th cycle
+    //
+    // $D679 and $3200 are in different slots, so the JMP's own three bytes
+    // must still come from the OLD mapping and only the target fetch from
+    // the new. Switching at once fetches the JMP opcode itself out of the
+    // wrong segment, which is precisely the 669 illegal opcodes above.
+    //
+    // Our loop sees every bus cycle the 6507 runs, so "four bus cycles" and
+    // "four CPU cycles" are the same statement here.
+    case CART_TYPE_PP: {
+      // Stella CartWD.hxx ourBankOrg: which 1K segment sits in each of the
+      // four slots, for each of the eight configurations. Banks 8-15 alias
+      // onto 0-7 (bank % romBankCount()), which the & 7 below does.
+      const uint8_t pp_org[8][4] = {
+        { 0, 0, 1, 3 }, { 0, 1, 2, 3 }, { 4, 5, 6, 7 }, { 7, 4, 2, 3 },
+        { 0, 0, 6, 7 }, { 0, 1, 7, 6 }, { 2, 3, 4, 5 }, { 6, 0, 5, 1 }
+      };
+      // Four live slot pointers, rebuilt only when the bank actually
+      // changes, so the read path is one indexed load and no table walk.
+      unsigned char *pp_slot[4];
+      uint32_t pp_bank = 0, pp_pending = 0, pp_delay = 0;
+      // Address handled on the previous pass. The delay below is counted in
+      // BUS CYCLES, and only an A12-high pass ends in a wait for the address
+      // to change - an A12-low pass re-samples at once and would otherwise
+      // spin the counter down inside a single 838ns cycle.
+      uint32_t pp_last = 0xFFFFFFFF;
+      for (int s = 0; s < 4; s++) pp_slot[s] = &rom_table[pp_org[0][s] << 10];
+      addr = 0; addr_prev = 0; addr_prev2 = 0;
+      data = 0; data_prev = 0;
+      while (1) {
+        while (((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev) || (addr != addr_prev2))
+        {
+          addr_prev2 = addr_prev;
+          addr_prev = addr;
+        }
+        // One tick of the switch delay per BUS CYCLE, which is what a changed
+        // address means here. A pending switch lands BEFORE this cycle is
+        // served, so the access that completes the delay already sees the new
+        // mapping - that is the whole point of the scheme (the JMP that
+        // triggered the switch still reads its own three bytes from the old
+        // bank, and only its target comes from the new one).
+        if (addr != pp_last) {
+          pp_last = addr;
+          if (pp_delay && --pp_delay == 0 && pp_pending != pp_bank) {
+            pp_bank = pp_pending;
+            for (int s = 0; s < 4; s++) pp_slot[s] = &rom_table[pp_org[pp_bank][s] << 10];
+          }
+          if ((addr & 0x1FF0) == 0x0030) { // hotspot read, $0030-$003F
+            // Confirm before arming, as in the UA loop: the 6507 holds an
+            // address for a whole bus cycle, a transition glitch does not.
+            if ((gpio_get_all() & 0x1FF0) == 0x0030) {
+              pp_pending = addr & 7;
+              pp_delay = 4;
+            }
+          }
+        }
+        if (addr & 0x1000) { // A12 high - RAM ports, then ROM
+          if (!(addr & 0x0F80))
+          { // $1000-$107F: the 64 bytes of cartridge RAM, seen twice.
+            // Bit 6 picks the port, and it is the MIRROR IMAGE of a SuperChip:
+            // CartWD sets RAM_HIGH_WP, so the WRITE port is the high half and
+            // the read port the low one.
+            //
+            // This test used to be `(addr & 0x0F80) == 0x0000` for the read
+            // port with a separate `(addr & 0x0FC0) == 0x0040` for the write
+            // port - but 0x0F80 does not contain bit 6, so the first test was
+            // already true across the whole window and the write branch was
+            // unreachable. Every write to cartridge RAM was answered as a
+            // read, i.e. the firmware drove the data lines while the 6507 was
+            // driving them, and nothing was ever stored. On hardware that is
+            // a game whose title screen is fine and whose sprites vanish the
+            // moment it needs a variable.
+            if (addr & 0x0040)
+            { // $1040-$107F: write port
+              // read last data on the bus before the address lines change
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+              { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
+              ram_table[addr&0x3F] = data_prev;
+            } else {
+              // $1000-$103F: read port
+              gpio_put_masked(DATA_PIN_MASK,ram_table[addr&0x3F]<<D0_PIN);
+              SET_DATA_MODE_OUT;
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+              SET_DATA_MODE_IN;
+            }
+          } else {
+            gpio_put_masked(DATA_PIN_MASK,pp_slot[(addr>>10)&3][addr&0x3FF]<<D0_PIN);
+            SET_DATA_MODE_OUT;
+            while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+            SET_DATA_MODE_IN;
+          }
+        }
+      }
+    }
       break;
     case CART_TYPE_UA:
     case CART_TYPE_UASW: {
@@ -4715,7 +4995,16 @@ int isProbablyBFSC(unsigned char *tail)
 int isProbablyDF(unsigned char *tail)
 {
  
-	return !memcmp(tail + 8, "DFBF", 4);
+	// "DFDF", not "DFBF". Stella CartDetector.cxx isProbablyDF(): 'DF carts
+	// store strings "DFDF" and "DFSC" starting at address $FFF8'. The B was a
+	// typo carried from the BF function just above, and it made this test
+	// unsatisfiable - no file can carry a marker no tool ever writes. Measured
+	// over the library: 4 files (2 distinct images, DF_128k_test.bin and
+	// 128kMultikernelFramework.bin) hold "DFDF" at size-8 and were reaching
+	// identify_cartridge()'s 128K branch only to fall out of it with
+	// cart_type still CART_TYPE_NONE. That is why TODO.md position 7 counted
+	// DFSC but no DF at all.
+	return !memcmp(tail + 8, "DFDF", 4);
 }
 
 int isProbablyDFSC(unsigned char *tail)
