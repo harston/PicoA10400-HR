@@ -77,6 +77,19 @@
   of a mirror of their own code. No other flashcart firmware this project draws on loads
   them; only Stella does._
 
+- **Amiga's Power Play Arcade cartridges run — 7 more images**
+  _The **Power Play Arcade Video Game Album** and the Amiga prototypes built on the same
+  board — **3-D Havoc**, **Surf's Up**, **S.A.C. Alert** — were read as ordinary 4K, F8,
+  F6 and F4 carts: the menu listed them, they started, and the bank switching did nothing
+  at all. This board is the only one here that takes its bank number off the **data** bus
+  instead of an address, and it commits the switch on the reset vector itself — which is
+  exactly how a game lands on the entry point of the bank it is jumping into._
+
+  _The complete 32KB dump of the album — all eight games — was not even on the list of
+  things to fix: it had been sitting there as an F4 cart, and only re-measuring the whole
+  library turned it up. One warning: the 16KB dump of the same album is **partial**. Its
+  own menu points at banks that are not in the file, and no firmware can repair that._
+
 - **Bankset cartridges run on the 7800 — 9 more files, StoneAge among them**
   _A Bankset cart holds two complete images in one file: one for the processor, one for
   the video chip, at the very same addresses, and the console's HALT line picks between

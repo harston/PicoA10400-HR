@@ -243,6 +243,11 @@ bool fs_changed;
 #define CART_TYPE_BANKSET_RAM	46	// flat + 2x16K banked RAM at $4000
 #define CART_TYPE_BANKSET_SG	47	// SuperGame, 2x(64K..256K)
 #define CART_TYPE_BANKSET_SG_RAM	48	// SuperGame + 2x16K banked RAM at $4000
+// FC - Amiga's "Power Play Arcade Video Game Album" board. A 2600 type sitting
+// above the 7800 block for the same reason UA does, so it has to be named in
+// the is2600 test in setup1() as well. Unlike every other 2600 mapper here the
+// bank number arrives on the DATA bus, not in the address.
+#define CART_TYPE_FC	49	// 8K/16K/32K, bank latched from the data bus
 
 // CCM_RAM/CCM_SIZE/RAM_BANKS/CCM_BANKS/MAX_RAM_BANK/MAX_CCM_BANK removed
 // (OPTIMIZATION.md 2.6): UnoCart (STM32) relic, unused anywhere in this
@@ -317,6 +322,7 @@ const EXT_TO_CART_TYPE_MAP ext_to_cart_type_map[] = {
 	{"UA", CART_TYPE_UA},
 	{"UAS", CART_TYPE_UASW},
   {"FA2", CART_TYPE_FA2},
+  {"FC", CART_TYPE_FC},
   {"A78", CART_TYPE_A78},
 	{0,0}
 };
@@ -3375,7 +3381,8 @@ start:
   // rely on, since they compare the full 16-bit port against 13-bit addresses.
   const bool is2600 = (cart_to_emulate <= 32)
                       || (cart_to_emulate == CART_TYPE_UA)
-                      || (cart_to_emulate == CART_TYPE_UASW);
+                      || (cart_to_emulate == CART_TYPE_UASW)
+                      || (cart_to_emulate == CART_TYPE_FC);
 
   if (ym_enabled) {
    vreg_set_voltage(VREG_VOLTAGE_1_25);
@@ -4064,6 +4071,85 @@ start:
       }
       }
       break;
+    // FC - Amiga "Power Play Arcade Video Game Album" (Stella CartFC.cxx).
+    // Three hotspots, and the only 2600 mapper here that takes its bank
+    // number off the DATA bus inside the ROM window:
+    //
+    //   write $1FF8   bank bits 0-1        <- data bus
+    //   write $1FF9   bank bits 2 and up   <- data bus
+    //   access $1FFC  commit the latched bank, and serve THAT read from the
+    //                 bank just selected
+    //
+    // The commit-on-$1FFC is what makes the scheme work at all, because $1FFC
+    // is also the RESET vector: `JMP $BFFB` fetches the 4C at $1FFB from the
+    // OLD bank and the two vector bytes at $1FFC/$1FFD from the NEW one, so a
+    // game reaches its own entry point without any RAM stub. Every image in
+    // the library uses that: the album menu's rows, the $1FE0 return stubs in
+    // banks 1 and 2, and the $1008 trampoline (STX $FFF8 / STY $FFF9 /
+    // LDA $FFFC / JMP ($0080)) that 3-D Havoc and album banks 4-7 share.
+    // Order below matches: switch FIRST, then read bankPtr.
+    //
+    // $1FF8/$1FF9 are the one place this firmware deliberately stops driving
+    // the bus inside $1000-$1FFF - it has to, because the value it needs is
+    // the one the 6502 is writing, and the sampling idiom is the same one the
+    // SuperChip write port uses. That costs a read of those two addresses,
+    // which would come back as the floating bus instead of ROM. Verified,
+    // not assumed: across all seven images no instruction reads $1FF8 or
+    // $1FF9 (only STA/STX/STY reach them), no code or vector lives at those
+    // two offsets in any bank, and a full run of each image under
+    // tools/fc_sim/run_fc.py counts zero reads of either.
+    //
+    // A write to $1FFC commits too. The cart has no R/W line, so this is not
+    // a choice; Stella happens to switch on reads only, because its
+    // CartridgeFC::poke() masks the address to 12 bits before comparing it
+    // with $1FFC. The difference is invisible on every path any library image
+    // actually executes - measured in the simulator, image by image - so the
+    // physically forced behaviour costs nothing here.
+    case CART_TYPE_FC: {
+      uint32_t fcBanks    = romLen / 4096;      // 1, 2, 4 or 8
+      uint32_t fcBankMask = fcBanks - 1;
+      uint32_t fcTarget   = 0;                  // Stella's reset(): bank 0
+      data = 0; data_prev = 0;
+      addr = 0; addr_prev = 0;
+      bankPtr = &rom_table[0];
+      while (1) {
+        while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+          addr_prev = addr;
+        // got a stable address
+        if (addr & 0x1000) {              // A12 high
+          if (addr >= 0x1FF8) {           // 8 of 4096 addresses; one compare,
+                                          // one fewer than the F8 loop needs
+            if (addr <= 0x1FF9) {
+              // read the last data on the bus before the address lines change
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+              { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
+              // Bank composition verbatim from Stella CartridgeFC::poke(),
+              // with its modulo written as a mask - the bank count is always
+              // a power of two. The mask is also what keeps a truncated dump
+              // inside its own image: a game that writes $1FF8 alone can ask
+              // for bank 3 of a 2-bank file, and unmasked that would serve
+              // whatever the previous cartridge left in rom_table.
+              if (addr == 0x1FF8)
+                fcTarget = data_prev & 0x03;
+              else if ((uint32_t)(data_prev << 2) < fcBanks)
+                fcTarget = (fcTarget + (data_prev << 2)) & fcBankMask;
+              else                        // same value written to both hotspots
+                fcTarget = data_prev & fcBankMask;
+              continue;
+            }
+            if (addr == 0x1FFC)           // commit, before the byte is served
+              bankPtr = &rom_table[(fcTarget & fcBankMask) * 4096];
+          }
+          // normal rom access
+          gpio_put_masked(DATA_PIN_MASK,bankPtr[addr&0xFFF]<<D0_PIN);
+          SET_DATA_MODE_OUT;
+          // wait for address bus to change
+          while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+          SET_DATA_MODE_IN;
+        }
+      }
+      }
+      break;
     case CART_TYPE_AR:
          emulate_supercharger_cartridge();
       break;
@@ -4623,6 +4709,32 @@ int isProbablyDFSC(unsigned char *tail)
 	return !memcmp(tail + 8, "DFSC", 4);
 }
 
+// FC - Amiga "Power Play Arcade Video Game Album" and the Amiga prototypes
+// built on the same board. Signatures verbatim from Stella CartDetector.cxx
+// isProbablyFC(); each one is the bank-select sequence itself, which is the
+// only thing on an FC cart that no other scheme writes:
+//
+//   STA $1FF8 / LSR / LSR / STA $1FF9   the album menus and 3-D Ghost Attack
+//   STA $FFF8 / STA $FFFC               Surf's Up, S.A.C. Alert (4K)
+//   STY $FFF9 / LDA $FFFC               3-D Havoc
+//
+// Measured over the whole library rather than assumed: exactly seven distinct
+// images match, in four size buckets - 4 x 4K, 3-D Havoc (8K), and the album
+// as both a 16K partial dump and a complete 32K one. No file of any other
+// scheme matches any of the three, so this test cannot steal a working game.
+int isProbablyFC(int size, unsigned char *bytes)
+{
+	unsigned char signature[3][6] = {
+		{ 0x8D, 0xF8, 0x1F, 0x4A, 0x4A, 0x8D },  // STA $1FF8, LSR, LSR, STA ...
+		{ 0x8D, 0xF8, 0xFF, 0x8D, 0xFC, 0xFF },  // STA $FFF8, STA $FFFC
+		{ 0x8C, 0xF9, 0xFF, 0xAD, 0xFC, 0xFF }   // STY $FFF9, LDA $FFFC
+	};
+	for (int i = 0; i < 3; i++)
+		if (searchForBytes(bytes, size, signature[i], 6, 1))
+			return 1;
+	return 0;
+}
+
 int isProbably4KSC(unsigned char *bytes) {
 	for (int i = 0; i < 256; i++)
 		if (bytes[i] != bytes[0]) return 0;
@@ -5062,6 +5174,12 @@ int identify_cartridge(char *filename)
 			cart_type = CART_TYPE_FE;
 		else if (isProbably0840(bytes_read, rom_table))
 			cart_type = CART_TYPE_0840;
+		// Stella runs isProbablyFC() here too, last before the F8 fallback.
+		// One image in the library reaches it: 3-D Havoc, 24 files, which as
+		// F8 boots and then can never leave bank 1 - its $1008 trampoline
+		// touches $1FF9 on every call, and under F8 that IS the bank select.
+		else if (isProbablyFC(bytes_read, rom_table))
+			cart_type = CART_TYPE_FC;
 		else {
 			cart_type = CART_TYPE_F8;
 		}
@@ -5087,6 +5205,9 @@ int identify_cartridge(char *filename)
 			cart_type = CART_TYPE_F6SC;
 		else if (isProbablyE7(bytes_read, rom_table))
 			cart_type = CART_TYPE_E7;
+		// Stella's position for FC in this bucket: after E7, before 3E.
+		else if (isProbablyFC(bytes_read, rom_table))
+			cart_type = CART_TYPE_FC;
 		else if (isProbably3E(bytes_read, rom_table))
 			cart_type = CART_TYPE_3E;
 		else
@@ -5100,6 +5221,11 @@ int identify_cartridge(char *filename)
 			cart_type = CART_TYPE_3E;
 		else if (isProbably3F(bytes_read, rom_table)) 
       cart_type = CART_TYPE_3F;
+		// The COMPLETE album is a 32K, 8-bank image; the 16K file above is a
+		// partial dump of it whose menu can only reach two of its own games.
+		// Three files in the library, all classified F4 until now.
+		else if (isProbablyFC(bytes_read, rom_table))
+			cart_type = CART_TYPE_FC;
 		else
 			cart_type = CART_TYPE_F4;
 	}
