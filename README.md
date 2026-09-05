@@ -90,6 +90,21 @@
   library turned it up. One warning: the 16KB dump of the same album is **partial**. Its
   own menu points at banks that are not in the file, and no firmware can repair that._
 
+- **Star Castle Arcade starts at all — 15 images, 30 files**
+  _The Harmony cartridge these builds were written for can keep a high-score table in its
+  own flash, and the game asks for that table **on the way in**, about two seconds after
+  power-on. It asks by reading one address and waiting for the cartridge to say "not busy
+  any more". Nothing here answered that address, so what went out was the plain ROM byte
+  underneath it — and in every bank of every copy in the library that byte happens to have
+  the "busy" bit set. The game sat on its waiting screen for good; the loop it waits in
+  has no other way out written into it._
+
+  _The cartridge now says "done, nothing transferred", which is what a real Harmony says
+  once a transfer has finished, so the game goes through and plays. The score table starts
+  empty and **is not saved yet** — writing to flash while the other core is driving the
+  cartridge bus is a separate problem, and the same one the 7800 High Score Cart needs.
+  Confirmed on a real console._
+
 - **Six more bankswitching schemes answer the bus at all — 19 more files**
   _`DF`, `DFSC`, `EFSC`, `0840` and the Wickstead Design board behind **Pursuit of the
   Pink Panther** were *recognised* by the firmware and then not emulated. The cartridge

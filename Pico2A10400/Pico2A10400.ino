@@ -3294,6 +3294,55 @@ void setup_pp() {
   }
 }
 
+// FA2 (Harmony RAM+, 28K): $1FF4 is the cartridge's flash-transfer port. A read
+// returns the ROM byte at $FF4 of the current bank with bit 6 forced - SET while
+// a 256-byte load or save is in flight, CLEAR once it has finished. That is
+// literally what Stella returns from CartridgeFA2::ramReadWrite():
+// myImage[myBankOffset + 0xFF4], ORed with 0x40 while busy, ANDed with ~0x40
+// when done.
+//
+// We have no flash store yet, so the honest answer is "ready, and nothing
+// happened". We give it by CLEARING BIT 6 IN THE IMAGE instead of adding a
+// branch to the bus loop: the byte the loop already serves from bankPtr[0xFF4]
+// then IS the ready answer, identical to Stella's, and the loop - which has to
+// respond inside one 6507 cycle - gains not a single instruction.
+//
+// This is not cosmetic. In all 15 Star Castle images in the library byte $FF4 is
+// 0x42 in ALL SEVEN banks: the 'B' of the "BANK0".."BANK6" marker the Harmony
+// tools write under the hotspots. Bit 6 of 0x42 is set, so the cartridge has
+// been answering "busy" forever. The game's wait loop is copied to zero page and
+// run from RAM (hence the odd addresses) and reads
+//
+//     BIT $1FF4 / BVC done / DEY / ... / BNE loop        done: JMP ($FFFE)
+//
+// where DEY only animates the screen - there is no branch out when it reaches
+// zero. The one exit is bit 6 going low, so the game stayed there for good.
+//
+// And it is not merely a lost high-score table: the load sits on the RESET path.
+// Reset enters bank 6 at $1231, and $1259 branches to $127C = JSR $16FC, which
+// stores 1 (= read) in RAM byte 255 and jumps to that wait screen. The title was
+// unreachable from power-on, roughly two seconds in.
+//
+// Safe to do to the image: $1FF5-$1FFB switch banks the moment they are read, so
+// the marker string is unreadable as data on real hardware too, and the only
+// reader of $FF4 is this hotspot. Idempotent, unlike the swap in setup_pp().
+//
+// What this does NOT do: a save still goes nowhere - RAM byte 255 is written by
+// the game and never read back by it (verified across all 7 banks: no load of
+// $11FF through any mirror), so nothing notices, but the score does not persist.
+// That is TODO position 10.
+void setup_fa2() {
+  // Cartridge RAM starts cleared, as in Stella's initializeRAM(). ram_table is
+  // shared with the SuperChip loops and is never cleared between loads; the game
+  // does clear these 256 bytes itself before the load on the reset path, but not
+  // before the two later ones, and "no saved table" has to read as empty rather
+  // than as the previous title's leftovers.
+  for (int i = 0; i < 256; i++) ram_table[i] = 0;
+  // A hand-renamed .FA2 file of any other size is not this board.
+  if (romLen != 28 * 1024) return;
+  for (int b = 0; b < 7; b++) rom_table[b * 4096 + 0xFF4] &= (uint8_t)~0x40;
+}
+
 void __time_critical_func(setup1()) {   //HandleBUS()
 	
   u_int8_t data, data_prev;
@@ -3473,6 +3522,7 @@ start:
   if (cart_to_emulate == CART_TYPE_AR) setup_supercharger();
   if (cart_to_emulate == CART_TYPE_CV) setup_cv();
   if (cart_to_emulate == CART_TYPE_PP) setup_pp();
+  if (cart_to_emulate == CART_TYPE_FA2) setup_fa2();
   if (cart_to_emulate >= CART_TYPE_BANKSET && cart_to_emulate <= CART_TYPE_BANKSET_SG_RAM)
     setup_bankset();
 
