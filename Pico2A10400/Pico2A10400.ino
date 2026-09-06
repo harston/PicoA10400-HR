@@ -248,6 +248,13 @@ bool fs_changed;
 // the is2600 test in setup1() as well. Unlike every other 2600 mapper here the
 // bank number arrives on the DATA bus, not in the address.
 #define CART_TYPE_FC	49	// 8K/16K/32K, bank latched from the data bus
+// JANE - the Tarzan (Coleco) prototype board, Stella CartJANE.cxx. Four 4K
+// banks like F6, but the hotspots are two pairs, $1FF0/$1FF1 and $1FF8/$1FF9,
+// instead of one $1FF6..$1FF9 run. F6 therefore selects banks 2 and 3 by
+// accident and can never reach bank 1, which is why the file boots today and
+// still plays wrong. Another 2600 type numbered above the 7800 block, so it
+// has to be named in the is2600 test in setup1() exactly like UA and FC.
+#define CART_TYPE_JANE	50	// 16K, hotspots $1FF0/$1FF1/$1FF8/$1FF9
 
 // CCM_RAM/CCM_SIZE/RAM_BANKS/CCM_BANKS/MAX_RAM_BANK/MAX_CCM_BANK removed
 // (OPTIMIZATION.md 2.6): UnoCart (STM32) relic, unused anywhere in this
@@ -323,6 +330,11 @@ const EXT_TO_CART_TYPE_MAP ext_to_cart_type_map[] = {
 	{"UAS", CART_TYPE_UASW},
   {"FA2", CART_TYPE_FA2},
   {"FC", CART_TYPE_FC},
+  {"JAN", CART_TYPE_JANE},
+	// .0FA0 is served by the UA loop, not by a case of its own; the reason is in
+	// isProbably0FA0(). Only the first three characters of an extension are
+	// compared, so this entry is "0FA".
+  {"0FA", CART_TYPE_UA},
   {"A78", CART_TYPE_A78},
 	{0,0}
 };
@@ -3459,7 +3471,8 @@ start:
   const bool is2600 = (cart_to_emulate <= 32)
                       || (cart_to_emulate == CART_TYPE_UA)
                       || (cart_to_emulate == CART_TYPE_UASW)
-                      || (cart_to_emulate == CART_TYPE_FC);
+                      || (cart_to_emulate == CART_TYPE_FC)
+                      || (cart_to_emulate == CART_TYPE_JANE);
 
   if (ym_enabled) {
    vreg_set_voltage(VREG_VOLTAGE_1_25);
@@ -4486,6 +4499,115 @@ start:
     case CART_TYPE_DPC:
          emulate_dpc_cartridge();
       break;
+    // JANE - Tarzan prototype (Stella CartJANE.cxx). $1FF0 -> bank 0,
+    // $1FF1 -> 1, $1FF8 -> 2, $1FF9 -> 3. Two of those four are F6 hotspots
+    // that happen to select the same banks, which is why this image boots and
+    // plays under F6 and simply never reaches bank 1 - tools/x8_sim/ measures
+    // it as 105 bank switches and 1133 distinct PCs under F6 against 223 and
+    // 1491 under JANE, with no illegal opcodes either way. Nothing reports
+    // that today; the cart just behaves wrong.
+    case CART_TYPE_JANE:
+      bankPtr = &rom_table[0];
+      while (1) {
+        while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+          addr_prev = addr;
+        if (addr & 0x1000) { // A12 high
+          // One masked test rather than four compares, and it is exact: with
+          // A12 high and bits 11-4 all set, only bits 3 and 0 are still free,
+          // so masking with $1FF6 gives $1FF0 for these four addresses and for
+          // no other address on the bus. The bank number is those two free
+          // bits put back together, bit 3 as the high one.
+          if ((addr & 0x1FF6) == 0x1FF0)
+            bankPtr = &rom_table[(((addr >> 2) & 2) | (addr & 1)) * 4 * 1024];
+          gpio_put_masked(DATA_PIN_MASK,bankPtr[addr&0xFFF]<<D0_PIN);
+          SET_DATA_MODE_OUT;
+          // wait for address bus to change
+          while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+          SET_DATA_MODE_IN;
+        }
+      }
+      break;
+    // 3E - Tigervision 3F with banked RAM bolted on (Stella Cart3E.cxx plus
+    // CartEnhanced.cxx for the geometry). Detected by this firmware since
+    // forever and emulated by it never: there was no case here at all, so
+    // every 3E file in the library fell through to `default: break;` and left
+    // the bus undriven. That is 12 files the menu offers and that die on
+    // selection, plus 10 more of 128K that were not even detected.
+    //
+    //   $1800-$1FFF  fixed, always the LAST 2K of the image (so the RESET
+    //                vector is always reachable, whatever is in the low half)
+    //   $1000-$17FF  switchable, holding EITHER a 2K ROM bank OR a 1K RAM bank
+    //   write $3F    put ROM bank <data> in the low segment
+    //   write $3E    put RAM bank <data> in the low segment
+    //
+    // When a RAM bank is mapped the segment is a split port, the same shape as
+    // a SuperChip but 1K wide and the other way up: $1000-$13FF READS the RAM,
+    // $1400-$17FF WRITES it (Stella's RAM_HIGH_WP). Position 7 was lost for a
+    // week to getting a split port's masks wrong, so: bit 10 of the address is
+    // the port select, and there is no address in $1000-$17FF that is both.
+    //
+    // 32 RAM banks of 1K is exactly the 32K of ram_table, which nothing else
+    // uses in a 2600 mode. It is cleared here because ram_table is not cleared
+    // between games and 0.44 showed what stale cartridge RAM does to a game
+    // that assumes it starts empty.
+    //
+    // Both hotspots sit at A12 = 0 and take the bank number off the DATA bus,
+    // so this borrows CART_TYPE_3F's two idioms wholesale: the three-sample
+    // stable-address test (a half-settled address in the A12-low path latches
+    // the wrong bank) and sampling data_prev on the cycle before the address
+    // lines move.
+    case CART_TYPE_3E: {
+      cartPages = romLen / 2048;
+      if (cartPages < 1) cartPages = 1;
+      addr = 0; addr_prev = 0; addr_prev2 = 0;
+      data = 0; data_prev = 0;
+      bankPtr  = &rom_table[0];                       // power-on: ROM bank 0
+      fixedPtr = &rom_table[(cartPages - 1) * 2048];  // $1800-$1FFF, always
+      ram1Ptr  = 0;                                   // no RAM bank mapped yet
+      memset(ram_table, 0, 32 * 1024);
+      while (1) {
+        while (((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev) || (addr != addr_prev2))
+        {
+          addr_prev2 = addr_prev;
+          addr_prev = addr;
+        }
+        // got a stable address
+        if (addr & 0x1000) { // A12 high
+          if (addr & 0x800) {                 // $1800-$1FFF: the fixed 2K
+            gpio_put_masked(DATA_PIN_MASK,fixedPtr[addr&0x7FF]<<D0_PIN);
+            SET_DATA_MODE_OUT;
+            while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+            SET_DATA_MODE_IN;
+          } else if (ram1Ptr) {               // low segment holds a RAM bank
+            if (addr & 0x400) {               // $1400-$17FF: the write port
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+              { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
+              ram1Ptr[addr&0x3FF] = data_prev;
+            } else {                          // $1000-$13FF: the read port
+              gpio_put_masked(DATA_PIN_MASK,ram1Ptr[addr&0x3FF]<<D0_PIN);
+              SET_DATA_MODE_OUT;
+              while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+              SET_DATA_MODE_IN;
+            }
+          } else {                            // low segment holds a ROM bank
+            gpio_put_masked(DATA_PIN_MASK,bankPtr[addr&0x7FF]<<D0_PIN);
+            SET_DATA_MODE_OUT;
+            while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+            SET_DATA_MODE_IN;
+          }
+        } else { // A12 low - read the last data on the bus before it changes
+          while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+          { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
+          if (addr == 0x003F) {               // ROM bank into the low segment
+            bankPtr = &rom_table[(data_prev % cartPages) * 2048];
+            ram1Ptr = 0;
+          } else if (addr == 0x003E) {        // RAM bank into the low segment
+            ram1Ptr = &ram_table[(data_prev & 0x1F) * 1024];
+          }
+        }
+      }
+      }
+      break;
     case CART_TYPE_3F:  
   	  cartPages = romLen/2048;
 	    addr=0; addr_prev = 0; addr_prev2 = 0;
@@ -4912,12 +5034,75 @@ int usesF8Hotspots(int size, unsigned char *bytes)
 	return 0;
 }
 
-int isProbably3E(int size, unsigned char *bytes)
-{	// 3E cart bankswitching is triggered by storing the bank number
-	// in address 3E using 'STA $3E', commonly followed by an
-	// immediate mode LDA
-	unsigned char  signature[] = { 0x85, 0x3E, 0xA9, 0x00 };  // STA $3E; LDA #$00
+// 0FA0 - the Brazilian (Fotomania / JVP) 8K board. Signatures verbatim from
+// Stella CartDetector.cxx isProbably0FA0(). Its hotspots are $FA0 (bank 0) and
+// $FC0 (bank 1) - BELOW $1000, which is what puts this board in UA's family
+// rather than F8's, and why an F8 loop serves these files without ever
+// switching a bank (measured: 0 switches in 300k instructions, for both).
+//
+// There is no case CART_TYPE_0FA0 and there does not need to be. The UA loop
+// already decodes both addresses correctly, because $FA0 & $0260 == $0220 and
+// $FC0 & $0260 == $0240 - the two values it tests. What it does NOT do is
+// decode them EXACTLY: a real 0FA0 board compares A10 and A7 as well
+// (Cart0FA0.cxx: (addr & $16E0) == $06A0 / $06C0) and the UA loop does not, so
+// it would switch on 768 of the 8192 bus addresses where the board would sit
+// still. That difference is real, and it was measured rather than argued away.
+// tools/x8_sim/run_x8.py enumerates all 768, then runs each image for 300k
+// instructions and intersects the addresses it actually puts on the bus with
+// that set: 0 of 2272 distinct addresses for H.E.R.O., 0 of 2724 for
+// Ms. Pac-Man. Re-run it before adding a third 0FA0 image.
+int isProbably0FA0(int size, unsigned char *bytes)
+{
+	unsigned char signature[4][3] = {
+		{ 0x2C, 0xC0, 0x0F },  // BIT $FC0   (H.E.R.O., Kung-Fu Master)
+		{ 0x8D, 0xC0, 0x0F },  // STA $FC0   (Pole Position, Subterranea)
+		{ 0xAD, 0xC0, 0x0F },  // LDA $FC0   (Front Line, Zaxxon)
+		{ 0x2C, 0xC0, 0xEF }   // BIT $EFC0  (Motocross)
+	};
+	for (int i = 0; i < 4; i++)
+		if (searchForBytes(bytes, size, signature[i], 3, 1))
+			return 1;
+	return 0;
+}
+
+// JANE - Tarzan, Coleco prototype. Stella CartDetector.cxx isProbablyJANE():
+// LDA $FFF1 followed by RTS, which is the bank-1 selector itself. (Stella's
+// comment there says "LDA $0CB8"; it is a copy-paste from isProbablyGL just
+// below it - the bytes are LDA $FFF1.)
+//
+// The library holds two Tarzan images and only one matches. The other is the
+// same game rebuilt for an F6 board: its $FFF0/$FFF1 accesses were rewritten
+// to $FFF6/$FFF7 and the banks permuted to suit. Counted rather than assumed -
+// LDA $FFF0 / LDA $FFF1 occur 1 and 2 times in the JANE image and 0 and 0 in
+// the F6 conversion, LDA $FFF6 / LDA $FFF7 the other way round - so this test
+// cannot pull the working conversion out of the F6 case it belongs in.
+int isProbablyJANE(int size, unsigned char *bytes)
+{
+	unsigned char signature[] = { 0xAD, 0xF1, 0xFF, 0x60 };  // LDA $FFF1; RTS
 	return searchForBytes(bytes, size, signature, 4, 1);
+}
+
+// 3E - two rules ORed, because each is the ONLY thing that catches part of the
+// library and dropping either one loses a working image. Measured over every
+// file in all five size buckets: together they match 12 distinct images and
+// nothing else, so widening this test cannot take a file away from another
+// case.
+//
+//   (a) STA $3E; LDA #$00 - the rule this firmware has always used, an older
+//       Stella heuristic. Sole match for castlevania_scroll_proto.bin, which
+//       carries only ONE 'STA $3F' in the whole image and so fails (b).
+//   (b) STA $3E at least once and STA $3F at least twice - what Stella's
+//       CartDetector.cxx isProbably3E() checks today. Sole match for
+//       "Notbd128k07jan2005b" (NTSC and PAL) and the Archive-10 demo
+//       templates, all 128K.
+int isProbably3E(int size, unsigned char *bytes)
+{
+	unsigned char  signature[] = { 0x85, 0x3E, 0xA9, 0x00 };  // STA $3E; LDA #$00
+	unsigned char  sig3e[] = { 0x85, 0x3E };                  // STA $3E
+	unsigned char  sig3f[] = { 0x85, 0x3F };                  // STA $3F
+	return searchForBytes(bytes, size, signature, 4, 1)
+	    || (searchForBytes(bytes, size, sig3e, 2, 1)
+	        && searchForBytes(bytes, size, sig3f, 2, 2));
 }
 
 int isProbably3EPlus(int size, unsigned char *bytes)
@@ -5509,6 +5694,10 @@ int identify_cartridge(char *filename)
 		else if (isProbablyUA(bytes_read, rom_table)
 		         && !usesF8Hotspots(bytes_read, rom_table))
 			cart_type = CART_TYPE_UA;
+		// Stella runs isProbably0FA0() exactly here: after UA, before FE. Routed
+		// to the UA loop, which decodes $FA0/$FC0 as well - see isProbably0FA0().
+		else if (isProbably0FA0(bytes_read, rom_table))
+			cart_type = CART_TYPE_UA;
     else if (isProbablyFE(bytes_read, rom_table) && !f8)
 			cart_type = CART_TYPE_FE;
 		else if (isProbably0840(bytes_read, rom_table))
@@ -5549,6 +5738,9 @@ int identify_cartridge(char *filename)
 			cart_type = CART_TYPE_FC;
 		else if (isProbably3E(bytes_read, rom_table))
 			cart_type = CART_TYPE_3E;
+		// Stella's position for JANE: last test before the F6 fallback.
+		else if (isProbablyJANE(bytes_read, rom_table))
+			cart_type = CART_TYPE_JANE;
 		else
 			cart_type = CART_TYPE_F6;
 	}
@@ -5585,7 +5777,16 @@ int identify_cartridge(char *filename)
 			cart_type = CART_TYPE_F0;
 	}
 	else if (image_size == 128 * 1024) {
-		if (isProbablyDF(tail))
+		// 3E first, which is Stella's order - and safe here rather than merely
+		// faithful. Of the 16 distinct 128K images in the library the three
+		// carrying a DF or DFSC tail marker carry no 3E signature, and the six
+		// carrying a 3E signature carry no tail marker. The two sets are
+		// disjoint, so this cannot take a file away from the DF/DFSC cases that
+		// 0.43 brought to life. Five of the six are real 3E images that today
+		// are not detected at all and so are not even listed as playable.
+		if (isProbably3E(bytes_read, rom_table))
+			cart_type = CART_TYPE_3E;
+		else if (isProbablyDF(tail))
 			cart_type = CART_TYPE_DF;
 		else if (isProbablyDFSC(tail))
 			cart_type = CART_TYPE_DFSC;

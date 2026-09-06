@@ -125,6 +125,33 @@
   144KB, so they stay marked in red and unusable. There are eight such files and every
   one of them is a bankswitching test program rather than a game._
 
+- **Boulder Dash and the other 3E carts run — 22 files that were dead on selection**
+  _The `3E` board is Tigervision's, with a bank of RAM added: half the cartridge window
+  is switchable and can hold either program or memory, and the games built on it —
+  **Boulder Dash** in all its forms, **Not Boulder Dash**, a **Castlevania** scrolling
+  prototype — use that RAM for the playfield they scroll. The firmware had been
+  *recognising* these carts since the day it was written and had never had a line of code
+  to actually serve one, so the menu listed them, offered them, and the screen stayed
+  black on every single one. They run now._
+
+  _Five more of them, all 128KB, were not even recognised: that size was only ever
+  checked for two other board types. And the test that spots a `3E` cart was too narrow
+  in one direction and too wide in the other, so it is now both rules at once — the old
+  one still catches the Castlevania prototype, the new one catches the three 128KB
+  builds, and neither alone catches all of them._
+
+- **H.E.R.O. and Ms. Pac-Man from JVP run — and Tarzan gets its missing quarter**
+  _The Brazilian **JVP** conversions of **H.E.R.O.** and **Ms. Pac-Man** were read as
+  ordinary F8 carts and never switched a bank once — the whole game ran out of the first
+  half of the ROM. Their board picks a bank through an address below the cartridge
+  window, the same trick as the UA carts above, so it now rides that same code._
+
+  _The **Tarzan** prototype is a subtler case. Its four banks are selected by four
+  addresses, and two of the four happen to be the ones an F6 cart uses, for the same two
+  banks — so the game booted, looked nearly right, and one of its four banks was simply
+  unreachable. Nothing reported that; it just behaved wrong. Note the library also holds
+  a version of Tarzan rebuilt for a real F6 board, and that one is left alone._
+
 - **Bankset cartridges run on the 7800 — 9 more files, StoneAge among them**
   _A Bankset cart holds two complete images in one file: one for the processor, one for
   the video chip, at the very same addresses, and the console's HALT line picks between
