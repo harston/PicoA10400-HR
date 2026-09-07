@@ -23,6 +23,23 @@
   the filters, the noise generators and two-tone mode. The result is checked against
   MAME's own POKEY clock by clock, not by ear._
 
+- **Both POKEYs, where a cartridge carries two**
+  _Ten files in the library wire up **two** POKEY chips at once — the "Dual POKEY"
+  demos. Only the first was emulated, so nine of them played half their parts and the
+  tenth, which puts its chips at `$0800` and `$0810`, played worse than half: the two
+  were folded into one register file and overwrote each other. Both chips now sound._
+
+  _It costs the other four hundred–odd POKEY cartridges nothing. The two address pairs
+  that actually occur are sixteen bytes apart, so one window serves both chips and the
+  bus loops keep the single address compare they always had — and the second chip is not
+  synthesised at all until a cartridge actually writes to it. Checked against a second
+  emulator as well as MAME: all eight channels agree to within 1 Hz._
+
+  _Hunting the last of it turned up an older fault underneath, one that had been in the
+  `$0450` window since it was written: an address could be read while it was still
+  settling and a byte would land in the wrong register. That is fixed too, which also
+  cleans up a buzz on cartridges that carry a POKEY beside on-cart RAM._
+
 - **FM sound — the YM2151 is emulated**
   _The FM chip from Atari's XM expansion module is carried on the board by a few 7800
   titles — **1942**, **Wonder Boy**, **Pac-Man Collection 40th Anniversary**,
@@ -244,8 +261,7 @@ where one exists. Some 2600 schemes stay out of range for a harder reason — **
 and **CDFJ** cartridges carry their own ARM program and expect a processor in the
 cartridge to run it, which is what a Harmony has and this board does not._
 
-_One POKEY is emulated, so the handful of demos wiring up two get roughly half their
-parts. The audio line exists only on **PicoA10400** — the Pico 2 board uses the
+_The audio line exists only on **PicoA10400** — the Pico 2 board uses the
 standard Raspberry Pi Pico footprint, where the cartridge bus consumes every
 available pin, so **Pico2A10400 stays silent** whether the cartridge asks for a POKEY
 or a YM2151. DPC music is the exception and plays on both boards, for the reason

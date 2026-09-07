@@ -1431,6 +1431,10 @@ void __time_critical_func(emulate_normala78_pokey()) {
   const uint32_t lo = (base_rom < 0x4000) ? 0x4000 : base_rom;
   const uint32_t pkbase = (uint32_t)pokey_base;   // volatile: hoist out of the loop
   const uint32_t pkmask = (uint32_t)pokey_mask;
+  // 0x0F for one chip, 0x1F when two share the window - see pokey.h. Hoisted for
+  // the same reason pkbase/pkmask are: it is volatile, and re-reading a volatile
+  // inside the loop is what made carts with no POKEY at all start glitching.
+  const uint32_t pkregm = (uint32_t)pokey_reg_mask;
   const uint32_t ymon   = (uint32_t)ym_enabled;  // ditto - never read in the loop
 
 #if POKEY_DIAG_E6
@@ -1482,7 +1486,7 @@ void __time_critical_func(emulate_normala78_pokey()) {
           if ((cur & BUS_PIN_MASK) != addr) break;
           last = cur;
         }
-        uint32_t pkreg = addr & 0x0F;
+        uint32_t pkreg = addr & pkregm;
         pokey_capture_write(pkreg, (uint8_t)((last >> D0_PIN) & 0xFF));
       }
     }
@@ -1539,7 +1543,7 @@ void __time_critical_func(emulate_normala78_pokey()) {
           if ((cur & BUS_PIN_MASK) != addr) break;
           last = cur;
         }
-        uint32_t pkreg = addr & 0x0F;
+        uint32_t pkreg = addr & pkregm;
         pokey_capture_write(pkreg, (uint8_t)((last >> D0_PIN) & 0xFF));   // strobe, see pokey.h
       }
     }
@@ -1900,6 +1904,18 @@ void __time_critical_func(emulate_supercart_ram_pokey()) {
             }
         } else {
             rawaddr=gpio_get_all();
+#if POKEY_DIAG_E12
+            // E12 DIAGNOSTIC (pokey.h): confirm the address with a second
+            // matching sample before decoding anything below $8000. This loop
+            // has always taken it from one sample; emulate_normala78_pokey()
+            // has required two since 0.16. A mis-sampled address serves the
+            // WRONG ram_table byte, and on "LZSS Player" that byte IS a POKEY
+            // register. Non-blocking - a mismatch re-enters the loop.
+            {
+                uint32_t r2 = gpio_get_all();
+                if ((r2 & BUS_PIN_MASK) != (rawaddr & BUS_PIN_MASK)) continue;
+            }
+#endif
             // EXram - 16k is in 0x4000
             if (rawaddr & 0x4000) {
                 addr= rawaddr & 0x3fff;
@@ -2555,6 +2571,7 @@ static uint32_t bankset_pk_seen = 0;
       pokey_regs[0x01] = 0xA8;    /* AUDC1: pure tone, volume 8 */             \
       pokey_regs[0x08] = 0x00;    /* AUDCTL */                                 \
       pokey_regs[0x0F] = 0x03;    /* SKCTL released */                         \
+      pokey_live[0] = 1;                                                      \
     } else if (n_ < (uint32_t)BANKSET_DIAG_TONE) {                             \
       pokey_capture_write((reg), (val));                                       \
     }                                                                          \
@@ -2590,6 +2607,7 @@ static uint32_t bankset_pk_armed = 0;
       pokey_regs[0x01] = 0xA8;    /* AUDC1: pure tone, volume 8 */             \
       pokey_regs[0x08] = 0x00;    /* AUDCTL */                                 \
       pokey_regs[0x0F] = 0x03;    /* SKCTL released */                         \
+      pokey_live[0] = 1;                                                      \
       bankset_pk_armed = 1;                                                    \
     } else if (!bankset_pk_armed) {                                            \
       pokey_capture_write(r_, (uint8_t)v_);                                    \
@@ -2625,6 +2643,7 @@ static uint32_t bankset_pk_armed3 = 0;
       pokey_regs[0x01] = 0xA8;    /* AUDC1: pure tone, volume 8 */             \
       pokey_regs[0x08] = 0x00;                                                 \
       pokey_regs[0x0F] = 0x03;                                                 \
+      pokey_live[0] = 1;                                                      \
       bankset_pk_armed3 = 1;                                                   \
     } else if (!bankset_pk_armed3) {                                           \
       pokey_capture_write(r_, (uint8_t)v_);                                    \
@@ -2660,6 +2679,7 @@ static uint32_t bankset_pk_armed4 = 0;
       pokey_regs[0x01] = 0xA8;                                                 \
       pokey_regs[0x08] = 0x00;                                                 \
       pokey_regs[0x0F] = 0x03;                                                 \
+      pokey_live[0] = 1;                                                      \
       bankset_pk_armed4 = 1;                                                   \
     } else if (!bankset_pk_armed4) {                                           \
       pokey_capture_write(r_, (uint8_t)v_);                                    \
@@ -2697,6 +2717,7 @@ static uint32_t bankset_pk_nz = 0;
       pokey_regs[0x01] = 0xA8;                                                 \
       pokey_regs[0x08] = 0x00;                                                 \
       pokey_regs[0x0F] = 0x03;                                                 \
+      pokey_live[0] = 1;                                                      \
       bankset_pk_nz++;                                                         \
     } else if (bankset_pk_nz < (uint32_t)BANKSET_DIAG_TONE5) {                 \
       pokey_capture_write(r_, (uint8_t)v_);                                    \
@@ -2777,6 +2798,10 @@ void __time_critical_func(emulate_bankset_flat()) {
                     : ((origin < 0x4000u) ? 0x4000u : origin);
   const uint32_t pkbase = (uint32_t)pokey_base;   // volatile: hoist out of the loop
   const uint32_t pkmask = (uint32_t)pokey_mask;
+  // 0x0F for one chip, 0x1F when two share the window - see pokey.h. Hoisted for
+  // the same reason pkbase/pkmask are: it is volatile, and re-reading a volatile
+  // inside the loop is what made carts with no POKEY at all start glitching.
+  const uint32_t pkregm = (uint32_t)pokey_reg_mask;
   const uint32_t ymon   = (uint32_t)ym_enabled;
   // A POKEY at $4000 on a 48K/52K half sits INSIDE the ROM window, so it has to
   // be write-only there: reads must still return ROM (JS7800 calls this exact
@@ -2824,7 +2849,7 @@ void __time_critical_func(emulate_bankset_flat()) {
             if ((cur & BUS_PIN_MASK) != addr) break;
             last = cur;
           }
-          BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+          BANKSET_CAPTURE(addr & pkregm, (uint8_t)((last >> D0_PIN) & 0xFF));
         }
 #if BANKSET_TRACK_HALT
       } else {
@@ -2857,7 +2882,7 @@ void __time_critical_func(emulate_bankset_flat()) {
         if ((cur & BUS_PIN_MASK) != addr) break;
         last = cur;
       }
-      BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+      BANKSET_CAPTURE(addr & pkregm, (uint8_t)((last >> D0_PIN) & 0xFF));
     }
   }
 }
@@ -2889,6 +2914,10 @@ void __time_critical_func(emulate_bankset_ram()) {
   const uint32_t lo     = (origin < 0x8000u) ? 0x8000u : origin;   // RAM owns $4000-$7FFF
   const uint32_t pkbase = (uint32_t)pokey_base;
   const uint32_t pkmask = (uint32_t)pokey_mask;
+  // 0x0F for one chip, 0x1F when two share the window - see pokey.h. Hoisted for
+  // the same reason pkbase/pkmask are: it is volatile, and re-reading a volatile
+  // inside the loop is what made carts with no POKEY at all start glitching.
+  const uint32_t pkregm = (uint32_t)pokey_reg_mask;
   const uint32_t ymon   = (uint32_t)ym_enabled;
 #if BANKSET_STICKY_N
   uint32_t lowrun = 0;
@@ -2923,7 +2952,7 @@ void __time_critical_func(emulate_bankset_ram()) {
           if ((cur & BUS_PIN_MASK) != addr) break;
           last = cur;
         }
-        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+        BANKSET_CAPTURE(addr & pkregm, (uint8_t)((last >> D0_PIN) & 0xFF));
       }
       addr_prev = addr;
       continue;
@@ -3063,7 +3092,7 @@ void __time_critical_func(emulate_bankset_ram()) {
           if ((cur & BUS_PIN_MASK) != addr) break;
           last = cur;
         }
-        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+        BANKSET_CAPTURE(addr & pkregm, (uint8_t)((last >> D0_PIN) & 0xFF));
       }
     }
   }
@@ -3092,6 +3121,10 @@ void __time_critical_func(emulate_bankset_sg()) {
   const uint32_t fix_bank  = (bank_mask ? bank_mask - 1u : 0u) * 0x4000u;  // $4000-$7FFF
   const uint32_t pkbase = (uint32_t)pokey_base;
   const uint32_t pkmask = (uint32_t)pokey_mask;
+  // 0x0F for one chip, 0x1F when two share the window - see pokey.h. Hoisted for
+  // the same reason pkbase/pkmask are: it is volatile, and re-reading a volatile
+  // inside the loop is what made carts with no POKEY at all start glitching.
+  const uint32_t pkregm = (uint32_t)pokey_reg_mask;
   const uint32_t ymon   = (uint32_t)ym_enabled;
 
   while (1) {
@@ -3150,7 +3183,7 @@ void __time_critical_func(emulate_bankset_sg()) {
           if ((cur & BUS_PIN_MASK) != addr) break;
           last = cur;
         }
-        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+        BANKSET_CAPTURE(addr & pkregm, (uint8_t)((last >> D0_PIN) & 0xFF));
       }
     }
   }
@@ -3173,6 +3206,10 @@ void __time_critical_func(emulate_bankset_sg_ram()) {
   const uint32_t last_bank = bank_mask * 0x4000u;
   const uint32_t pkbase = (uint32_t)pokey_base;
   const uint32_t pkmask = (uint32_t)pokey_mask;
+  // 0x0F for one chip, 0x1F when two share the window - see pokey.h. Hoisted for
+  // the same reason pkbase/pkmask are: it is volatile, and re-reading a volatile
+  // inside the loop is what made carts with no POKEY at all start glitching.
+  const uint32_t pkregm = (uint32_t)pokey_reg_mask;
   const uint32_t ymon   = (uint32_t)ym_enabled;
 
   while (1) {
@@ -3250,7 +3287,7 @@ void __time_critical_func(emulate_bankset_sg_ram()) {
           if ((cur & BUS_PIN_MASK) != addr) break;
           last = cur;
         }
-        BANKSET_CAPTURE(addr & 0x0F, (uint8_t)((last >> D0_PIN) & 0xFF));
+        BANKSET_CAPTURE(addr & pkregm, (uint8_t)((last >> D0_PIN) & 0xFF));
       }
     }
   }
@@ -5393,6 +5430,11 @@ int identify_cartridge(char *filename)
         //   bit0  -> $4000    bit6  -> $0450    bit10 -> $0440    bit15 -> $0800
         {
           uint16_t head_lo = A78_HEADER[54];
+          // The FULL 16-bit field, needed for bit 10 - which lives in byte 53,
+          // not byte 54, and is why the old "head_lo & 0x0400" test below could
+          // never be true. See the dual-POKEY branch for what it is used for and,
+          // just as importantly, what it deliberately is NOT used for.
+          uint16_t head_all = ((uint16_t)A78_HEADER[53] << 8) | (uint16_t)A78_HEADER[54];
 
           // MAME's validate_header() (a78_slot.cpp:150-185) DISABLES POKEY@$4000
           // when the same header also puts RAM / bank 0 / bank 6 / banked RAM at
@@ -5408,14 +5450,53 @@ int identify_cartridge(char *filename)
             head_lo &= (uint16_t)~0x01;
           }
 
-          // Only ONE POKEY is emulated. Carts declaring two (the "Dual POKEY
-          // 440 450" and "800 810" demos) get the first match and therefore half
-          // their music - better than nothing, and they still run.
+          // TWO POKEYs are emulated. The two attested pairs, $0440+$0450 and
+          // $0800+$0810, are both SIXTEEN BYTES APART, so a dual cart is served
+          // by ONE 32-byte window with address bit 4 choosing the chip - the hot
+          // loops keep the single "(addr & pkmask) == pkbase" they always had,
+          // and only pokey_reg_mask widens from 0x0F to 0x1F. See pokey.h.
           pokey_mask = 0xFFF0;                      // 16-byte window by default
+          pokey_reg_mask = 0x0F;                    // ...and one chip in it
           if      (head_lo & 0x0001)     { pokey_enabled = 1; pokey_base = 0x4000; }
+          // DUAL, and deliberately ONLY as a pair. Bit 10 ($0440) is required to
+          // arrive TOGETHER WITH bit 6 ($0450); a lone bit 10 stays ignored, the
+          // way it has been ignored ever since the old test read the wrong byte.
+          //
+          // That is not timidity, it is the §0x05 case from TODO.md: three files
+          // ("Impossible Mission [!]/[a1]/[f1]", byte53=0x05, byte54=0x02) have
+          // bit 10 set as debris in an otherwise broken header and no POKEY on
+          // the board at all. Honouring a lone bit 10 would hand all three an
+          // aux-chip window in their hot loop for nothing. MAME ignores bit 10
+          // outright (a78_slot.cpp masks with 0xe02e and never looks at it) and
+          // JS7800 only prints it, so nothing is lost by requiring the pair -
+          // and all 9 dual files in the library set both bits.
+          else if ((head_all & 0x0440) == 0x0440) {
+            pokey_enabled  = 1;
+            pokey_base     = 0x0440;                // $0440-$045F, both chips
+            pokey_mask     = 0xFFE0;
+            pokey_reg_mask = 0x1F;                  // bit 4 = which chip
+            Serial.println("Dual POKEY $0440 + $0450");
+          }
           else if (head_lo & 0x0040)     { pokey_enabled = 1; pokey_base = 0x0450; }
-          else if (head_lo & 0x0400)     { pokey_enabled = 1; pokey_base = 0x0440; }
           else if (A78_HEADER[53] & 0x80){ pokey_enabled = 1; pokey_base = 0x0800;
+                                           // 32 bytes here means TWO CHIPS, not
+                                           // one chip mirrored: "White Lamp Music
+                                           // Demo (Dual POKEY 800 810)" drives
+                                           // $0800-$080F and $0810-$081F as two
+                                           // independent voices, and no header
+                                           // bit exists to declare that pair, so
+                                           // the split has to be unconditional
+                                           // for the $0800 family. Nothing
+                                           // regresses: every other $0800 file in
+                                           // the library writes ONE half only
+                                           // (verified by scanning their 6502
+                                           // stores), so their second chip is
+                                           // never written, never rendered and
+                                           // never counted in the output scale.
+                                           // "POKEY Tester (810)", which uses the
+                                           // upper half alone, therefore plays
+                                           // through chip 1 at full volume
+                                           // instead of through chip 0's mirror.
                                            // 32 BYTES, NOT 2KB. MAME installs
                                            // its handler over the whole
                                            // $0800-$0FFF slot decode
@@ -5449,16 +5530,19 @@ int identify_cartridge(char *filename)
                                            // really writes ($0800-$080F, $0815,
                                            // $0818+Y) is inside the 32-byte
                                            // window, so nothing is lost.
-                                           pokey_mask = 0xFFE0; }  // $0800-$081F
+                                           pokey_mask = 0xFFE0;
+                                           pokey_reg_mask = 0x1F; }  // $0800-$081F
           else                           { pokey_enabled = 0; pokey_base = 0xFFFF; }
         }
-        for (int i=0;i<16;i++) pokey_regs[i]=0;
+        for (int i=0;i<16;i++) { pokey_regs[i]=0; pokey2_regs[i]=0; }
+        pokey_live[0] = 0; pokey_live[1] = 0;
         // SKCTL defaults to "released" (running), not the real chip's power-on
         // 0x00 (held in reset): 53/434 library files declaring POKEY never
         // write SKCTL at all, and a literal power-on-silent chip would leave
         // every one of them mute forever. Every file that DOES write SKCTL
         // still gets its own value the instant it writes it - see pokey.h.
         pokey_regs[0x0F] = 0x03;
+        pokey2_regs[0x0F] = 0x03;
         Serial.print("POKEY base:");Serial.println(pokey_base,HEX);
 
         // YM2151 (OPM) at $0460/$0461 - byte53 bit 3, "ym2151 at $460/$461" in
@@ -5483,6 +5567,10 @@ int identify_cartridge(char *filename)
           pokey_enabled = 1;          // selects the listening emulate_* variant
           pokey_base    = 0x0460;
           pokey_mask    = 0xFFFE;     // exactly two bytes, as MAME's XM decodes
+          pokey_reg_mask = 0x01;      // ...and no chip-select bit; ym_window_
+                                      // service() masks with 1 itself, but a
+                                      // header declaring BOTH a dual POKEY and
+                                      // a YM would otherwise leave 0x1F here
           Serial.println("YM2151 @ $0460");
 #if YM_REPORT_RATE
           // Measure core 0's FM throughput HERE, where writing a file is safe -
@@ -5511,7 +5599,28 @@ int identify_cartridge(char *filename)
         //       gives header 0x0446
         // The Activision/Absolute tests stay on the RAW byte, so headers like
         // 0x05 (Impossible Mission [f1]) keep landing where they land today.
-        uint8_t map53 = A78_HEADER[53] & (uint8_t)~0x0C;
+        // Bit 0 is masked out here for exactly the reason bits 2 and 3 already
+        // are: it is NOT a board selector at the point this gate runs. The
+        // A78_HEADER[53] == 1 (Activision) and == 2 (Absolute) tests above have
+        // already caught every header where bit 0 really does name a board, and
+        // they compare the WHOLE byte - which is the same semantics MAME uses
+        // ((mapper & 0xff00) == 0x0100, a78_slot.cpp:493). After them, a bit 0
+        // that is still set can only be debris.
+        //
+        // Leaving it in the mask sent "Impossible Mission [!]/[a1]/[f1]"
+        // (byte53=0x05 = Activision bit + POKEY@$0440 bit, byte54=0x02 =
+        // SuperGame) down the ELSE branch to CART_TYPE_NORMALA78: a 128KB
+        // bank-switched cart served flat. The reset vector then comes from
+        // offset $BFFC of the image, which is graphics, so the console never
+        // started the game at all - on a PAL 7800 that means the BIOS falls
+        // back to its own built-in Asteroids. Measured over 2363 valid headers
+        // this token moves exactly those 3 files and nothing else, and takes
+        // the disagreement with MAME's board choice from 3 to 0.
+        //
+        // The map53 == 0 gate itself STAYS. It is what protects bits 4 (Souper)
+        // and 6 (halt-banked RAM without banksets), for which MAME has no case
+        // either and also leaves the cart flat.
+        uint8_t map53 = A78_HEADER[53] & (uint8_t)~0x0D;
         if(A78_HEADER[53] == 1) {
           cart_type = CART_TYPE_ACTIVISION;
         } else if(A78_HEADER[53] == 2) {

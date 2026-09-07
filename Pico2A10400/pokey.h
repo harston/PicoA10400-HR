@@ -94,6 +94,129 @@
 #define POKEY_DIAG_E8 0
 #endif
 
+// E9 / E10 - the 0.47 dual-POKEY follow-up. Hardware reported NOISE ON TOP OF
+// THE MUSIC on exactly two of the nine dual carts, "LZSS Player" and "Portal",
+// and those two are not an arbitrary pair: they are the ONLY two whose header
+// byte54 is 0x46 rather than 0x40, i.e. the only two that declare SuperGame
+// plus RAM at $4000. That routes them to emulate_supercart_ram_pokey() while
+// the other seven run emulate_normala78_pokey(), and those two loops capture a
+// POKEY write in genuinely different ways:
+//
+//   flat loop            no R/W gating, but a bounded 64-turn end-of-cycle scan
+//                        that keeps the LAST byte seen while the address was
+//                        still valid - i.e. after the 6502 has driven the data.
+//   SuperGame/RAM loop   pokey_window_service(): R/W gated, drives the bus on a
+//                        read, and takes the data byte from ONE early sample,
+//                        relying on the loop re-entering to converge.
+//
+// The .ino documents this exact hazard twice on that very loop ("Krok 19", the
+// bank register and the on-cart RAM window both got an end-of-cycle scan for
+// it: "the byte is sometimes good and sometimes garbage"). The POKEY window on
+// that loop never did. Before 0.47 that only fed the chip at $0450; now it also
+// feeds $0440, so there is twice as much of it and it is audible on both.
+//
+// These two switches separate the two candidate explanations. They are
+// diagnostics, not fixes: pokey.h's own note above records that a bounded wait
+// dropped into these loops once cost MARIA its data (XMAS/Arkanoid glitches),
+// which is precisely why E9 has to be MEASURED on a console rather than
+// adopted.
+//
+//   E9   pokey_window_service() captures with the same bounded end-of-cycle
+//        scan the flat loop uses. Noise gone -> the capture path is the cause.
+//        Watch the PICTURE as carefully as the sound on this one.
+//   E10  chip 1 ($0450) only; chip 0 ($0440) is never rendered. The bus side is
+//        untouched, so this is 0.46's AUDIO with 0.47's everything else. Noise
+//        gone -> what chip 0 receives is the problem, not the synthesis.
+#ifndef POKEY_DIAG_E9
+#define POKEY_DIAG_E9 0
+#endif
+#ifndef POKEY_DIAG_E10
+#define POKEY_DIAG_E10 0
+#endif
+
+// E11 / E12 - the second round, after E9/E10 came back from hardware:
+//
+//   0.47   LZSS: noise           Portal: buzz
+//   E10    LZSS: NO noise, but   Portal: buzz STILL THERE
+//          the sound is distorted
+//   E9     LZSS: noise           Portal: buzz, lighter
+//
+// Two separate faults, not one:
+//
+//   LZSS   the noise IS chip 0's rendered output (E10 removes it) and it is NOT
+//          a capture-timing artefact (E9 does not). So chip 0 is being fed bad
+//          DATA. And the data has a source: LZSS reads its POKEY register
+//          stream straight out of ON-CART RAM - eighteen stores of the shape
+//          "LDA $6000,X / STA $0440+n" and "LDA $7000,X / STA $0450+n", nine
+//          registers per chip. $6000 and $7000 are inside $4000-$7FFF, the
+//          SuperGame RAM window this firmware serves from ram_table. No other
+//          dual demo does this: measured over all ten, LZSS is the only one
+//          with a single such store. A byte lost or mis-addressed in that RAM
+//          therefore lands DIRECTLY in an AUDF/AUDC register - which is what
+//          noise sounds like. It also explains E10's "distorted": chip 1's
+//          table lives in the same RAM, so muting chip 0 removes the noise but
+//          leaves chip 1 playing from the same damaged data.
+//
+//   Portal the buzz survives chip 0 being muted, so it is NOT the second chip
+//          and NOT a 0.47 regression - E10 is 0.46's audio. Portal does not
+//          read POKEY data from cart RAM at all (0 such stores); it drives
+//          chip 1 mostly through IRQEN/STIMER/SKCTL, i.e. it uses POKEY as an
+//          interrupt timer, and takes chip 0's data from CONSOLE RAM ($23A0).
+//          Separate problem, tracked separately.
+//
+//   E11  chip 0 ($0440) only, chip 1 muted - the mirror of E10. If LZSS's
+//        chip 0 alone is ALSO distorted music rather than pure noise, then both
+//        chips are equally damaged and the fault is upstream of POKEY entirely,
+//        i.e. the RAM. If chip 0 alone is pure noise while chip 1 alone was
+//        music, the damage is specific to the $6000 table.
+//   E12  the SuperGame+RAM loop confirms the address with a SECOND matching
+//        sample before it decodes anything below $8000. That loop takes the
+//        address from ONE sample, unlike emulate_normala78_pokey(), which has
+//        required two matching samples since 0.16 - and a mis-sampled address
+//        serves the WRONG ram_table byte. For a graphics cart that is one
+//        wrong pixel; for LZSS it is a wrong POKEY register. Non-blocking: a
+//        mismatch just re-enters the loop, it never waits.
+#ifndef POKEY_DIAG_E11
+#define POKEY_DIAG_E11 0
+#endif
+#ifndef POKEY_DIAG_E12
+#define POKEY_DIAG_E12 0
+#endif
+
+// E13 - "listen-only" for the aux window on the SuperGame/RAM loops. TRIED AND
+// REJECTED; the switch is kept only so the negative result can be reproduced.
+//
+// The full sequence, and how it landed (hardware, 2026-09-06):
+//
+//   build  rendered     bus change                    LZSS            Portal
+//   0.47   chip0+chip1  -                             noise           buzz
+//   E9     chip0+chip1  end-of-cycle capture          noise           buzz, lighter
+//   E10    chip1 only   -                             no noise*       buzz
+//   E11    chip0 only   -                             noise, music ok NO BUZZ
+//   E12    chip0+chip1  RAM address = 2 samples       noise           buzz
+//   E13    chip0+chip1  listen-only + end-of-cycle    noise           NO BUZZ, clicks
+//   E14    chip0+chip1  CONFIRM THE WINDOW ADDRESS    CLEAN           CLEAN
+//   E15    chip0+chip1  E13 + E14                     noise           clean
+//
+//   (*) E10's "distorted" was half an arrangement, not a defect - E11 showed
+//       chip 0 alone plays it clean.
+//
+// E14 IS NOW PRODUCTION (see the guard in pokey_window_service() above), so
+// there is no POKEY_DIAG_E14 switch - it would be a no-op, exactly as E2's
+// clock change has had none since 0.33. POKEY_DIAG_E15 is gone with it: with
+// the guard shipped, E13 alone now *is* what E15 was.
+//
+// AND THAT IS THE POINT OF KEEPING E13. E15 - listen-only WITH the address
+// guard - came back WORSE than the guard alone: LZSS was noisy again. So the
+// listen-only idea is not merely unnecessary, it is harmful on these loops, and
+// the switch is here so that can be re-checked rather than re-argued. Note that
+// E13 changes TWO things at once (it drops the R/W gate AND stops driving), so
+// its result is not attributable to either one on its own; since E14 alone
+// fixes both files there was no reason to split it further.
+#ifndef POKEY_DIAG_E13
+#define POKEY_DIAG_E13 0
+#endif
+
 // --- POKEY_DIGI_QUEUE: sub-sample timing for sample ("digi") playback -------
 // POKEY_IMPROVEMENT.md 5.4 predicted this and deliberately deferred it: "digi
 // streams through VOLUME_ONLY are limited by our sample rate - writes faster
@@ -204,6 +327,13 @@
 // pokey_stimer_seq below): it is a strobe, and "last write wins" cannot see a
 // second strobe of the SAME value.
 volatile uint8_t pokey_regs[16] = {0};
+// SECOND CHIP. Nine files in the library declare two POKEYs at once (bit 10 =
+// $0440 together with bit 6 = $0450 in the a78 header's 16-bit mapper field);
+// one more, "White Lamp Music Demo (Dual POKEY 800 810)", uses $0800 and $0810
+// without any header bit able to say so. Both pairs are SIXTEEN BYTES APART, so
+// the two windows are one 32-byte window with address bit 4 choosing the chip -
+// which is why the hot loops need no second compare (see pokey_reg_mask).
+volatile uint8_t pokey2_regs[16] = {0};
 volatile uint8_t pokey_enabled  = 0;   // set by identify_cartridge() from the header
 // $4000 (byte54 bit0) or $0450 (bit6). 0xFFFF when disabled - NOT 0, because
 // (addr & 0xFFF0)==0 matches the TIA registers at $0000-$000F, which every cart
@@ -216,6 +346,23 @@ volatile uint16_t pokey_base    = 0xFFFF;
 // was silent while "(800)" played: it addresses $0810, one mirror up.
 volatile uint16_t pokey_mask    = 0xFFF0;
 
+// Which address bits carry the register index INSIDE that window. 0x0F for a
+// single chip - exactly the "addr & 0x0F" every capture site used to spell out
+// literally. 0x1F when two chips share one 32-byte window: bit 4 then selects
+// the chip and bits 3-0 the register, so pokey_capture_write() can split them
+// without the bus loop testing a second base address. Nothing else changes -
+// a single-POKEY cart gets 0x0F here and behaves exactly as before.
+volatile uint8_t pokey_reg_mask = 0x0F;
+
+// Has the bus ever written this chip? Set by core 1 on every capture, read by
+// core 0 once per output sample. Two jobs, both of which need "written", not
+// "declared": chip 1's synthesis is skipped entirely until it exists (so the
+// ~424 single-POKEY files in the library pay literally nothing for this
+// feature), and the output scale divides by 2 only when BOTH chips are really
+// playing - so "POKEY Tester (810)", a lone chip sitting in the second slot,
+// stays as loud as "POKEY Tester (800)" rather than half as loud.
+volatile uint8_t pokey_live[2]  = {0, 0};
+
 // STIMER (offset 9) reloads all four channel counters and forces their outputs
 // to a known state - it is an EVENT, not a value, and two STIMER writes in a
 // row (same or different data, the byte written is ignored by real POKEY too)
@@ -223,15 +370,19 @@ volatile uint16_t pokey_mask    = 0xFFF0;
 // SECOND write if its value differed from the first. This counter increments
 // on every write to offset 9 regardless of value; core 0 reacts to a CHANGE in
 // it, which a "last write wins" byte cannot represent for a repeated strobe.
-volatile uint32_t pokey_stimer_seq = 0;
+volatile uint32_t pokey_stimer_seq[2] = {0, 0};
 
 #if POKEY_DIGI_QUEUE
 #include "hardware/timer.h"
 #define POKEY_Q_SIZE 128                      /* power of two */
 typedef struct { uint32_t t_us; uint8_t reg; uint8_t val; } pk_ev_t;
-static volatile pk_ev_t pokey_queue[POKEY_Q_SIZE];
-static volatile uint32_t pk_q_head = 0;       // written by core 1 only
-static volatile uint32_t pk_q_tail = 0;       // written by core 0 only
+// One queue PER CHIP. A shared queue cannot work once there are two renderers:
+// each drains until it reaches an event later than its own window, so whichever
+// ran first would consume the other's events. Costs nothing while the feature
+// is off, which is its default.
+static volatile pk_ev_t pokey_queue[2][POKEY_Q_SIZE];
+static volatile uint32_t pk_q_head[2] = {0, 0};   // written by core 1 only
+static volatile uint32_t pk_q_tail[2] = {0, 0};   // written by core 0 only
 #endif
 
 // Capture one POKEY register write off the bus. Single point so the queue and
@@ -239,22 +390,37 @@ static volatile uint32_t pk_q_tail = 0;       // written by core 0 only
 // everything else on this path is: see the note above pokey_read_reg().
 static inline __attribute__((always_inline))
 void pokey_capture_write(uint32_t reg, uint8_t val) {
+  // 'reg' arrives masked with pokey_reg_mask, so bit 4 is the chip select for a
+  // dual cart and is always 0 for every other one - no branch, no second window
+  // test, and the single-chip path is the same three instructions it was.
+  const uint32_t chip = (reg >> 4) & 1u;
+  reg &= 0x0Fu;
 #if POKEY_DIGI_QUEUE
   if (reg < 8) {                              // AUDF/AUDC - the digi registers
-    uint32_t h = pk_q_head, n = h + 1u;
-    if ((uint32_t)(n - pk_q_tail) <= POKEY_Q_SIZE) {
+    uint32_t h = pk_q_head[chip], n = h + 1u;
+    if ((uint32_t)(n - pk_q_tail[chip]) <= POKEY_Q_SIZE) {
       uint32_t i = h & (POKEY_Q_SIZE - 1u);
-      pokey_queue[i].t_us = timer_hw->timerawl;
-      pokey_queue[i].reg  = (uint8_t)reg;
-      pokey_queue[i].val  = val;
-      pk_q_head = n;
+      pokey_queue[chip][i].t_us = timer_hw->timerawl;
+      pokey_queue[chip][i].reg  = (uint8_t)reg;
+      pokey_queue[chip][i].val  = val;
+      pk_q_head[chip] = n;
+      pokey_live[chip] = 1;
       return;                                 // timing channel ONLY - core 0
     }                                         // applies it into pokey_regs[]
     // queue full: fall through and take the old path rather than lose the write
   }
 #endif
-  pokey_regs[reg] = val;
-  if (reg == 0x09) pokey_stimer_seq = pokey_stimer_seq + 1;   // strobe, see above
+  // A lookup table of the two register files would be the obvious way to select
+  // one, and it is the wrong one HERE: a static array of pointers lands in
+  // .rodata, i.e. FLASH, and this line runs on core 1 inside a
+  // __time_critical_func() loop. Reaching flash from a bus loop is the class of
+  // defect patches 0.09/0.13 removed. A ternary between two .bss arrays keeps
+  // both addresses in the RAM-resident literal pool of the loop itself -
+  // checked in the .elf, there is no 0x10xxxxxx load on this path.
+  volatile uint8_t *rf = chip ? pokey2_regs : pokey_regs;
+  rf[reg] = val;
+  if (reg == 0x09) pokey_stimer_seq[chip] = pokey_stimer_seq[chip] + 1;   // strobe
+  pokey_live[chip] = 1;
 }
 
 
@@ -303,15 +469,24 @@ void pokey_capture_write(uint32_t reg, uint8_t val) {
 // outlines this into one copy in FLASH reached through a RAM veneer - the defect
 // patches 0.09/0.13 removed. check_hotpath.sh catches it if this is ever dropped.
 
-static uint32_t pk_rand = 0x1234;      // RANDOM generator, core 1 only - see the
-                                        // "KNOWN SIMPLIFICATIONS" note above for
-                                        // why this stays independent of the
-                                        // synthesis engine's poly17 table.
+static uint32_t pk_rand[2] = {0x1234, 0x1234};   // RANDOM generator, core 1 only -
+                                        // see the "KNOWN SIMPLIFICATIONS" note
+                                        // above for why this stays independent
+                                        // of the synthesis engine's poly17
+                                        // table. One per chip: two real POKEYs
+                                        // are two independent shift registers,
+                                        // and a game probing the second one has
+                                        // to see it change on its own.
 
+// 'reg' is masked with pokey_reg_mask, so bit 4 is the chip - same convention as
+// pokey_capture_write(), and 0 for every single-POKEY cart.
 static inline __attribute__((always_inline)) uint8_t pokey_read_reg(uint32_t reg) {
-  if (reg == 0x0A) {                   // RANDOM - the register games probe
-    pk_rand = (pk_rand >> 1) | ((((pk_rand) ^ (pk_rand >> 5)) & 1u) << 16);
-    return (uint8_t)(pk_rand & 0xFF);
+  if ((reg & 0x0Fu) == 0x0A) {         // RANDOM - the register games probe
+    uint32_t chip = (reg >> 4) & 1u;
+    uint32_t r = pk_rand[chip];
+    r = (r >> 1) | ((((r) ^ (r >> 5)) & 1u) << 16);
+    pk_rand[chip] = r;
+    return (uint8_t)(r & 0xFF);
   }
   return 0xFF;                         // ALLPOT/IRQST/SKSTAT: idle reads as high
 }
@@ -333,14 +508,71 @@ void pokey_window_service(uint32_t addr, uint8_t *rom_in_use) {
   // change at the call sites. Only one aux chip is emulated, so this is a
   // choice, not a merge - see ym2151.h.
   if (ym_enabled) { ym_window_service(addr, rom_in_use); return; }
+  // CONFIRM THE ADDRESS BEFORE IT PICKS A REGISTER (0.48, measured - experiment
+  // E14 below). The address handed in here is sampled at the TOP of the calling
+  // loop and can be several instructions old; on emulate_supercart_ram_pokey()
+  // it is the oldest of the three samples that pass takes. A sample caught while
+  // the address lines are still settling - as the bus moves from $0450 to $0441,
+  // say - can read as some OTHER address inside the window, and the captured
+  // byte then lands in the wrong register of the wrong chip. On "LZSS Player"
+  // that was audible as noise on top of otherwise correct music, and it is why
+  // emulate_normala78_pokey() has stabilised its address with two matching
+  // samples since 0.16 - the seven dual carts that run THAT loop were all clean.
+  //
+  // Giving up the cycle costs nothing: a real POKEY write holds its address for
+  // the whole cycle, so the very next pass catches it. What is dropped is only
+  // the settling artefact.
+  //
+  // Deliberately AFTER the ym_enabled test, so a YM2151 cart is untouched: 45
+  // files have been through hardware on that path and nothing has been reported
+  // against it. Same hazard in principle, no evidence and no reason to move it.
+  if ((gpio_get_all() & BUS_PIN_MASK) != (addr & BUS_PIN_MASK)) {
+    if (*rom_in_use) { SET_DATA_MODE_IN; *rom_in_use = 0; }
+    return;
+  }
   uint32_t g = gpio_get_all();
+  // pokey_reg_mask is 0x0F for one chip and 0x1F for a dual cart, where bit 4
+  // then names the chip - see its declaration. Read once here rather than in
+  // the caller: this branch only runs on a window hit, never per bus cycle.
+  const uint32_t rmask = (uint32_t)pokey_reg_mask;
+#if POKEY_DIAG_E13
+  // E13 DIAGNOSTIC: listen-only, exactly as emulate_normala78_pokey() does it.
+  // Never drive, do not consult R/W, and take the LAST byte seen while the
+  // address is still valid. This is the seven clean carts' handling, applied to
+  // the two that are not.
+  if (*rom_in_use) { SET_DATA_MODE_IN; *rom_in_use = 0; }
+  {
+    uint32_t last = g, cur;
+    for (uint32_t n = 0; n < 64; n++) {
+      cur = gpio_get_all();
+      if ((cur & BUS_PIN_MASK) != (addr & BUS_PIN_MASK)) break;
+      last = cur;
+    }
+    pokey_capture_write(addr & rmask, (uint8_t)((last >> D0_PIN) & 0xFF));
+  }
+  return;
+#endif
   if (g & RW_PIN_MASK) {                                   // read cycle
-    sio_hw->gpio_out = (uint32_t)pokey_read_reg(addr & 0x0F) << D0_PIN;
+    sio_hw->gpio_out = (uint32_t)pokey_read_reg(addr & rmask) << D0_PIN;
     if (!*rom_in_use) { SET_DATA_MODE_OUT; *rom_in_use = 1; }
   } else {                                                 // write cycle
     if (*rom_in_use) { SET_DATA_MODE_IN; *rom_in_use = 0; }
-    uint32_t reg = addr & 0x0F;
+    uint32_t reg = addr & rmask;
+#if POKEY_DIAG_E9
+    // E9 DIAGNOSTIC: end-of-cycle capture, the same bounded 64-turn scan the
+    // flat loop and this loop's own bank/RAM paths use. Keeps the LAST byte
+    // seen while the address is still valid, i.e. after the 6502 has driven
+    // it, instead of the single early sample production takes here.
+    uint32_t last = g, cur;
+    for (uint32_t n = 0; n < 64; n++) {
+      cur = gpio_get_all();
+      if ((cur & BUS_PIN_MASK) != (addr & BUS_PIN_MASK)) break;
+      last = cur;
+    }
+    pokey_capture_write(reg, (uint8_t)((last >> D0_PIN) & 0xFF));
+#else
     pokey_capture_write(reg, (uint8_t)((g >> D0_PIN) & 0xFF));
+#endif
   }
 }
 #endif // POKEY_HOST_TEST
@@ -360,13 +592,36 @@ typedef struct {
                          // free-run period (see pk_arm_pair()/pk_fire_ch0|2())
 } pk_chan_t;
 
-static pk_chan_t pk_ch[4];
-static uint32_t  pk_now   = 0;     // POKEY's own clock; PAUSES while SK_RESET holds
-static uint32_t  pk_epoch = 0;     // pk_now value where poly phase 0 falls (reset
-                                    // pins this to pk_now, so phase reads 0 the
-                                    // whole time the chip is held in reset)
-static uint32_t  pk_mix   = 0;     // duration-weighted level accumulator
-static uint8_t   pk_level = 0;     // current instantaneous summed level (0..60)
+// ONE EMULATED CHIP. Everything the engine used to keep in file-scope globals
+// lives here instead, so the very same code drives either chip through a
+// pointer: there is no second copy of the synthesis, only a second instance of
+// its state. On Cortex-M0+ this is free - a struct member is a base register
+// plus a small offset, which is exactly what a global already compiled to (a
+// literal-pool base plus an offset).
+typedef struct {
+  volatile uint8_t *regs;   // this chip's register file, written by core 1
+  uint8_t  idx;             // 0 or 1 - index into pokey_stimer_seq[]/pokey_live[]
+  pk_chan_t ch[4];
+  uint32_t now;             // POKEY's own clock; PAUSES while SK_RESET holds
+  uint32_t epoch;           // 'now' value where poly phase 0 falls (reset pins
+                            // this to 'now', so phase reads 0 the whole time
+                            // the chip is held in reset)
+  uint32_t mix;             // duration-weighted level accumulator
+  uint8_t  level;           // current instantaneous summed level (0..60)
+  // What used to be function-local statics inside pokey_next_sample(). A second
+  // chip needs its own "have I been primed", "which AUDCTL did I last see" and
+  // "which STIMER strobe have I already acted on"; leaving them shared would
+  // make one chip's topology change silently resync the other.
+  uint8_t  prev_audctl;
+  uint8_t  primed;
+  uint8_t  was_running;
+  uint32_t seen_stimer_seq;
+} pk_state_t;
+
+// was_running starts 0 rather than the old global's 1, and that is not a
+// behaviour change: the !primed branch in pk_render() assigns it from the
+// current SKCTL before anything reads it, so the initial value was already dead.
+static pk_state_t pk_st[2] = { { pokey_regs, 0 }, { pokey2_regs, 1 } };
 
 // Mersenne fold: for mask == 2^shift - 1, 2^shift == 1 (mod mask), so summing
 // the low 'shift' bits with everything above them is a modulo reduction. Loops
@@ -395,8 +650,8 @@ static inline uint8_t pk_poly_bit(const uint8_t *tab, uint32_t idx) {
 // NOTPOLY5 short-circuits the gate before it), which is how it went
 // unnoticed until tools/pokey_selftest/ ran a mode that actually reads a
 // table - see that tool's README for the trace that caught it.
-static inline void pk_fire_generator(pk_chan_t *c, uint8_t audc, uint8_t audctl, uint32_t t) {
-  uint32_t phase = t - pk_epoch + 1u;
+static inline void pk_fire_generator(pk_state_t *pk, pk_chan_t *c, uint8_t audc, uint8_t audctl, uint32_t t) {
+  uint32_t phase = t - pk->epoch + 1u;
   if ((audc & POKEY_NOTPOLY5) || pk_poly_bit(pk_poly5, pk_fold(phase, 31u, 5u))) {
     if (audc & POKEY_PURE) {
       c->out ^= 1;
@@ -415,14 +670,14 @@ static inline void pk_fire_generator(pk_chan_t *c, uint8_t audc, uint8_t audctl,
 // too (pk_fire_ch2()/pk_fire_ch3() below), so "only channel X changed" is not
 // enough information. Four table-free lookups is not worth optimising against
 // a budget this file uses under 3% of (POKEY_IMPROVEMENT.md 4.2).
-static inline void pk_recompute_level(void) {
+static inline void pk_recompute_level(pk_state_t *pk) {
   uint32_t s = 0;
   for (int ch = 0; ch < 4; ch++) {
-    uint8_t audc = pokey_regs[ch * 2 + 1];
-    uint8_t bit  = (pk_ch[ch].out ^ pk_ch[ch].filt) & 1u;
+    uint8_t audc = pk->regs[ch * 2 + 1];
+    uint8_t bit  = (pk->ch[ch].out ^ pk->ch[ch].filt) & 1u;
     if (bit || (audc & POKEY_VOLUME_ONLY)) s += (audc & POKEY_VOLUME_MASK);
   }
-  pk_level = (uint8_t)s;
+  pk->level = (uint8_t)s;
 }
 
 // The 28/114-tick base-clock divider is a single chip-wide free-running
@@ -434,17 +689,17 @@ static inline void pk_recompute_level(void) {
 // resync, or a two-tone reset borrowed from another channel's schedule),
 // because a NATURAL rearm (a channel firing on its own schedule) is already
 // sitting exactly on a pulse boundary and (AUDF+1)*pulse lands on the next one
-// automatically. pk_epoch doubles as this divider's phase reference: both it
+// automatically. pk->epoch doubles as this divider's phase reference: both it
 // and the poly counters are pinned to 0 by the very same SKCTL-freeze branch
 // in pokey.cpp (m_clock_cnt[0..2]=0 alongside m_p4/5/9/17=0), and neither is
 // touched by STIMER, so one variable can serve both.
-static inline uint32_t pk_ticks_to_pulse(uint32_t t, uint32_t pulse) {
+static inline uint32_t pk_ticks_to_pulse(pk_state_t *pk, uint32_t t, uint32_t pulse) {
   // A trigger clock is one where the divider REACHES 'pulse' after incrementing
-  // - i.e. clock t itself triggers when (t - pk_epoch) % pulse == pulse-1, not
+  // - i.e. clock t itself triggers when (t - pk->epoch) % pulse == pulse-1, not
   // when the remainder is 0. Off by one here cost a full extra tick on every
   // asynchronous rearm; tools/pokey_selftest/ is what caught it (see its
   // README for the trace that pinned this down to the exact formula).
-  uint32_t phase = (t - pk_epoch) % pulse;
+  uint32_t phase = (t - pk->epoch) % pulse;
   return (pulse - 1u) - phase;
 }
 
@@ -472,14 +727,14 @@ static inline uint32_t pk_ticks_to_pulse(uint32_t t, uint32_t pulse) {
 // caught this (see its README): the pure-tone tick-by-tick trace that pinned
 // it down was needed because PURE mode's XOR toggling can mask a one-tick
 // FIRST-period error indefinitely once every later period is correct.
-static inline uint32_t pk_period(int ch, uint8_t audf, uint8_t audctl, int pair, uint32_t t, int aligned) {
+static inline uint32_t pk_period(pk_state_t *pk, int ch, uint8_t audf, uint8_t audctl, int pair, uint32_t t, int aligned) {
   int hiclk = (ch == 0 && (audctl & POKEY_CH1_179)) || (ch == 2 && (audctl & POKEY_CH3_179));
   uint32_t cycles = hiclk ? (uint32_t)(pair ? 7 : 4) : 1u;
   uint32_t pulses_needed = (uint32_t)audf + cycles;
   if (hiclk) return aligned ? pulses_needed : pulses_needed - 1u;
   uint32_t pulse = (audctl & POKEY_CLOCK_15) ? POKEY_DIV_15 : POKEY_DIV_64;
   if (aligned) return pulses_needed * pulse;
-  return pk_ticks_to_pulse(t, pulse) + (pulses_needed - 1u) * pulse;
+  return pk_ticks_to_pulse(pk, t, pulse) + (pulses_needed - 1u) * pulse;
 }
 
 // Whether channel 'ch's EFFECTIVE clock source is the 1.79MHz one with no
@@ -515,14 +770,14 @@ static inline int pk_is_hiclk(int ch, uint8_t audctl) {
 // Called exactly once, on the EDGE where SK_RESET transitions from released to
 // held (pokey_next_sample() tracks "was running" to detect it) - never while
 // already frozen, and never on release, where nothing needs correcting.
-static inline void pk_freeze_snapshot(uint32_t t, uint8_t audctl) {
+static inline void pk_freeze_snapshot(pk_state_t *pk, uint32_t t, uint8_t audctl) {
   for (int ch = 0; ch < 4; ch++) {
     if (pk_is_hiclk(ch, audctl)) continue;         // no shared divider to lose phase on
     uint32_t pulse = (audctl & POKEY_CLOCK_15) ? POKEY_DIV_15 : POKEY_DIV_64;
-    uint32_t remaining = pk_ch[ch].next - t;       // ticks left under the OLD phase
+    uint32_t remaining = pk->ch[ch].next - t;       // ticks left under the OLD phase
     uint32_t pulses_remaining = (remaining + pulse - 1u) / pulse;   // round up
     if (pulses_remaining == 0u) pulses_remaining = 1u;
-    pk_ch[ch].next = t + pulses_remaining * pulse - 1u;
+    pk->ch[ch].next = t + pulses_remaining * pulse - 1u;
   }
 }
 
@@ -546,26 +801,26 @@ static inline uint32_t pk_period_freerun(int ch, uint8_t audctl) {
 // first period already carries the +cycles term and every free-run period
 // carries none - see pk_period_freerun() above. 'aligned' passes straight
 // through to the first period's pk_period() call, same meaning as there.
-static inline uint32_t pk_period_pair_total(int L, uint8_t audf_lo, uint8_t audf_hi, uint8_t audctl, uint32_t t, int aligned) {
-  return pk_period(L, audf_lo, audctl, 1, t, aligned) + (uint32_t)audf_hi * pk_period_freerun(L, audctl);
+static inline uint32_t pk_period_pair_total(pk_state_t *pk, int L, uint8_t audf_lo, uint8_t audf_hi, uint8_t audctl, uint32_t t, int aligned) {
+  return pk_period(pk, L, audf_lo, audctl, 1, t, aligned) + (uint32_t)audf_hi * pk_period_freerun(L, audctl);
 }
 
 // (Re)arm channel 'ch' as an independent, unlinked channel starting from tick
 // 't'. Never touches out[]/filt[] - only STIMER and a filter-owning channel's
 // own borrow do that. 'aligned': see pk_period() above.
-static inline void pk_arm_single(int ch, uint32_t t, uint8_t audctl, int aligned) {
-  pk_ch[ch].free_run = 0;
-  pk_ch[ch].next = t + pk_period(ch, pokey_regs[ch * 2], audctl, 0, t, aligned);
+static inline void pk_arm_single(pk_state_t *pk, int ch, uint32_t t, uint8_t audctl, int aligned) {
+  pk->ch[ch].free_run = 0;
+  pk->ch[ch].next = t + pk_period(pk, ch, pk->regs[ch * 2], audctl, 0, t, aligned);
 }
 
 // (Re)arm the pair whose low half is L (0 or 2, high half L+1) fresh from tick
 // 't': the low half gets a first-period borrow, the high half's own borrow is
 // scheduled directly via the closed form above. 'aligned': see pk_period().
-static inline void pk_arm_pair(int L, uint32_t t, uint8_t audctl, int aligned) {
+static inline void pk_arm_pair(pk_state_t *pk, int L, uint32_t t, uint8_t audctl, int aligned) {
   int H = L + 1;
-  pk_ch[L].free_run = 0;
-  pk_ch[L].next = t + pk_period(L, pokey_regs[L * 2], audctl, 1, t, aligned);
-  pk_ch[H].next = t + pk_period_pair_total(L, pokey_regs[L * 2], pokey_regs[H * 2], audctl, t, aligned);
+  pk->ch[L].free_run = 0;
+  pk->ch[L].next = t + pk_period(pk, L, pk->regs[L * 2], audctl, 1, t, aligned);
+  pk->ch[H].next = t + pk_period_pair_total(pk, L, pk->regs[L * 2], pk->regs[H * 2], audctl, t, aligned);
 }
 
 // Re-arm every channel/pair from tick 't' using the CURRENT AUDCTL. Always
@@ -578,40 +833,40 @@ static inline void pk_arm_pair(int L, uint32_t t, uint8_t audctl, int aligned) {
 // CH1_CH2/CH3_CH4/HICLK mid-note, and preserving phase across it would need
 // per-clock stepping for the transition, defeating the point of the
 // event-jump design.
-static inline void pk_resync_all(uint32_t t, uint8_t audctl) {
-  if (audctl & POKEY_CH1_CH2) pk_arm_pair(0, t, audctl, 0);
-  else { pk_arm_single(0, t, audctl, 0); pk_arm_single(1, t, audctl, 0); }
-  if (audctl & POKEY_CH3_CH4) pk_arm_pair(2, t, audctl, 0);
-  else { pk_arm_single(2, t, audctl, 0); pk_arm_single(3, t, audctl, 0); }
+static inline void pk_resync_all(pk_state_t *pk, uint32_t t, uint8_t audctl) {
+  if (audctl & POKEY_CH1_CH2) pk_arm_pair(pk, 0, t, audctl, 0);
+  else { pk_arm_single(pk, 0, t, audctl, 0); pk_arm_single(pk, 1, t, audctl, 0); }
+  if (audctl & POKEY_CH3_CH4) pk_arm_pair(pk, 2, t, audctl, 0);
+  else { pk_arm_single(pk, 2, t, audctl, 0); pk_arm_single(pk, 3, t, audctl, 0); }
 }
 
 // STIMER (pokey.cpp write_internal(), STIMER_C): reloads every channel and
 // forces a known output/filter state. Channels 1/2's filter idles HIGH when
 // unfiltered, 3/4's idles LOW - not a typo, it is what real POKEY does (the
 // XOR that implements the high-pass filter still runs even when "off").
-static inline void pk_stimer_apply(uint32_t t, uint8_t audctl) {
-  for (int c = 0; c < 4; c++) { pk_ch[c].out = 0; pk_ch[c].filt = (c < 2) ? 1 : 0; }
-  pk_resync_all(t, audctl);
-  pk_recompute_level();
+static inline void pk_stimer_apply(pk_state_t *pk, uint32_t t, uint8_t audctl) {
+  for (int c = 0; c < 4; c++) { pk->ch[c].out = 0; pk->ch[c].filt = (c < 2) ? 1 : 0; }
+  pk_resync_all(pk, t, audctl);
+  pk_recompute_level(pk);
 }
 
 // CHAN3's own borrow: toggle its generator, sample (or default) CHAN1's filter,
 // then either extend the free-run (joined) or rearm as unlinked (a NATURAL
 // rearm - aligned=1).
-static inline void pk_fire_ch2(uint32_t t, uint8_t audctl) {
-  pk_fire_generator(&pk_ch[2], pokey_regs[5], audctl, t);
-  pk_ch[0].filt = (audctl & POKEY_CH1_FILTER) ? pk_ch[0].out : 1;
-  if (audctl & POKEY_CH3_CH4) { pk_ch[2].free_run = 1; pk_ch[2].next = t + pk_period_freerun(2, audctl); }
-  else pk_arm_single(2, t, audctl, 1);
+static inline void pk_fire_ch2(pk_state_t *pk, uint32_t t, uint8_t audctl) {
+  pk_fire_generator(pk, &pk->ch[2], pk->regs[5], audctl, t);
+  pk->ch[0].filt = (audctl & POKEY_CH1_FILTER) ? pk->ch[0].out : 1;
+  if (audctl & POKEY_CH3_CH4) { pk->ch[2].free_run = 1; pk->ch[2].next = t + pk_period_freerun(2, audctl); }
+  else pk_arm_single(pk, 2, t, audctl, 1);
 }
 // CHAN4's own borrow: toggle its generator, sample (or default) CHAN2's filter,
 // then either rearm the whole pair fresh (its 16-bit cycle just completed) or
 // rearm as unlinked (both NATURAL - aligned=1).
-static inline void pk_fire_ch3(uint32_t t, uint8_t audctl) {
-  pk_fire_generator(&pk_ch[3], pokey_regs[7], audctl, t);
-  pk_ch[1].filt = (audctl & POKEY_CH2_FILTER) ? pk_ch[1].out : 1;
-  if (audctl & POKEY_CH3_CH4) pk_arm_pair(2, t, audctl, 1);
-  else pk_arm_single(3, t, audctl, 1);
+static inline void pk_fire_ch3(pk_state_t *pk, uint32_t t, uint8_t audctl) {
+  pk_fire_generator(pk, &pk->ch[3], pk->regs[7], audctl, t);
+  pk->ch[1].filt = (audctl & POKEY_CH2_FILTER) ? pk->ch[1].out : 1;
+  if (audctl & POKEY_CH3_CH4) pk_arm_pair(pk, 2, t, audctl, 1);
+  else pk_arm_single(pk, 3, t, audctl, 1);
 }
 // CHAN1's own borrow: toggle its generator, then either extend the free-run
 // (joined) or rearm as unlinked (NATURAL - aligned=1). The two-tone reset of
@@ -619,40 +874,40 @@ static inline void pk_fire_ch3(uint32_t t, uint8_t audctl) {
 // MAME's step_one_clock() places it - see pk_run_to(). That reset is NOT
 // natural for CHAN1 (it is borrowed from CHAN2's schedule, unrelated to
 // CHAN1's own pulse phase), which is why pk_run_to() passes aligned=0 there.
-static inline void pk_fire_ch0(uint32_t t, uint8_t audctl) {
-  pk_fire_generator(&pk_ch[0], pokey_regs[1], audctl, t);
-  if (audctl & POKEY_CH1_CH2) { pk_ch[0].free_run = 1; pk_ch[0].next = t + pk_period_freerun(0, audctl); }
-  else pk_arm_single(0, t, audctl, 1);
+static inline void pk_fire_ch0(pk_state_t *pk, uint32_t t, uint8_t audctl) {
+  pk_fire_generator(pk, &pk->ch[0], pk->regs[1], audctl, t);
+  if (audctl & POKEY_CH1_CH2) { pk->ch[0].free_run = 1; pk->ch[0].next = t + pk_period_freerun(0, audctl); }
+  else pk_arm_single(pk, 0, t, audctl, 1);
 }
 // CHAN2's own borrow: toggle its generator, then either rearm the whole pair
 // fresh or rearm as unlinked (both NATURAL - aligned=1).
-static inline void pk_fire_ch1(uint32_t t, uint8_t audctl) {
-  pk_fire_generator(&pk_ch[1], pokey_regs[3], audctl, t);
-  if (audctl & POKEY_CH1_CH2) pk_arm_pair(0, t, audctl, 1);
-  else pk_arm_single(1, t, audctl, 1);
+static inline void pk_fire_ch1(pk_state_t *pk, uint32_t t, uint8_t audctl) {
+  pk_fire_generator(pk, &pk->ch[1], pk->regs[3], audctl, t);
+  if (audctl & POKEY_CH1_CH2) pk_arm_pair(pk, 0, t, audctl, 1);
+  else pk_arm_single(pk, 1, t, audctl, 1);
 }
 
-// Advance the chip from pk_now to 'until', firing every borrow strictly before
-// 'until' in between, then fold the final partial span into pk_mix. Processing
+// Advance the chip from pk->now to 'until', firing every borrow strictly before
+// 'until' in between, then fold the final partial span into pk->mix. Processing
 // order for ties (CHAN3, CHAN4, two-tone check, CHAN1, CHAN2) matches
 // step_one_clock() exactly, including the obscure case that falls out of it
 // for free: a two-tone reset of CHAN1 on the same tick CHAN1 would otherwise
 // have independently borrowed CANCELS that borrow, because the reset already
 // overwrote 'next' before the CHAN1 branch below is even reached.
-static inline void pk_run_to(uint32_t until, uint8_t audctl, uint8_t skctl) {
-  uint32_t mark = pk_now;
+static inline void pk_run_to(pk_state_t *pk, uint32_t until, uint8_t audctl, uint8_t skctl) {
+  uint32_t mark = pk->now;
   for (;;) {
-    uint32_t t = pk_ch[0].next;
-    if (pk_ch[1].next < t) t = pk_ch[1].next;
-    if (pk_ch[2].next < t) t = pk_ch[2].next;
-    if (pk_ch[3].next < t) t = pk_ch[3].next;
+    uint32_t t = pk->ch[0].next;
+    if (pk->ch[1].next < t) t = pk->ch[1].next;
+    if (pk->ch[2].next < t) t = pk->ch[2].next;
+    if (pk->ch[3].next < t) t = pk->ch[3].next;
     if (t >= until) break;
 
-    pk_mix += (uint32_t)pk_level * (t - mark);
+    pk->mix += (uint32_t)pk->level * (t - mark);
     mark = t;
 
-    if (pk_ch[2].next == t) pk_fire_ch2(t, audctl);
-    if (pk_ch[3].next == t) pk_fire_ch3(t, audctl);
+    if (pk->ch[2].next == t) pk_fire_ch2(pk, t, audctl);
+    if (pk->ch[3].next == t) pk_fire_ch3(pk, t, audctl);
     // aligned=1: CHAN1's own inc_chan() for tick t already ran (earlier in
     // step_one_clock(), before this check), same as a natural wrap - the reset
     // just discards its result. The NEW counter's first increment is still a
@@ -664,14 +919,14 @@ static inline void pk_run_to(uint32_t until, uint8_t audctl, uint8_t skctl) {
     // TWOTONE-labelled passes in tools/pokey_selftest/ before the pass table
     // added SKCTL fuzzing that enables it incidentally on EVERY pass - see
     // that tool's README.
-    if ((skctl & POKEY_SK_TWOTONE) && pk_ch[1].next == t) pk_arm_single(0, t, audctl, 1);
-    if (pk_ch[0].next == t) pk_fire_ch0(t, audctl);
-    if (pk_ch[1].next == t) pk_fire_ch1(t, audctl);
+    if ((skctl & POKEY_SK_TWOTONE) && pk->ch[1].next == t) pk_arm_single(pk, 0, t, audctl, 1);
+    if (pk->ch[0].next == t) pk_fire_ch0(pk, t, audctl);
+    if (pk->ch[1].next == t) pk_fire_ch1(pk, t, audctl);
 
-    pk_recompute_level();
+    pk_recompute_level(pk);
   }
-  pk_mix += (uint32_t)pk_level * (until - mark);
-  pk_now = until;
+  pk->mix += (uint32_t)pk->level * (until - mark);
+  pk->now = until;
 }
 
 // Sample period as a whole number of POKEY-clock ticks plus a 16-bit fraction,
@@ -682,48 +937,45 @@ static inline void pk_run_to(uint32_t until, uint8_t audctl, uint8_t skctl) {
 #define POKEY_TICKS_INT   55u
 #define POKEY_TICKS_FRAC  56360u    /* (1787520<<16)/32000 - (55<<16), i.e. 0.8600 */
 
-// Produce one output sample. Called POKEY_SAMPLE_RATE times per second. Reads
+// Advance ONE chip by 'elapsed' POKEY-clock ticks and return its
+// duration-weighted level accumulator for that span (0 .. 60*elapsed). Reads
 // AUDCTL/SKCTL once (matching the bus capture's own one-sample latency budget,
 // unchanged from the first version) and resyncs channel scheduling on a STIMER
 // strobe, a change in AUDCTL, or the very first call.
-static inline uint16_t pokey_next_sample(void) {
-  static uint8_t  prev_audctl;
-  static uint32_t seen_stimer_seq;
-  static uint8_t  primed = 0;
-  static uint8_t  was_running = 1;   // matches the power-on default - see identify_cartridge()
-  static uint32_t frac = 0;
+//
+// Everything that used to be a function-local static here now lives in
+// pk_state_t, which is what makes a second instance possible at all: two chips
+// sharing one "prev_audctl" would each resync the other on every write.
 #if POKEY_DIGI_QUEUE
-  static uint32_t pk_win_us = 0;     // real time at the END of the previous window
+static inline uint32_t pk_render(pk_state_t *pk, uint32_t elapsed,
+                                 uint32_t now_us, uint32_t win0, uint32_t span_us) {
+#else
+static inline uint32_t pk_render(pk_state_t *pk, uint32_t elapsed) {
 #endif
-
-  uint8_t audctl = pokey_regs[8];
-  uint8_t skctl  = pokey_regs[0x0F];
-  uint32_t seq   = pokey_stimer_seq;          // volatile: one read
+  uint8_t audctl = pk->regs[8];
+  uint8_t skctl  = pk->regs[0x0F];
+  uint32_t seq   = pokey_stimer_seq[pk->idx];   // volatile: one read
   uint8_t running = (skctl & POKEY_SK_RESET) != 0;
 
-  if (!primed) {
-    pk_resync_all(pk_now, audctl);
-    pk_recompute_level();
-    prev_audctl = audctl;
-    seen_stimer_seq = seq;
-    was_running = running;
-    primed = 1;
-  } else if (seq != seen_stimer_seq) {
-    seen_stimer_seq = seq;
-    pk_stimer_apply(pk_now, audctl);
-    prev_audctl = audctl;
-  } else if (audctl != prev_audctl) {
-    pk_resync_all(pk_now, audctl);
-    pk_recompute_level();
-    prev_audctl = audctl;
+  if (!pk->primed) {
+    pk_resync_all(pk, pk->now, audctl);
+    pk_recompute_level(pk);
+    pk->prev_audctl = audctl;
+    pk->seen_stimer_seq = seq;
+    pk->was_running = running;
+    pk->primed = 1;
+  } else if (seq != pk->seen_stimer_seq) {
+    pk->seen_stimer_seq = seq;
+    pk_stimer_apply(pk, pk->now, audctl);
+    pk->prev_audctl = audctl;
+  } else if (audctl != pk->prev_audctl) {
+    pk_resync_all(pk, pk->now, audctl);
+    pk_recompute_level(pk);
+    pk->prev_audctl = audctl;
   }
 
-  if (was_running && !running) pk_freeze_snapshot(pk_now, audctl);
-  was_running = running;
-
-  frac += POKEY_TICKS_FRAC;
-  uint32_t elapsed = POKEY_TICKS_INT + (frac >> 16);
-  frac &= 0xFFFFu;
+  if (pk->was_running && !running) pk_freeze_snapshot(pk, pk->now, audctl);
+  pk->was_running = running;
 
   if (running) {
 #if POKEY_DIGI_QUEUE
@@ -739,19 +991,14 @@ static inline uint16_t pokey_next_sample(void) {
     // reconstructed exactly is the one that has just elapsed. Costs 31us of
     // latency, which nothing here can hear.
     {
-      const uint32_t target = pk_now + elapsed;
-      uint32_t now_us = time_us_32();
-      uint32_t win0   = pk_win_us ? pk_win_us : now_us;   // first call: empty window
-      pk_win_us = now_us;
-      uint32_t span_us = now_us - win0;
-      if (span_us == 0) span_us = 1;
-      // Clamp so the multiply below cannot overflow after a stall (a hiccup
-      // could otherwise make span_us enormous). 1000us is ~32 sample periods;
-      // anything beyond that is not a window worth reconstructing anyway.
-      if (span_us > 1000u) span_us = 1000u;
-      while (pk_q_tail != pk_q_head) {
-        uint32_t i = pk_q_tail & (POKEY_Q_SIZE - 1u);
-        uint32_t t = pokey_queue[i].t_us;
+      const uint32_t target = pk->now + elapsed;
+      const uint32_t q = pk->idx;
+      // now_us / win0 / span_us are computed ONCE per output sample by the
+      // caller and passed in, so both chips place their events on the same
+      // window rather than each measuring a slightly different one.
+      while (pk_q_tail[q] != pk_q_head[q]) {
+        uint32_t i = pk_q_tail[q] & (POKEY_Q_SIZE - 1u);
+        uint32_t t = pokey_queue[q][i].t_us;
         if ((int32_t)(t - now_us) >= 0) break;            // belongs to a later window
         uint32_t off = (int32_t)(t - win0) > 0 ? (t - win0) : 0u;
         if (off > span_us) off = span_us;
@@ -762,34 +1009,101 @@ static inline uint16_t pokey_next_sample(void) {
         // product is at most 56000 and fits easily. A uint64_t here would pull
         // in the 64-bit software divide instead of the 32-bit one - the exact
         // trap the note above this function's own division warns about.
-        uint32_t tick = pk_now + (off * elapsed) / span_us;
+        uint32_t tick = pk->now + (off * elapsed) / span_us;
         if ((int32_t)(tick - target) > 0) tick = target;
-        if ((int32_t)(tick - pk_now) > 0) pk_run_to(tick, audctl, skctl);
-        pokey_regs[pokey_queue[i].reg] = pokey_queue[i].val;
-        pk_recompute_level();      // volume/waveform may have changed mid-window
-        pk_q_tail = pk_q_tail + 1u;
+        if ((int32_t)(tick - pk->now) > 0) pk_run_to(pk, tick, audctl, skctl);
+        pk->regs[pokey_queue[q][i].reg] = pokey_queue[q][i].val;
+        pk_recompute_level(pk);      // volume/waveform may have changed mid-window
+        pk_q_tail[q] = pk_q_tail[q] + 1u;
       }
     }
 #endif
-    pk_run_to(pk_now + elapsed, audctl, skctl);
+    pk_run_to(pk, pk->now + elapsed, audctl, skctl);
   } else {
     // Held in reset: no channel may borrow and the poly phase pins at 0 (see
-    // pk_epoch), but the OUTPUT sample clock does not stop - the level is
+    // pk->epoch), but the OUTPUT sample clock does not stop - the level is
     // simply constant over this whole span, so folding it in directly is
     // exact, not an approximation.
-    pk_epoch = pk_now;
-    pk_mix += (uint32_t)pk_level * elapsed;
+    pk->epoch = pk->now;
+    pk->mix += (uint32_t)pk->level * elapsed;
   }
 
-  uint32_t mix = pk_mix;
-  pk_mix = 0;
-  // 4 channels x volume 15 = 60 max, elapsed <= 56 (POKEY_TICKS_INT plus one
-  // carried tick) - mix never exceeds 60*56=3360, so mix*PWM_WRAP fits a plain
-  // uint32_t with room to spare (max ~1.72M against a ~4.29G ceiling). This
-  // matters on a core with no hardware divide: a needless uint64_t here would
-  // pull in the 64-bit software division routine instead of the 32-bit one,
-  // roughly doubling the one division this function cannot avoid.
-  uint32_t out = (mix * POKEY_PWM_WRAP) / (60u * elapsed);
+  uint32_t mix = pk->mix;
+  pk->mix = 0;
+  return mix;
+}
+
+// Produce one output sample. Called POKEY_SAMPLE_RATE times per second.
+//
+// COST OF THE SECOND CHIP, and why it is not paid by the ~424 single-POKEY
+// files in the library: chip 1 is rendered only once a write has actually
+// reached it (pokey_live[1]), which no cart but a dual one ever does. What a
+// single-POKEY cart adds here is one byte load and one branch per sample -
+// 32 000 times a second, against a core running at POKEY_CLOCK_KHZ.
+//
+// MIXING. Two real POKEYs both drive the console's single AUD IN line, so
+// their outputs sum; linear summation is what MAME, JS7800 and test7800 all do
+// for the 7800 (POKEY_IMPROVEMENT.md 5.3). The full-scale divisor therefore
+// becomes 120 rather than 60 when BOTH chips are playing - each contributes
+// half the swing, and a dual cart voicing the same part on both chips comes
+// out at the same loudness as a single chip playing it alone, instead of
+// clipping. The divisor stays at 60 when only one chip has ever been written,
+// which keeps every existing POKEY cart bit-for-bit as loud as before AND
+// covers "POKEY Tester (810)": a lone chip that happens to sit in the second
+// slot must not be rendered at half volume just because the first slot exists.
+static inline uint16_t pokey_next_sample(void) {
+  static uint32_t frac = 0;
+#if POKEY_DIGI_QUEUE
+  static uint32_t pk_win_us = 0;     // real time at the END of the previous window
+#endif
+
+  frac += POKEY_TICKS_FRAC;
+  uint32_t elapsed = POKEY_TICKS_INT + (frac >> 16);
+  frac &= 0xFFFFu;
+
+#if POKEY_DIGI_QUEUE
+  // Measured once for BOTH chips - see pk_render()'s digi block.
+  uint32_t now_us = time_us_32();
+  uint32_t win0   = pk_win_us ? pk_win_us : now_us;   // first call: empty window
+  pk_win_us = now_us;
+  uint32_t span_us = now_us - win0;
+  if (span_us == 0) span_us = 1;
+  // Clamp so the multiply in pk_render() cannot overflow after a stall (a
+  // hiccup could otherwise make span_us enormous). 1000us is ~32 sample
+  // periods; anything beyond that is not a window worth reconstructing anyway.
+  if (span_us > 1000u) span_us = 1000u;
+#define PK_RENDER(p) pk_render((p), elapsed, now_us, win0, span_us)
+#else
+#define PK_RENDER(p) pk_render((p), elapsed)
+#endif
+
+#if POKEY_DIAG_E10
+  // E10 DIAGNOSTIC: chip 1 only, chip 0 silent - 0.46's audio behaviour with
+  // 0.47's bus side. See the switch's comment above.
+  uint32_t mix   = pokey_live[1] ? PK_RENDER(&pk_st[1]) : 0u;
+  uint32_t scale = 60u;
+#elif POKEY_DIAG_E11
+  // E11 DIAGNOSTIC: chip 0 only, chip 1 silent - the mirror of E10.
+  uint32_t mix   = PK_RENDER(&pk_st[0]);
+  uint32_t scale = 60u;
+#else
+  uint32_t mix   = PK_RENDER(&pk_st[0]);
+  uint32_t scale = 60u;
+  if (pokey_live[1]) {
+    mix += PK_RENDER(&pk_st[1]);
+    if (pokey_live[0]) scale = 120u;
+  }
+#endif
+#undef PK_RENDER
+
+  // 4 channels x volume 15 = 60 max per chip, elapsed <= 56 (POKEY_TICKS_INT
+  // plus one carried tick) - mix never exceeds 2*60*56=6720, so mix*PWM_WRAP
+  // fits a plain uint32_t with room to spare (max ~3.43M against a ~4.29G
+  // ceiling). This matters on a core with no hardware divide: a needless
+  // uint64_t here would pull in the 64-bit software division routine instead
+  // of the 32-bit one, roughly doubling the one division this function cannot
+  // avoid.
+  uint32_t out = (mix * POKEY_PWM_WRAP) / (scale * elapsed);
   if (out > POKEY_PWM_WRAP) out = POKEY_PWM_WRAP;
   return (uint16_t)out;
 }
