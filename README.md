@@ -117,10 +117,35 @@
   has no other way out written into it._
 
   _The cartridge now says "done, nothing transferred", which is what a real Harmony says
-  once a transfer has finished, so the game goes through and plays. The score table starts
-  empty and **is not saved yet** — writing to flash while the other core is driving the
-  cartridge bus is a separate problem, and the same one the 7800 High Score Cart needs.
-  Confirmed on a real console._
+  once a transfer has finished, so the game goes through and plays. **The score table is
+  saved too**, in a file on the cartridge's own USB drive — see the next entry, which is
+  where that mechanism came from. Confirmed on a real console._
+
+- **The 7800 High Score Cart works, and scores survive the power going off**
+  _The High Score Cart is a pass-through cartridge Atari sold for the 7800: games call into
+  its BIOS to keep one shared table of initials and scores. This board now **is** one. Both
+  windows the real cartridge answers are emulated — 2 KB of battery-backed RAM at `$1000`
+  and the 4 KB BIOS at `$3000` — and the BIOS is built into the firmware, so there is
+  nothing to copy; drop an `HSC.ROM` in the root only if you want to override it. 134 of
+  the 180 files that ask for one are covered. Confirmed on a real console._
+
+  _The table lives in `/.save_hsc.data`, an ordinary 8 KB file on the cartridge's own USB
+  drive that you can see, copy and back up from a PC — not a hidden corner of flash. Star
+  Castle Arcade's save uses the same mechanism in `/.save_fa2.data`. Both are kept out of
+  the menu listing so they do not clutter the browser. Writing them does not disturb the
+  game: the core driving the cartridge bus never reads flash, so it keeps answering the
+  console for the ~26 ms an erase takes._
+
+  _One thing from the six hardware rounds this took is worth writing down, because nothing
+  in the source hinted at it. A 6502 store through an index register — `STA $10B3,X`,
+  `STA ($A6),Y`, which is how the BIOS writes every game entry and every score — spends its
+  second-to-last cycle **reading** the address it is about to write. When the index does not
+  cross a page boundary, that read and the write share one address; the firmware was holding
+  the data bus "until the address changes", so the entire write cycle passed inside that
+  hold and was never sampled. Only plain `STA` stores, which have no such cycle, ever
+  reached the table. It is the only window in the firmware that is read and written at the
+  same addresses — every 2600 RAM scheme has a separate write port — so nothing else could
+  have shown it._
 
 - **Six more bankswitching schemes answer the bus at all — 19 more files**
   _`DF`, `DFSC`, `EFSC`, `0840` and the Wickstead Design board behind **Pursuit of the

@@ -34,6 +34,17 @@ FatVolume fatfs;
 FatFile root;
 FatFile file;
 
+// Save slots (TODO 10 and 11). Included HERE and not with the other headers:
+// since 0.51 its primary back-end is a hidden file on the FAT volume, so it
+// needs fatfs and flash to already exist.
+#include "nvstore.h"
+
+// True when the cartridge came up plugged into a PC rather than into the Atari.
+// nvstore may only CREATE its files in that case: creating one writes flash
+// through the Adafruit driver, which calls rp2040.idleOtherCore(), and core 1
+// parked while the Atari is running means the 6507 reads a floating bus.
+bool connected_to_pc = false;
+
 // USB Mass Storage object
 Adafruit_USBD_MSC usb_msc;
 // Check if flash is formatted
@@ -450,6 +461,11 @@ volatile u_int8_t rootdir=0;
 volatile uint32_t addrc;
 volatile uint32_t retaddr;
 volatile u_int8_t cart_to_emulate;
+
+// High Score Cart (TODO 11). Included HERE and not with the other headers: it
+// needs CART_TYPE_NORMALA78, romLen, rom_table, ram_table, pokey_enabled and
+// ym_enabled to already exist, plus nvstore.h for the save slot.
+#include "hsc.h"
   
 ////////////////////////////////////////////////////////////////////////////////////
 //                     REBOOT
@@ -1413,6 +1429,121 @@ void __time_critical_func(emulate_normala78()) {
       // wait for address bus to change
       while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
       SET_DATA_MODE_IN;
+    }
+  }
+}
+
+// High Score Cart variant of the loop above - TODO position 11. A SEPARATE
+// function for the same reason emulate_normala78_pokey() is separate: the plain
+// path took several hardware iterations to get right and carries ~76 titles that
+// have nothing to do with the HSC. Nothing above is touched, and
+// compare_untouched_loops.py is expected to report it byte-identical.
+//
+// Two extra windows, both BELOW $4000, i.e. in the part of the map a 7800
+// cartridge never drives - so neither can collide with the game's ROM window
+// (lo is >= $4000 by construction). Addresses read out of MAME
+// (src/mame/machine/a7800.cpp:1480-1481), not from a wiki:
+//
+//   $3000-$3FFF   the 4 KB HSC BIOS, read-only
+//   $1000-$17FF   the 2 KB battery-backed SRAM, read and write
+//
+// Where they live in memory, and why that costs nothing, is in hsc.h.
+void __time_critical_func(emulate_normala78_hsc()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  uint32_t addr, addr_prev = 0;
+  // Same mapping as emulate_normala78() - MAME's read_40xx formula, see the long
+  // comment there.
+  const uint32_t base_rom = (romLen >= 0x10000) ? 0x4000 : (0x10000 - (uint32_t)romLen);
+  const uint32_t lo = (base_rom < 0x4000) ? 0x4000 : base_rom;
+  // Hoisted: both are plain SRAM, and core 1 must never touch flash - which is
+  // exactly what lets core 0 erase a sector while this loop keeps running.
+  uint8_t *const nv = &ram_table[0];                      // $1000-$17FF
+  const uint8_t *const bios = &rom_table[HSC_BIOS_OFF];   // $3000-$3FFF
+
+  // The two HSC windows are R/W-GATED, unlike the flat ROM window above them,
+  // and that changes one rule: their wait for the cycle to end is BOUNDED.
+  // ym2151.h records why, from Krok 18 - "an unbounded one hangs the cart
+  // outright if R/W is ever misread" - and ym_window_service_blocking() is the
+  // proven shape for an R/W-gated window on this very loop (45 YM carts, 28 of
+  // them flat). 0.52-0.54 spun unbounded here; that is fixed in 0.55.
+
+  while (1) {
+    while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+      addr_prev = addr;
+    // got a stable address
+    if (addr >= lo) {
+      sio_hw->gpio_out = (uint32_t)rom_table[addr - base_rom] << D0_PIN;  // D0-D7 are the only outputs in 7800 modes
+      SET_DATA_MODE_OUT;
+      // wait for address bus to change
+      while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+      SET_DATA_MODE_IN;
+    } else if ((addr & 0xF000) == 0x3000) {
+      // HSC BIOS. R/W-gated even though it is ROM: a write cycle into ROM space
+      // must not put us on the bus against the CPU. The plain loop can skip this
+      // test for its own window because a game never writes to its own ROM; here
+      // we are answering for a device the game did not put there.
+      if (gpio_get_all() & RW_PIN_MASK) {
+        sio_hw->gpio_out = (uint32_t)bios[addr & 0x0FFF] << D0_PIN;
+        SET_DATA_MODE_OUT;
+        for (uint32_t k = 0; k < 256; k++)
+          if ((gpio_get_all()&BUS_PIN_MASK) != addr) break;
+        SET_DATA_MODE_IN;
+        hsc_bios_reads++;
+      }
+    } else if ((addr & 0xF800) == 0x1000) {
+      // HSC NVRAM. $1000-$17FF is unmapped on a stock console, which is why the
+      // real cartridge uses it - console RAM starts at $1800.
+      //
+      // This is the only window in either sketch that is READ AND WRITTEN at
+      // the same addresses - every 2600 RAM scheme here has a separate write
+      // port - and that difference hid a defect until 0.61. A 6502 store
+      // through an index register (STA abs,X, STA (zp),Y) spends its
+      // penultimate cycle READING the effective address before writing it, and
+      // when the index does not carry, that read and the write share ONE
+      // address. Holding the drive "until the address changes" therefore sits
+      // on the bus across the whole write cycle, and the write is never seen.
+      // The HSC BIOS writes its game table ($1029,X / $106E,X / $10B3,X) and
+      // every score record (STA ($A6),Y) exactly that way, so nothing but plain
+      // STA abs - which has no such cycle - ever reached the save file. Read off
+      // the returned file: $10F8,X landed only at X=60..68, the range where
+      // $10F8+X carries into $11xx.
+      //
+      // The cure is the shape BANKSET_HOLD_WHILE_READ already proved on
+      // hardware: release on the address moving OR on R/W going low, then fall
+      // into the capture. R/W low is confirmed with a second sample for the
+      // reason recorded there - one spurious low must not drop the drive
+      // mid-fetch - and the wait stays bounded, as 0.55 made every wait here.
+      uint32_t wr = 1;                    // arrived as a write: capture it
+      if (gpio_get_all() & RW_PIN_MASK) {
+        sio_hw->gpio_out = (uint32_t)nv[addr & 0x07FF] << D0_PIN;
+        SET_DATA_MODE_OUT;
+        wr = 0;
+        for (uint32_t k = 0; k < 256; k++) {
+          const uint32_t h1 = gpio_get_all();
+          if ((h1 & BUS_PIN_MASK) != addr) break;
+          if (h1 & RW_PIN_MASK) continue;
+          const uint32_t h2 = gpio_get_all();
+          if ((h2 & BUS_PIN_MASK) != addr) break;
+          if (!(h2 & RW_PIN_MASK)) { wr = 1; break; }
+        }
+        SET_DATA_MODE_IN;
+        hsc_reads++;
+      }
+      if (wr) {
+        // End-of-cycle capture: the same bounded 64-turn scan this loop's POKEY
+        // variant uses. Keeps the LAST byte seen while the address is still
+        // valid, i.e. after the 6502 has driven it, instead of an early sample.
+        uint32_t last = gpio_get_all(), cur;
+        for (uint32_t g = 0; g < 64; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS_PIN_MASK) != addr) break;
+          last = cur;
+        }
+        nv[addr & 0x07FF] = (uint8_t)((last >> D0_PIN) & 0xFF);
+        // The only thing core 1 tells core 0. NOT a timestamp: time_us_32() may
+        // compile to a call into flash, and core 1 must never read flash.
+        hsc_writes++;
+      }
     }
   }
 }
@@ -3336,6 +3467,109 @@ void setup_pp() {
   }
 }
 
+
+////////////////////////////////////////////////////////////////////////////////////
+//                     FA2 flash transfer - TODO position 10
+////////////////////////////////////////////////////////////////////////////////////
+// The handshake is split across both cores because only core 1 can see the bus
+// and only core 0 can afford to stop for 50 ms.
+//
+//   core 1  sees the read of $1FF4, latches the operation code the game left in
+//           cartridge RAM byte 255, and raises bit 6 ("busy") in the byte it is
+//           about to serve. One store, because it has to land inside the 6507
+//           cycle that is reading it.
+//   core 0  is idle in loop() for the whole of an FA2 game - no POKEY, no YM, so
+//           it falls into the empty `continue` - and does the flash work there.
+//
+// The answer the game actually reads is NOT fa2_busy: it is bit 6 of the byte at
+// offset $FF4 of the ROM image, which the bus loop already serves through
+// bankPtr[addr & 0xFFF]. That is why the ROM-serving path gains nothing at all.
+// fa2_busy exists only so one request cannot be accepted twice.
+volatile uint8_t fa2_op = 0;    // 0 = idle, else RAM byte 255: 1 = load, 2 = save
+volatile uint8_t fa2_busy = 0;  // 1 from "core 1 accepted" to "core 0 finished"
+
+#ifndef FA2_DIAG_TIMING
+#define FA2_DIAG_TIMING 0
+#endif
+#if FA2_DIAG_TIMING
+// Puts the phase-0 measurement from TODO.md on the Atari screen, in place of the
+// version string in the menu footer: "E045P007 N03" reads as 45 ms to erase,
+// 7 ms to program, 3 commits so far - WORST times seen, not the last ones,
+// because the question being asked is whether the operation fits, not what it
+// usually costs. Exactly 12 characters, uppercase and digits only: the kernel
+// renders 12 per row and the font has no lowercase.
+static char fa2_footer_buf[16];
+static const char *fa2_timing_footer(void) {
+  uint32_t e = 0, p = 0;
+  uint16_t n = 0;
+  if (!nv_stat(NV_SLOT_FA2, &e, &p, &n)) return "FA2 NO SAVE ";
+  e /= 1000;
+  p /= 1000;
+  if (e > 999) e = 999;
+  if (p > 999) p = 999;
+  if (n > 99) n = 99;
+  snprintf(fa2_footer_buf, sizeof(fa2_footer_buf), "E%03luP%03lu N%02u",
+           (unsigned long)e, (unsigned long)p, (unsigned)n);
+  return fa2_footer_buf;
+}
+#endif
+
+// What the menu footer should say. There are TWO places that set it: loop() at
+// startup, and the directory listing, where it shares the slot with the "N OF M"
+// overflow message. A diagnostic build that patched only the first was wiped by
+// the first listing - i.e. before the Atari ever drew it - which is why 0.60's
+// -NVSF build came back from hardware still reading the version string. One
+// macro now feeds both sites, so a diagnostic footer cannot be half-applied.
+#if FA2_DIAG_TIMING
+#define MENU_FOOTER_NOW()  fa2_timing_footer()
+#elif NV_DIAG_FOOTER
+#define MENU_FOOTER_NOW()  nv_slots_footer()
+#else
+#define MENU_FOOTER_NOW()  MENU_FOOTER_TEXT
+#endif
+
+// Called from loop() on core 0, every pass, for every cart type. Returns after
+// one load and one branch unless an FA2 game has actually asked for something.
+void fa2_service(void) {
+  if (!fa2_busy) return;
+  const uint8_t op = fa2_op;
+
+  // Busy in EVERY bank, not just the one the game happened to be in when it
+  // asked. Core 1 can only afford the one store; this covers a bank switch
+  // during the transfer. Star Castle does not switch banks inside its wait loop
+  // - the loop is the same 30 instructions in bank 6 every time round - but the
+  // protocol does not forbid it.
+  for (int b = 0; b < 7; b++) rom_table[b * 4096 + 0xFF4] |= 0x40;
+
+  if (op == 1) {        // load
+    // A slot that was never written leaves the cartridge RAM as setup_fa2()
+    // cleared it. That is Stella's behaviour when the flash file is missing, and
+    // it is why nv_read_slot() refuses to hand back an unwritten slot instead of
+    // copying out 256 zeroes it never stored.
+    //
+    // Writing ram_table while core 1 serves reads from it is safe here for the
+    // same reason real hardware gets away with it: for the whole of the transfer
+    // the game sits in the wait loop and does not read cartridge RAM at all.
+    nv_read_slot(NV_SLOT_FA2, ram_table, NV_FA2_LEN);
+  } else if (op == 2) { // save
+    nv_write_slot(NV_SLOT_FA2, ram_table, NV_FA2_LEN);
+  }
+
+  // Order matters, and this is the whole of the exit protocol.
+  //   1. RAM byte 255 -> 0. Stella calls this "successful operation". It has to
+  //      go first because core 1 latches a new request the moment it sees that
+  //      byte non-zero with fa2_busy clear.
+  //   2. bit 6 -> 0 in all seven banks. This is the game's ONE exit from the
+  //      wait loop; there is no timeout behind it.
+  //   3. fa2_busy -> 0, last, so nothing can be latched before the answer is
+  //      fully in place.
+  ram_table[255] = 0;
+  for (int b = 0; b < 7; b++) rom_table[b * 4096 + 0xFF4] &= (uint8_t)~0x40;
+  __dmb();
+  fa2_op = 0;
+  fa2_busy = 0;
+}
+
 // FA2 (Harmony RAM+, 28K): $1FF4 is the cartridge's flash-transfer port. A read
 // returns the ROM byte at $FF4 of the current bank with bit 6 forced - SET while
 // a 256-byte load or save is in flight, CLEAR once it has finished. That is
@@ -3369,10 +3603,13 @@ void setup_pp() {
 // the marker string is unreadable as data on real hardware too, and the only
 // reader of $FF4 is this hotspot. Idempotent, unlike the swap in setup_pp().
 //
-// What this does NOT do: a save still goes nowhere - RAM byte 255 is written by
-// the game and never read back by it (verified across all 7 banks: no load of
-// $11FF through any mirror), so nothing notices, but the score does not persist.
-// That is TODO position 10.
+// Since 0.50 the transfer is real: fa2_service() on core 0 moves those 256 bytes
+// to and from flash, and bit 6 is raised for the duration instead of being
+// permanently low. Since 0.51 they land in /.save_fa2.data, a hidden 8 KB file
+// on the USB drive, so a table can be backed up or reset from a PC; the
+// reserved sector above the filesystem is the fallback (nvstore.h). The static clearing below stays,
+// and stays load-bearing: it is the READY state the image has to be in before
+// the first request, and the state core 0 restores after every one.
 void setup_fa2() {
   // Cartridge RAM starts cleared, as in Stella's initializeRAM(). ram_table is
   // shared with the SuperChip loops and is never cleared between loads; the game
@@ -3380,6 +3617,9 @@ void setup_fa2() {
   // before the two later ones, and "no saved table" has to read as empty rather
   // than as the previous title's leftovers.
   for (int i = 0; i < 256; i++) ram_table[i] = 0;
+  // Nothing may be left pending from a previous cart. Both cores read these.
+  fa2_op = 0;
+  fa2_busy = 0;
   // A hand-renamed .FA2 file of any other size is not this board.
   if (romLen != 28 * 1024) return;
   for (int b = 0; b < 7; b++) rom_table[b * 4096 + 0xFF4] &= (uint8_t)~0x40;
@@ -3653,9 +3893,12 @@ start:
 
     case CART_TYPE_NORMALA78:
       // POKEY carts get the listening variant; everything else keeps the plain,
-      // hardware-proven loop untouched.
-      if (POKEY_BUS_ON) emulate_normala78_pokey();
-      else               emulate_normala78();
+      // hardware-proven loop untouched. hsc_prepare() only ever raises
+      // hsc_enabled for a cart with NEITHER chip, so this order is exclusive by
+      // construction, not by luck.
+      if (hsc_enabled)       emulate_normala78_hsc();
+      else if (POKEY_BUS_ON) emulate_normala78_pokey();
+      else                   emulate_normala78();
     break;
 
     case CART_TYPE_ABSOLUTE:
@@ -4738,8 +4981,32 @@ start:
 		    // got a stable address
 		  if (addr & 0x1000)
 		  { // A12 high
-			  if ((addr >= 0x1FF5) && (addr <= 0x1FFB))	// bank-switch
-				  bankPtr = &rom_table[(addr-0x1FF5)*4*1024];
+			  if ((addr >= 0x1FF4) && (addr <= 0x1FFB))	// bank-switch + flash port
+			  {
+				  if (addr == 0x1FF4)
+				  {	// FA2 flash-transfer port. Latch what the game left in RAM byte 255
+					// and raise bit 6 in the byte THIS SAME ACCESS is about to be served
+					// from - one store, because it has to land inside the 6507 cycle
+					// doing the read. Core 0 does everything else, including the other
+					// six banks. The read itself still falls through to "normal rom
+					// access" below, so the ROM-serving path gains NOTHING: the only
+					// change to the address decode is the constant 0x1FF5 -> 0x1FF4.
+					// Order is load-bearing and NOT left to the compiler. The image patch is
+					// written through a volatile lvalue so it cannot sink below the two
+					// volatile stores: core 0 starts the moment it sees fa2_busy, and if it
+					// got as far as clearing bit 6 before we set it, we would set it again
+					// after the only agent that ever clears it had finished - and the game's
+					// wait loop has no timeout to rescue it from that. GCC did exactly this
+					// reordering when the patch was a plain store.
+					  if (!fa2_busy && ram_table[255]) {
+						  *(volatile uint8_t *)&bankPtr[0xFF4] |= 0x40;
+						  fa2_op = ram_table[255];
+						  fa2_busy = 1;
+					  }
+				  }
+				  else
+					  bankPtr = &rom_table[(addr-0x1FF5)*4*1024];
+			  }
 
 			  if ((addr & 0x1F00) == 0x1100)
 			  {	// a read from cartridge ram
@@ -5332,6 +5599,10 @@ int identify_cartridge(char *filename)
   // so only the LAST identify before newgame can matter - but there is no reason
   // to add a second one.)
   ym_enabled = 0;
+  // Header byte 58 is the save-device field; nothing read it before 0.52. Cleared
+  // here for the same reason as ym_enabled - a 2600 file must not inherit the
+  // previous 7800 cart's declaration.
+  a78_save_dev = 0;
 	Serial.print("Identify:");Serial.println(filename);
   
   if (!(file.open(filename))) Serial.println("Open error");
@@ -5420,6 +5691,11 @@ int identify_cartridge(char *filename)
         image_size |= A78_HEADER[51] << 8;
         image_size |= A78_HEADER[52];
         romLen=image_size;
+        // 0x01 = High Score Cart, 0x03 = HSC + SaveKey, 0x02 = SaveKey only.
+        // hsc_prepare() tests those values rather than "& 0x01", because 0x9D
+        // and 0xFF - garbage in 8 headers - also have bit 0 set.
+        a78_save_dev = (uint8_t)A78_HEADER[58];
+        Serial.print("58:");Serial.println(A78_HEADER[58],DEC);
         Serial.print("53:");Serial.println(A78_HEADER[53],DEC);
         Serial.print("54:");Serial.println(A78_HEADER[54],DEC);
         
@@ -6080,6 +6356,12 @@ void LoadGame(int numfile) {
    //Serial.print("Ovrclk ret:");Serial.println(ret);
    // set_sys_clock_pll(1200000000, 4, 1);
    
+    // Everything the High Score Cart needs, settled BEFORE newgame: the BIOS is
+    // read off the drive and the saved table is pulled out of flash, both pure
+    // reads, both on core 0 while core 1 is still serving the menu. Nothing here
+    // creates or writes a file, so core 1 is never parked.
+    hsc_prepare(cart_to_emulate);
+
     Serial.println("----------------------------------");
     Serial.print("Cart type:");Serial.println(cart_to_emulate);
     Serial.println("----------------------------------");
@@ -6170,6 +6452,44 @@ void renderEntry(int idx, int off) {
   }
 }
 
+// Is this a file the firmware owns rather than a game? Two rules, both applying
+// to the ROOT directory only:
+//
+//   *.data starting with '.'   the save slots nvstore.h creates
+//                              (/.save_fa2.data, /.save_hsc.data)
+//   HSC.ROM                    the High Score Cart BIOS (hsc.h). It is a plain
+//                              4096-byte .ROM the user copies over from a PC, so
+//                              it cannot be hidden by attribute, and without this
+//                              the menu would offer it as a 4K 2600 game.
+//
+// The save files already carry the HIDDEN attribute and the sweep below drops
+// hidden entries anyway, so the first rule looks redundant. It is not: the
+// attribute belongs to whatever wrote the file last, and a user who backs one up
+// on a PC and copies it back gets it back VISIBLE. The name is ours, so match on
+// the name too.
+//
+// Root only, so a ROM folder that happens to hold a ".something.data" file - or
+// its own HSC.ROM - is left alone.
+//
+// A name too long for the buffer cannot be one of ours (the longest is 15
+// characters), so getName() failing is simply "no".
+static bool is_firmware_own_file(FatFile *f) {
+  char n[32];
+  if (!f->getName(n, sizeof(n))) return false;
+  size_t len = strlen(n);
+  if (len == 7 &&
+      (n[0] == 'h' || n[0] == 'H') && (n[1] == 's' || n[1] == 'S') &&
+      (n[2] == 'c' || n[2] == 'C') && n[3] == '.' &&
+      (n[4] == 'r' || n[4] == 'R') && (n[5] == 'o' || n[5] == 'O') &&
+      (n[6] == 'm' || n[6] == 'M')) return true;
+  if (n[0] != '.') return false;
+  if (len < 5) return false;
+  const char *t = n + len - 5;
+  return t[0] == '.' &&
+         (t[1] == 'd' || t[1] == 'D') && (t[2] == 'a' || t[2] == 'A') &&
+         (t[3] == 't' || t[3] == 'T') && (t[4] == 'a' || t[4] == 'A');
+}
+
 void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
   int contfile=0;
   char filename[MAX_NAME_LEN];
@@ -6210,6 +6530,10 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
         while (file.openNext(&root, O_RDONLY) ) {
           bool isdir = file.isDir();
           if (file.isHidden() || (isdir?1:0)!=wantdir) { // wrong kind for this sweep
+            file.close();
+            continue;
+          }
+          if (!isdir && root.isRoot() && is_firmware_own_file(&file)) { // ours, not a game
             file.close();
             continue;
           }
@@ -6266,7 +6590,7 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
           Serial.print("WARNING: directory holds ");Serial.print(found);
           Serial.print(" entries, only ");Serial.print(shown);Serial.println(" fit in the menu");
         } else {
-          snprintf(msg, sizeof(msg), "%-12.12s", MENU_FOOTER_TEXT);
+          snprintf(msg, sizeof(msg), "%-12.12s", MENU_FOOTER_NOW());
         }
         set_menu_status_msg(msg);
       }
@@ -6335,6 +6659,11 @@ void setup() {
   {
     Serial.println("Failed to init files system, flash may not be formatted");
   }
+
+  // Which side are we plugged into? nvstore may only create its save files when
+  // there is no Atari to starve of bus cycles - see nvstore.h.
+  connected_to_pc = !carton;
+
 if (!carton) {
   Serial.println("Connected to PC");
   Serial.print("JEDEC ID: 0x"); Serial.println(flash.getJEDECID(), HEX);
@@ -6363,13 +6692,20 @@ void loop()
       while(1);
     }
 
+    // Resolve /.save_fa2.data and /.save_hsc.data once, here: core 0, before any
+    // game can be selected. Creating a file writes flash through the Adafruit
+    // driver, which parks core 1, so that half only happens with no Atari
+    // attached; opening and validating is pure reads and always happens.
+    nv_init(connected_to_pc);
+    hsc_log_slots();   // HSC_DIAG_PROBE only; compiles to nothing otherwise
+
     Serial.println("Flash contents:");
 
     // Open next file in root.
     // Warning, openNext starts at the current directory position
     // so a rewind of the directory may be required.
     
-     set_menu_status_msg(MENU_FOOTER_TEXT);
+     set_menu_status_msg(MENU_FOOTER_NOW());
      menu_status[12] = OVERSIZED_COLOUR; // read by the menu kernel for oversized entries
    	 set_menu_status_byte(0);
 
@@ -6396,6 +6732,15 @@ void loop()
 #if !POKEY_DIAG_E4
      if (pokey_enabled) pokey_run();   // never returns
 #endif
+     // FA2 is the one cart type that gives core 0 work AFTER the game has
+     // started, and it gets it precisely because it has neither chip: the two
+     // calls above never return, so anything with a POKEY or a YM can never
+     // reach this line - and a flash write would have had nowhere to run. Costs
+     // one load and one branch per pass of an otherwise empty loop.
+     fa2_service();
+     // Same idea, same reason it is reachable here: the High Score Cart commits
+     // its 2 KB once the NVRAM window has been quiet for a quarter of a second.
+     hsc_service();
      // E4 DIAGNOSTIC BUILD (pokey.h): with pokey_run() skipped, core 0 falls
      // straight through to the continue below and spins here for the rest of
      // the game - which is EXACTLY what it does for a cart with no POKEY, i.e.
