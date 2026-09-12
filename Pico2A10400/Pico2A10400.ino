@@ -187,6 +187,9 @@ bool fs_changed;
 #include "ym2151.h"  // YM2151 (OPM) FM synthesis, same audio pin. Included
                      // BEFORE pokey.h, because pokey_window_service() hands
                      // the $04xx window over to it for a YM cart.
+#include "sn76489.h" // SN76489 on the same pin, for the SN/Eagle (.s78) carts.
+                     // Model ported from the Go one written for our copy of
+                     // test7800 and verified there - TEST_ROMS_SN/README.md.
 #include "pokey.h"   // minimal POKEY audio - see the header for why this board
                      // has no audio line routed to the Pico at all.
 
@@ -265,6 +268,21 @@ bool fs_changed;
 // accident and can never reach bank 1, which is why the file boots today and
 // still plays wrong. Another 2600 type numbered above the 7800 block, so it
 // has to be named in the is2600 test in setup1() exactly like UA and FC.
+// SN - the SN/Eagle board (.s78), the one with the SN76489 at $043F. A 7800
+// type, so it must stay ABOVE 32 for the is2600 test in setup1(). Seven 4K
+// windows from $8000 to $EFFF, each with its own bank register at its own
+// base, plus a fixed bank 7 at $F000 and cartridge RAM at $4000-$7FFF.
+//
+// The image has NO a78 header - test7800 hands the whole file to the mapper
+// from byte 0 - so the type is chosen by extension, exactly the way test7800
+// requires an explicit "-mapper SN".
+//
+// Semantics follow Ocelot, the emulator written by Eagle himself, NOT the
+// older reading in test7800's sn.go: $B000 selects a bank like every other
+// window, the bank number is the whole byte, and a bank past the end of the
+// image is ignored rather than wrapped. Our own SN_BANK_TEST.s78 is what
+// caught the difference; see TODO.md SS8.
+#define CART_TYPE_SN	51	// SN/Eagle .s78, 7x4K banked + SN76489
 #define CART_TYPE_JANE	50	// 16K, hotspots $1FF0/$1FF1/$1FF8/$1FF9
 
 // CCM_RAM/CCM_SIZE/RAM_BANKS/CCM_BANKS/MAX_RAM_BANK/MAX_CCM_BANK removed
@@ -347,6 +365,10 @@ const EXT_TO_CART_TYPE_MAP ext_to_cart_type_map[] = {
 	// compared, so this entry is "0FA".
   {"0FA", CART_TYPE_UA},
   {"A78", CART_TYPE_A78},
+  // The SN/Eagle image carries no header of any kind, so the extension is the
+  // only thing that can select it. test7800 is in the same position and
+  // solves it the same way, by refusing to guess and requiring "-mapper SN".
+  {"S78", CART_TYPE_SN},
 	{0,0}
 };
 
@@ -1739,6 +1761,214 @@ void __time_critical_func(emulate_mram()) {
         }
     } else if (rom_in_use) {                // below $4000, or the gap under a 16K ROM
         SET_DATA_MODE_IN; rom_in_use = 0;
+    }
+  }
+}
+
+// SN/Eagle board (.s78) - the family icebloxplus belongs to, and the only one
+// in this firmware that carries an SN76489.
+//
+// Address map, from Ocelot (the emulator written by Eagle, the mapper's own
+// author) rather than from test7800's sn.go, which reads the board
+// differently in three places - see TODO.md SS8:
+//
+//   $043F        SN76489 write latch, one byte, write only
+//   $4000-$7FFF  cartridge RAM, 16K at a time
+//   $8000-$EFFF  seven 4K windows, each with its own bank register at its
+//                own base ($8000 selects for $8000, $9000 for $9000, ...)
+//   $F000-$FFFF  fixed, always bank 7 - this is where the 6502 vectors live
+//   $FFFF        control register (write); reads still return bank 7's byte
+//
+// Three details that are easy to get wrong, all of them settled by reading
+// Ocelot's source and confirmed by our own SN_BANK_TEST.s78:
+//
+//   * $B000 is NOT special. It selects a bank exactly like the other six.
+//   * the bank number is the WHOLE byte, not six or seven bits of it.
+//   * a bank past the end of the image is IGNORED, not wrapped.
+//
+// NOT implemented, deliberately: $FFFF values from $20 up (SN2's second pair
+// of RAM banks, MIX, HIGH RAM). Those need another 32K of cartridge RAM,
+// which is what makes Eagle impossible on the RP2040 sibling of this board -
+// and keeping the two sketches identical in behaviour is worth more than a
+// feature no file we can test uses. A write of $08 or more leaves the RAM
+// window alone rather than doing something half-right.
+//
+// THIS BOARD IS NOT THE RP2040 ONE. A15 is gpio 26 and lives OUTSIDE
+// BUS_PIN_MASK, so 'addr' here holds A0-A14 only and every A15 test has to
+// go through rawaddr. That is the difference that made a loop silently lose
+// A15 in 0.55. It makes the window arithmetic simpler rather than harder:
+// with A15 already stripped, addr IS the offset into the top 32K, so the
+// window number is just addr >> 12 and bank 7 is window 7.
+__attribute__((optimize("O2")))
+void __time_critical_func(emulate_sn()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+
+  // Seven byte offsets into rom_table, one per window, identity-mapped at
+  // power up - which is what makes the vectors in bank 7 work before the
+  // cartridge has switched anything. An automatic array, so it lives in SRAM:
+  // a static const table would land in .rodata, i.e. flash, on core 1's hot
+  // path - the trap CLAUDE.md records from 0.47.
+  uint32_t bank_off[7];
+  for (uint32_t i = 0; i < 7; i++) bank_off[i] = i << 12;
+
+  const uint32_t fixed_off = 7u << 12;
+  const uint32_t nbanks    = (uint32_t)romLen >> 12;
+
+  // ram_table is 32K, i.e. the two 16K banks an SN board has. ram_and folds
+  // the A8/A9 mirroring into the index mask: $FFFF bit 1 drops A8, bit 2 A9.
+  uint32_t ram_sel = 0;
+  uint32_t ram_and = 0x3FFFu;
+
+  uint32_t addr, rawaddr;
+  uint8_t  rom_in_use = 0;
+#if SN_DIAG
+  uint32_t snd_prev = 0xFFFFFFFFu;
+#endif
+
+  while (1) {
+    rawaddr = gpio_get_all();
+    addr = rawaddr & BUS_PIN_MASK;          // A0-A14 only on this board
+#if SN_DIAG
+    // A15 is outside BUS_PIN_MASK here, so the edge has to include it
+    const uint32_t snd_edge = ((rawaddr & BUS15_PIN_MASK) != snd_prev);
+    snd_prev = rawaddr & BUS15_PIN_MASK;
+#endif
+
+    if (rawaddr & A15_PIN_MASK) {           // $8000-$FFFF
+      uint32_t slot = addr >> 12;           // 0..6 are windows, 7 is fixed
+      if (slot == 7u) {
+        sio_hw->gpio_out = (uint32_t)rom_table[fixed_off + (addr & 0x0FFFu)] << D0_PIN;
+        if (rawaddr & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+#if SN_DIAG
+          // AFTER the byte is on the bus, so the answer itself is not delayed
+          snd_count_fixed_read(addr & 0x0FFFu, snd_edge);
+#endif
+        } else {
+          if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+          if (addr == 0x7FFFu) {            // $FFFF - control register
+            // End-of-cycle capture. Compared against BUS15_PIN_MASK, not
+            // BUS_PIN_MASK, so a change in A15 also ends the cycle.
+            uint32_t last = gpio_get_all(), cur;
+            uint32_t full = last & BUS15_PIN_MASK;
+            for (uint32_t g = 0; g < 64; g++) {
+              cur = gpio_get_all();
+              if ((cur & BUS15_PIN_MASK) != full) break;
+              last = cur;
+            }
+            uint32_t d = (last >> D0_PIN) & 0xFFu;
+#if SN_DIAG
+            snd_count_ctrl();
+#endif
+            if (d <= 0x07u) {
+              ram_sel = (d & 0x01u) ? 0x4000u : 0u;
+              uint32_t m = 0x3FFFu;
+              if (d & 0x02u) m &= ~0x0100u;   // mirror A8
+              if (d & 0x04u) m &= ~0x0200u;   // mirror A9
+              ram_and = m;
+            }
+            // d >= 0x08: SN2 / MIX / HIGH RAM, not implemented - see above
+          }
+        }
+      } else {
+        sio_hw->gpio_out = (uint32_t)rom_table[bank_off[slot] + (addr & 0x0FFFu)] << D0_PIN;
+        if (rawaddr & RW_PIN_MASK) {
+          if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+        } else {
+          if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+          uint32_t last = gpio_get_all(), cur;
+          uint32_t full = last & BUS15_PIN_MASK;
+          for (uint32_t g = 0; g < 64; g++) {
+            cur = gpio_get_all();
+            if ((cur & BUS15_PIN_MASK) != full) break;
+            last = cur;
+          }
+          uint32_t b = (last >> D0_PIN) & 0xFFu;
+#if SN_DIAG
+          snd_log_bankw(rawaddr, last);
+#endif
+          if (b < nbanks) bank_off[slot] = b << 12;   // else: leave it alone
+        }
+      }
+    } else if (addr & A14_PIN_MASK) {        // $4000-$7FFF cartridge RAM
+      uint32_t idx = ram_sel + (addr & ram_and);
+      if (rawaddr & RW_PIN_MASK) {
+        sio_hw->gpio_out = (uint32_t)ram_table[idx] << D0_PIN;
+        if (!rom_in_use) { SET_DATA_MODE_OUT; rom_in_use = 1; }
+      } else {
+        if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+        uint32_t last = gpio_get_all(), cur;
+        uint32_t full = last & BUS15_PIN_MASK;
+        for (uint32_t g = 0; g < 64; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS15_PIN_MASK) != full) break;
+          last = cur;
+        }
+        ram_table[idx] = (uint8_t)((last >> D0_PIN) & 0xFFu);
+#if SN_DIAG
+        snd_count_ramw();
+#endif
+      }
+    } else {                                 // below $4000
+      if (rom_in_use) { SET_DATA_MODE_IN; rom_in_use = 0; }
+      if (addr == SN76489_BASE) {
+        // LISTEN ONLY - the chip has no data output, so nothing is driven.
+        // Exactly ONE clean byte per write, and this path is the only one in
+        // the file that needs that guarantee. On real hardware the address
+        // can wobble off $043F for a single sample while it settles - the same
+        // class of fault POKEY_DIAG_E12 chased. The old loop broke out on that
+        // one sample, captured the data bus in the FIRST half of the cycle,
+        // before the 6502 drives it (floating, usually $FF), and then caught
+        // the cycle a second time once the address came back.
+        //
+        // Every other window here survives that, because it is last-write-
+        // wins: a POKEY register, a RAM byte or a bank register simply gets
+        // the right value on the second capture. The SN76489 does not. It is
+        // a single latch driven by a state machine, and a stray $FF is a
+        // LATCH byte for register 7 - so the real DATA byte that followed went
+        // to the noise attenuation instead of the tone period's high bits.
+        // Only the low four bits of each period ever changed, which made
+        // 800, 700, 600... come out as 800, 812, 808...: on hardware, "the
+        // same tone over and over". No emulator can show this, since none of
+        // them model the bus settling.
+        //
+        // So: the address has to be gone for TWO consecutive samples before
+        // the cycle counts as over, and the byte is only taken if the last
+        // in-window sample was a write. Gating on R/W here is not the Krok 18
+        // hazard - that was DRIVING the bus on the strength of R/W and then
+        // blocking. This path never drives; a misread R/W can at worst drop or
+        // accept one byte. Bounded at 256 for the same reason every wait in
+        // this file is bounded.
+        // Compared through BUS15_PIN_MASK so A15 (gpio 26 on this board)
+        // going high also ends the cycle.
+#if SN_DIAG
+        // The production scan below, unchanged, with the cycle recorded after
+        // the capture decision - so what is logged is what production does.
+        uint32_t full = rawaddr & BUS15_PIN_MASK;
+        uint32_t last = rawaddr, cur;
+        uint32_t miss = 0, g;
+        for (g = 0; g < 256; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS15_PIN_MASK) == full) { last = cur; miss = 0; }
+          else if (++miss >= 2) break;
+        }
+        const uint32_t is_w = (last & RW_PIN_MASK) ? 0u : 1u;
+        if (is_w)
+          sn76489_capture_write((uint8_t)((last >> D0_PIN) & 0xFFu));
+        snd_log_entry(rawaddr, last, (g << 16) | (miss << 8) | is_w);
+#else
+        uint32_t full = rawaddr & BUS15_PIN_MASK;
+        uint32_t last = rawaddr, cur;
+        uint32_t miss = 0;
+        for (uint32_t g = 0; g < 256; g++) {
+          cur = gpio_get_all();
+          if ((cur & BUS15_PIN_MASK) == full) { last = cur; miss = 0; }
+          else if (++miss >= 2) break;
+        }
+        if (!(last & RW_PIN_MASK))
+          sn76489_capture_write((uint8_t)((last >> D0_PIN) & 0xFFu));
+#endif
+      }
     }
   }
 }
@@ -3904,6 +4134,13 @@ start:
       emulate_mram();
     break;
 
+    case CART_TYPE_SN:
+      // One loop, no _pokey/_hsc variants: the SN76489 window is part of
+      // emulate_sn() itself, and an SN board has neither a POKEY nor a High
+      // Score Cart to declare - it has no header in which to declare them.
+      emulate_sn();
+    break;
+
     case CART_TYPE_VERSA:
       // Only "Mario Bros (Ice Stress Test)" (header 0x0062) takes the _pokey path
       // in this library; the other four VersaBoard files declare no POKEY.
@@ -5594,6 +5831,10 @@ int identify_cartridge(char *filename)
   // so only the LAST identify before newgame can matter - but there is no reason
   // to add a second one.)
   ym_enabled = 0;
+  // Cleared for exactly the reason ym_enabled is: a cart loaded after an SN
+  // one must not inherit its sound chip and hand core 0 to a synthesiser the
+  // game never asked for.
+  sn76489_enabled = 0;
   // Header byte 58 is the save-device field; nothing read it before 0.52. Cleared
   // here for the same reason as ym_enabled - a 2600 file must not inherit the
   // previous 7800 cart's declaration.
@@ -5652,6 +5893,19 @@ int identify_cartridge(char *filename)
           Serial.println("Loading header");
           isfor7800=1;
           for (int j=0;j<0x80;j++) A78_HEADER[j]=file.read();
+    }
+    // .s78 - SN/Eagle. No header to read: the image is banks from byte 0, so
+    // the loop below copies the file as it stands. The SN76489 comes with the
+    // board, so it is switched on here rather than read out of a header field
+    // - the a78 format has no bit for this chip at all.
+    if (cart_type == CART_TYPE_SN) {
+      isfor7800 = 1;
+      sn76489_enabled = 1;
+      Serial.println("SN/Eagle cart (.s78), SN76489 at $043F");
+      if ((image_size & 0x0FFF) != 0)
+        Serial.println("WARNING: .s78 size is not a multiple of 4096 - the last bank is short");
+      if (image_size < 0x8000)
+        Serial.println("WARNING: .s78 smaller than 32KB - there is no bank 7, so the 6502 vectors are missing");
     }
     if (image_size > sizeof(rom_table)) {
       // Truncate rather than refuse: the menu shows these entries in red, and loading
@@ -6706,6 +6960,10 @@ void loop()
      if (ym_enabled)    ym_run();      // never returns
 #if !POKEY_DIAG_E4
      if (pokey_enabled) pokey_run();   // never returns
+     // Same arrangement, same reason: an SN cart hands core 0 to synthesis
+     // and never takes it back. It cannot collide with the two above - a
+     // .s78 has no header, so it can declare neither a POKEY nor a YM.
+     if (sn76489_enabled) sn76489_run();   // never returns
 #endif
      // FA2 is the one cart type that gives core 0 work AFTER the game has
      // started, and it gets it precisely because it has neither chip: the two

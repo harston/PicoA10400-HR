@@ -49,6 +49,24 @@
   approximation, checked against it sample for sample. The dozen largest images are
   still over the 144KB limit and stay out of reach._
 
+- **SN cartridges run — Eagle's board and its SN76489 sound chip**
+  _Eagle's SN board is a 7800 cartridge with a sound chip of its own — Texas
+  Instruments' **SN76489**, three square-wave voices and a noise channel — and
+  its own bank switching: seven 4KB windows, a fixed bank for the vectors and two
+  banks of cartridge RAM. Its `.s78` files now load, bank and play. The chip is
+  emulated on the core that sits idle during a game and plays through the same
+  audio line as the POKEY, so it is heard on **PicoA10400** only. Both halves
+  follow Ocelot, the emulator written by the board's author — down to the clock
+  the chip runs at. Confirmed on a real console with two test programs, one for
+  the sound and one for every bank window._
+
+  _One thing from the four hardware rounds this took is worth writing down: a
+  cartridge started from this cart's menu begins in the console's **2600 mode**,
+  because the menu is a 2600 program and the game is entered without the BIOS.
+  Every real 7800 game switches the console into 7800 mode with its first
+  instructions, so games do not notice — but a home-made test ROM that skips
+  that step runs on every emulator and misbehaves only here._
+
 - **Carts that declare an extra chip now get their real mapper**
   _A cartridge announcing a POKEY or a YM2151 in its `.a78` header was read as a plain
   flat ROM whatever its actual bankswitching, which is why **Wonder Boy** and both
@@ -288,8 +306,8 @@ cartridge to run it, which is what a Harmony has and this board does not._
 
 _The audio line exists only on **PicoA10400** — the Pico 2 board uses the
 standard Raspberry Pi Pico footprint, where the cartridge bus consumes every
-available pin, so **Pico2A10400 stays silent** whether the cartridge asks for a POKEY
-or a YM2151. DPC music is the exception and plays on both boards, for the reason
+available pin, so **Pico2A10400 stays silent** whether the cartridge asks for a POKEY,
+a YM2151 or an SN76489. DPC music is the exception and plays on both boards, for the reason
 given above._
 
 _The DPC music generator is driven from a free-running clock rather than from the
