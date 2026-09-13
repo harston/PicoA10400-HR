@@ -67,6 +67,27 @@
   instructions, so games do not notice — but a home-made test ROM that skips
   that step runs on every emulator and misbehaves only here._
 
+- **The 7800 goes quiet — the cartridge audio line is no longer left floating**
+  _On an Atari 7800 the menu used to hum, and so did every game without a sound chip
+  of its own; on a 2600 there was silence. Pin 18 of the 7800 connector — the console's
+  audio input — runs straight to the Pico on this board, and the firmware had never
+  initialised that pin, so the console's audio input sat on a high-impedance track
+  running between two address lines and picked the bus up. It is now held at the level
+  a silent POKEY presents, from the moment the cartridge starts. The 2600 connector
+  carries no audio line, which is why that console was never affected. Confirmed on a
+  real console — and measured rather than guessed: a diagnostic build cycled the pin
+  through three idle states and named each one on screen, so a single flash decided
+  which one to keep. Sound from the console's own TIA is no quieter than before._
+
+- **YM2151 demos that showed a picture and played nothing**
+  _Eight of the forty-five YM2151 titles read the chip's address port before writing to
+  it, and waited for a "busy" flag to clear. That read returned $FF, where bit 7 means
+  busy, so the wait never ended and the 6502 stopped at the first register write — while
+  MARIA kept painting the title screen that was already up, which is why these looked
+  alive and silent rather than crashed. What sits at that address on an XM is a board,
+  not a bare chip, and its read side does not come back from the YM2151. Confirmed on a
+  real console, with titles that already worked kept as the control._
+
 - **Carts that declare an extra chip now get their real mapper**
   _A cartridge announcing a POKEY or a YM2151 in its `.a78` header was read as a plain
   flat ROM whatever its actual bankswitching, which is why **Wonder Boy** and both

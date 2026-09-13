@@ -184,6 +184,55 @@ bool fs_changed;
 #define BANKSET_HALT_ACTIVE_LOW 1
 #endif
 
+// --- 7800 audio line (connector pin 18, "AUD IN") ---------------------------
+// AUDIO_PIN_ROUTED says whether cartridge pin 18 physically reaches the Pico on
+// this board. Board fact, not a preference - the same discipline as
+// BANKSET_HAS_HALT:
+//
+//   PicoA10400  - U2 pin 18 -> net ExtAudio -> J2 pin 8 -> GPIO29, with zero
+//                 passive parts in between (pokey_feasibility/README.md).
+//                 MEASURED on the board 2026-09-12: GP29 <-> edge pin 18 reads
+//                 ~0 ohm, and GP29 shows no connection to any other pin of the
+//                 connector or of the Pico - so this clone carries no VSYS
+//                 divider on GP29 either, and the console's audio input is the
+//                 pin's only load.
+//   Pico2A10400 - the net is a single unconnected pad (patch 0.31); POKEY and
+//                 YM use GPIO25 there and nothing reaches the cartridge.
+//
+// AUDIO_IDLE_MODE is what that pin does while nothing synthesises on it - the
+// menu, and every cart without a POKEY/YM/SN. Until now the answer was "it is
+// never initialised at all": ALL_GPIO_MASK is GPIO0-28, so GPIO29 keeps its
+// RP2040 reset configuration (function NULL, input, ~50-80k pull-down) and the
+// console's audio input sits on a high-impedance trace that runs between A15
+// (pin 17) and A7 (pin 19) on the connector. That is the suspected source of
+// the hum heard in the menu on a 7800 - MENU_FIX.md 2, TODO.md 9. Upstream's
+// firmware has the identical mask (2496e3f:PicoA10400/PicoA10400.ino line 109),
+// which fits the report that the hum predates POKEY support.
+//
+//   0  leave the pin exactly as every build before 0.66 left it
+//   1  drive it low - the level a silent POKEY/SN presents (production)
+//   2  PWM at mid rail - the level ym2151.h calls silence
+//   3  DIAGNOSTIC: rotate 0 -> 1 -> 2 every AUDX_PHASE_MS while the menu runs,
+//      naming the phase in the footer, so ONE flash answers which state is
+//      silent instead of three (build.sh <Sketch>-AUDX).
+//
+// SETTLED ON HARDWARE 2026-09-12 with the _AUDX build, on a 7800 in the menu:
+// phase AUD0 (the pin as every build so far left it) HUMS, AUD1 (driven low)
+// and AUD2 (mid rail) are BOTH SILENT. So it is the floating input, not noise
+// conducted through the supply or the bus - H1, and H3 would have survived all
+// three phases. Mode 1 is the default because both cures work and low is the
+// level POKEY and SN already present when they have nothing to play, so a cart
+// that starts synthesising does not step the line.
+#ifndef AUDIO_PIN_ROUTED
+#define AUDIO_PIN_ROUTED 0
+#endif
+#ifndef AUDIO_IDLE_MODE
+#define AUDIO_IDLE_MODE 1
+#endif
+#ifndef AUDX_PHASE_MS
+#define AUDX_PHASE_MS 4000
+#endif
+
 #include "ym2151.h"  // YM2151 (OPM) FM synthesis, same audio pin. Included
                      // BEFORE pokey.h, because pokey_window_service() hands
                      // the $04xx window over to it for a YM cart.
@@ -196,6 +245,41 @@ bool fs_changed;
 
 #define SET_LED_ON    	gpio_init(25);gpio_set_dir(25,GPIO_OUT);gpio_put(25,true);
 #define SET_LED_OFF    	gpio_init(25);gpio_set_dir(25,GPIO_OUT);gpio_put(25,false);
+
+#if AUDIO_PIN_ROUTED && AUDIO_IDLE_MODE
+// Put the cartridge audio line into one of the three idle states described at
+// AUDIO_IDLE_MODE. Compiled in only when a non-zero mode asked for it, so a
+// production build (mode 0) does not contain this function at all - the reason
+// the production .uf2 is byte-identical with these macros in the tree.
+//
+// Phase 0 restores the pin to what every build so far has left it as: no
+// peripheral function, input, pull-down - the RP2040 reset state, which is
+// what "never initialised" means in practice. It matters that this is exact,
+// because phase 0 is the control the other two are judged against.
+static void audio_idle_apply(uint8_t phase) {
+  switch (phase) {
+    case 1:   // driven low: what a silent POKEY or SN presents to the console
+      gpio_init(POKEY_AUDIO_PIN);
+      gpio_set_dir(POKEY_AUDIO_PIN, GPIO_OUT);
+      gpio_put(POKEY_AUDIO_PIN, 0);
+      break;
+    case 2: {  // mid rail: what ym2151.h calls silence. Same slice and wrap the
+               // audio path uses in a game, so this is that path minus samples.
+      gpio_set_function(POKEY_AUDIO_PIN, GPIO_FUNC_PWM);
+      uint slice = pwm_gpio_to_slice_num(POKEY_AUDIO_PIN);
+      pwm_config cfg = pwm_get_default_config();
+      pwm_config_set_wrap(&cfg, POKEY_PWM_WRAP);
+      pwm_init(slice, &cfg, true);
+      pwm_set_gpio_level(POKEY_AUDIO_PIN, (POKEY_PWM_WRAP + 1) / 2);
+      break;
+    }
+    default:  // 0: back to the reset state = today's production behaviour
+      gpio_set_function(POKEY_AUDIO_PIN, GPIO_FUNC_NULL);
+      gpio_set_pulls(POKEY_AUDIO_PIN, false, true);
+      break;
+  }
+}
+#endif
 
 
 
@@ -3909,6 +3993,18 @@ void __time_critical_func(setup1()) {   //HandleBUS()
       gpio_set_drive_strength(gp, BUS_DRIVE_STRENGTH);
       gpio_set_slew_rate(gp, GPIO_SLEW_RATE_SLOW);
     }
+#if AUDIO_PIN_ROUTED && (AUDIO_IDLE_MODE == 1 || AUDIO_IDLE_MODE == 2)
+    // The console's audio input must not be left sitting on a high-impedance
+    // trace that runs between A15 and A7 on the connector - see AUDIO_IDLE_MODE
+    // above. Later gpio_set_function(..., GPIO_FUNC_PWM) in pokey_audio_init()
+    // and friends takes the pin over for a cart that actually synthesises, so
+    // this only ever decides the IDLE state.
+    //
+    // Mode 3 is deliberately absent here: the rotating diagnostic is driven
+    // from core 0's menu loop, which leaves core 1's initialisation - and with
+    // it every emulate_* loop - byte-identical to production.
+    audio_idle_apply(AUDIO_IDLE_MODE);
+#endif
 
 // We require the menu to do a write to $1FF4 to unlock the comms area.
 // This is because the 7800 bios accesses this area on console startup, and we wish to ignore these
@@ -7022,6 +7118,35 @@ void loop()
      }
    }
 
+#if AUDIO_PIN_ROUTED && (AUDIO_IDLE_MODE == 3)
+   // _AUDX diagnostic (MENU_FIX.md 2.5, TODO.md 9). Rotate the idle state of
+   // the cartridge audio line every AUDX_PHASE_MS and name the phase in the
+   // 12-character footer, so ONE flash says which state silences the hum
+   // instead of three separate ones - hardware rounds are the expensive
+   // resource here, not builds.
+   //
+   // Core 1 is not involved: GPIO29 sits outside ALL_GPIO_MASK, so no bus loop
+   // reads or writes it, and gpio_put()/gpio_set_function() touch this one pad.
+   // Reached only while the MENU is running - a started cart takes the
+   // "if (newgame)" branch above and never comes back here.
+   {
+     static uint32_t audx_last  = 0;
+     static uint8_t  audx_phase = 0;
+     static bool     audx_begun = false;
+     if (!audx_begun) { audx_begun = true; audx_last = millis(); audio_idle_apply(0); }
+     if (millis() - audx_last > AUDX_PHASE_MS) {
+       audx_last  = millis();
+       audx_phase = (uint8_t)((audx_phase + 1) % 3);
+       audio_idle_apply(audx_phase);
+     }
+     // Rewritten on every pass, not only on a phase change: rebuilding a
+     // directory listing rewrites the footer (AtariMenu()), and the phase has
+     // to come straight back. Exactly 12 characters each, per CLAUDE.md.
+     set_menu_status_msg(audx_phase == 0 ? "AUD0 INPUT  "
+                       : audx_phase == 1 ? "AUD1 LOW    "
+                                         : "AUD2 PWM MID");
+   }
+#endif
    if (cmd_exec!=0) {
     Serial.print("GC:");Serial.println(gamechoosen);
     delay(500);

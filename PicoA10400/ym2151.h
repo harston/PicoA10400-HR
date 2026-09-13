@@ -125,11 +125,38 @@ void ym_bus_write(uint32_t addr, uint8_t data) {
   }
 }
 
-// A0=0 reads 0xFF on a real chip (MAME ym2151.cpp:1683 "confirmed on a real
-// YM2151"); A0=1 reads the status register.
+// A0=1 reads the status register. A0=0 reads ZERO - not the 0xFF a bare YM2151
+// gives (MAME ym2151.cpp:1683, "confirmed on a real YM2151"), because what sits
+// at $0460 here is a BOARD, not a chip on a bench.
+//
+// 0xFF HUNG EIGHT FILES, and the shape of the hang is the reason this is not a
+// judgement call (Silent Colony, $7363):
+//
+//     LDA $46          ; register number
+//     BIT $0460        ; read back BEFORE writing the register select
+//     BMI *-3          ; ...and wait WHILE bit 7 is set
+//     STA $0460
+//
+// With 0xFF bit 7 is never clear, so the 6502 spins there forever on its first
+// register write. MARIA keeps painting the display list that is already up, so
+// the console shows the title screen and plays nothing - exactly what came back
+// from hardware on 2026-09-12. Measured over the library: of the 45 files
+// declaring a YM2151, EIGHT poll "BIT $0460 / BMI" this way (the seven other
+// Eagle demos plus Shinobi), 32 poll $0461 the same way and 5 read $0461 with
+// LDA. Nothing waits FOR bit 7 to appear: the one "BIT $0460 / BPL" in the
+// library is a forward branch inside Shinobi's data, not a loop.
+//
+// JS7800 arrived at the same value and left the reason in a comment
+// (ORIG/JS7800/src/js/prosystem/Xm.js, xm_Read):
+//
+//     b = address & 1 ? YM.getStatus() : 0; // 0xFF? Breaks some demos... hmm...
+//
+// which is independent confirmation from a reference emulator: the read side of
+// $0460 on an XM does not come back from the chip. On real hardware these demos
+// work, so whatever the board returns there has bit 7 clear.
 static inline __attribute__((always_inline))
 uint8_t ym_bus_read(uint32_t addr) {
-  return (addr & 1) ? (uint8_t)ym_status : 0xFF;
+  return (addr & 1) ? (uint8_t)ym_status : 0x00;
 }
 
 #ifndef YM_HOST_TEST

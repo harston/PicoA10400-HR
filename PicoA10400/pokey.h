@@ -288,6 +288,14 @@
 //   LZSS and R-Type are SuperGame carts, so neither E6 nor E7 touches them:
 //   they are the built-in negative control and MUST look exactly as today.
 //
+//
+//   NOTE after 0.66: E3's premise was "the pin is left the plain input a
+//   non-POKEY cart leaves it". That is no longer the idle state - setup1() now
+//   holds the line LOW (AUDIO_IDLE_MODE in the .ino), because leaving it
+//   floating is what hummed on a 7800. An E3 build today therefore means
+//   "synthesis runs, pin held at the silent level", which is still a silent
+//   pin and still removes the audio signal from the picture. To reproduce the
+//   ORIGINAL E3 exactly, add -DAUDIO_IDLE_MODE=0 to that build.
 // Build with ./build.sh PicoA10400-E3 (or -E4 / -E5).
 #ifndef POKEY_DIAG_E3
 #define POKEY_DIAG_E3 0

@@ -31,8 +31,12 @@
 #define SN76489_BASE   0x043Fu
 
 // Shares the audio pin and carrier with POKEY: one line to the console, one
-// cart playing at a time. GPIO29 -> 7800 connector pin 18 ("AUD IN").
-#define SN_AUDIO_PIN   29
+// cart playing at a time. On THIS board that is GPIO25, the on-board LED, and
+// connector pin 18 is not routed to the Pico at all (patch 0.31) - the same
+// pin POKEY and YM use here. Was 29 until 0.66: copied over from PicoA10400,
+// where 29 IS the audio line. Nothing could be heard either way, but 29 on a
+// genuine Pico 2 is the VSYS sense divider, which is not ours to drive.
+#define SN_AUDIO_PIN   25
 #define SN_PWM_WRAP    511          // 9-bit, carrier = clk_sys / 512
 
 // The clock the cartridge feeds the chip: the 6502's own, ~1.79MHz. Taken
