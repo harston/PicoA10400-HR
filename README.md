@@ -283,8 +283,9 @@
 
 - **Easier browsing**
   - _The listing is sorted: directories first, then alphabetically._
-  - _The PAL menu shows **ten entries per page instead of nine**, in the same screen
-    area: each row is now drawn in fewer scanlines. The NTSC menu is unchanged._
+  - _The menu shows more entries per page in the same screen area — **ten instead of
+    nine** on PAL, **eight instead of seven** on NTSC — because each row is now drawn
+    in fewer scanlines._
   - _Subdirectories no longer vanish in folders holding hundreds of files._
   - _The full file name scrolls under the cursor, despite the 12-character row._
   - _Long ROM names display and load correctly — now up to 127 characters._
