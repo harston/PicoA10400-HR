@@ -281,15 +281,26 @@
   colour-marked in the listing, so you can just try them. False warnings for `.a78`
   files that fit exactly are gone too._
 
+- **A menu with room for the names: 32 characters per row instead of 12**
+  _The row is four times as wide as the one the original menu draws, so most titles
+  are simply readable instead of cut to a guess. A page holds nine entries and a
+  footer; the header shows the firmware version at the top level and the path below
+  it, the footer the page number and how much of the directory is on screen._
+
+  _Every row begins with a mark that says what the entry is — `/` a directory, `^` the
+  way up, `+` a file, `X` a file the cart cannot use. The mark is not part of the name:
+  it does not sort, does not scroll with it and cannot be truncated. It carries what
+  the colour carries, which is what matters on a monochrome set and over RF, where the
+  colour of a one-pixel-wide stroke does not survive._
+
+  _The kernel that draws it is PlusCart's (United Carts of Atari, GPL-3); its source,
+  and the proof that our copy differs from it by three bytes, are in `menu32_rom/`._
+
 - **Easier browsing**
   - _The listing is sorted: directories first, then alphabetically._
-  - _The menu shows more entries per page in the same screen area — **ten instead of
-    nine** on PAL, **eight instead of seven** on NTSC — because each row is now drawn
-    in fewer scanlines._
   - _Subdirectories no longer vanish in folders holding hundreds of files._
-  - _The full file name scrolls under the cursor, despite the 12-character row._
+  - _A name too long even for the wider row scrolls under the cursor._
   - _Long ROM names display and load correctly — now up to 127 characters._
-  - _When the listing does not fit, the footer shows how many entries you can see._
 
   _That last limit had been 79, and in a full library about one file in eight is longer
   than that. Every one of them was listed as a broken row: it sorted to the top, would
@@ -339,9 +350,10 @@ console's own cycles. Games where music is an accompaniment — Pitfall II among
 do not care. The few DPC **music demos**, which carry no graphics at all and tie their
 display to the music, can come up differently from one power-on to the next._
 
-_Tip: the menu background tells you which build is flashed — **blue is the PAL build,
-red is the NTSC one**. Handy, since a region mismatch is easy to create and looks like
-a fault._
+_Tip: the menu background tells you which build is flashed — the PAL build paints it
+**navy blue**, and the NTSC build's background byte means a different colour on a PAL
+set. Handy, since a region mismatch is easy to create and otherwise looks like a
+fault._
 
 # PicoA10400
 

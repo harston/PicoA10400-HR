@@ -547,6 +547,41 @@ char path[MAX_PATH_LEN];
  char filetoopen[MAX_PATH_LEN+MAX_NAME_LEN]; // was 50, which overflowed with long names or subdirectories; a too-short buffer here truncates the path and the file silently fails to open
  
 char menu_ram[1024];	// < NUM_DIR_ITEMS * 12 (85 max)
+
+// --- 32-column menu (TODO.md 11, MENU_UPGRADE.md section H) ------------------
+// MENU32 replaces the 12-column kernel with PlusCart's 32-column one (our
+// revision of it, menu32_rom/menu32_hr.asm) and builds the page here, in
+// rom_table, instead of filling menu_ram. Everything else - the directory
+// sweep, LoadGame(), the hand-off to a game - stays exactly as it is, which is
+// why this is a switch and not a rewrite: a build with MENU32 0 is the menu that
+// shipped in 0.69, byte for byte.
+// On since 0.70: the 32-column menu is what ships. It was round-tripped on the
+// console five times (readability of the typeface and density, then the footer,
+// the directory mark, the cursor colours and the busy mark), and the build with
+// MENU32 0 is still exactly the 12-column menu of 0.69 - one constant back, for
+// a build that has to be compared against the old one.
+#ifndef MENU32
+#define MENU32 1
+#endif
+#if MENU32
+#include "menu32.h"
+static menu32_page_map menu32_map;    // where each row's code sits, for the marquee
+static int menu32_page = 0;           // page on screen
+static int menu32_pages = 0;          // index of the last page
+// What the root directory shows instead of a bare "/". Exactly 32 characters,
+// the width of a row; the 12-character MENU_FOOTER_TEXT is the 12-column menu's.
+#define MENU32_VERSION_TEXT "Pico2A10400-HR v10  (AOTTA v1.0)"
+static char menu32_header_text[MENU32_COLS + 1];
+static char menu32_footer_text[MENU32_COLS + 1];
+// Core 1 -> core 0. The kernel writes a command byte to $1FE6 and reports the
+// highlighted row by reading $1FC0+row once per frame; menu32_parity is the
+// phase it drew last, which is the one that is safe to rewrite (the next frame
+// draws the other one).
+volatile int menu32_cmd = -1;
+volatile uint32_t menu32_cmd_seq = 0;
+volatile int menu32_cursor = -1;
+volatile int menu32_parity = 0;
+#endif
 char isfor7800=0;
 char is16k=0;
 int romsize;
@@ -4018,6 +4053,82 @@ newgame=0; // poi rimetti 1
     //comms_enabled=true; // poi via?
  //  set_menu_status_byte(0);
 start:
+#if MENU32
+  // --- 32-column menu -------------------------------------------------------
+  // The page the Atari runs is an F4 image in rom_table: bank 0 is the kernel,
+  // banks 1-6 are the page in the two frame phases. What this loop has to do on
+  // top of serving bytes:
+  //
+  //   $1FF4-$1FFB  select bank n - and banks 1 and 4 are where a frame's kernel
+  //                starts, which is how core 0 learns which phase is on screen
+  //                and therefore which copy of a row it may rewrite (marquee);
+  //   $1FE6        the kernel WRITES its command byte here. A 2600 cartridge
+  //                port has no R/W line, so the only way to read a write is to
+  //                leave the data lines alone and sample them while the address
+  //                is stable - the value that stands one sample before the
+  //                address changes is the one the CPU put there;
+  //   $1FC0+row    the cursor report our revision of the kernel adds;
+  //   $1FE7-$1FED  status bytes, and they live in bank 0 like the rest of the
+  //                comms area, so they are served from rom_table[] directly and
+  //                do not care which bank is selected.
+  //
+  // Bank switching stays OFF until the kernel has read $1FF4. On a 7800 the BIOS
+  // reads $FFF8/$FFF9 (the signature) before the cartridge runs at all, and
+  // those are two of the hotspots - switching there would hand the BIOS the
+  // vectors of a page bank instead of the kernel's.
+  while (newgame==0)
+	{
+		while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+			addr_prev = addr;
+		if (addr & 0x1000) 	{ // A12 high
+			addrc = addr & 0x1fff;
+			if (comms_enabled) 	{
+				if (addrc >= MENU32_MARQUEE_BASE) {          // the comms page, $1FC0 and up
+					if (addrc >= MENU32_BANK_BASE && addrc <= 0x1FFB) {
+						uint32_t bank = addrc - MENU32_BANK_BASE;
+						bankPtr = &rom_table[bank * 4096];
+						if (bank == 1 || bank == 4) menu32_parity = (bank == 4) ? 1 : 0;
+						gpio_put_masked(DATA_PIN_MASK,bankPtr[addrc&0xFFF]<<D0_PIN);
+						SET_DATA_MODE_OUT;
+						while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+						SET_DATA_MODE_IN;
+					} else if (addrc == MENU32_CMD_BYTE) {      // a write: sample, never drive
+						uint32_t d = 0, dprev = 0;
+						while ((gpio_get_all()&BUS_PIN_MASK) == addr) {
+							dprev = d;
+							d = (gpio_get_all()&DATA_PIN_MASK) >> D0_PIN;
+						}
+						menu32_cmd = (int)(dprev & 0xFF);
+						menu32_cmd_seq++;
+					} else {
+						if (addrc <= MENU32_MARQUEE_BASE + MENU32_MAX_ROWS)
+							menu32_cursor = (int)(addrc - MENU32_MARQUEE_BASE);
+						gpio_put_masked(DATA_PIN_MASK,rom_table[addrc&0xFFF]<<D0_PIN);
+						SET_DATA_MODE_OUT;
+						while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+						SET_DATA_MODE_IN;
+					}
+				} else {
+					gpio_put_masked(DATA_PIN_MASK,bankPtr[addrc&0xFFF]<<D0_PIN);
+					SET_DATA_MODE_OUT;
+					while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+					SET_DATA_MODE_IN;
+				}
+			} else {	// prior to an access to $1FF4 we might be on a 7800 whose BIOS is
+				// still looking at us, with the CPU at ~1.8MHz - keep this short, and
+				// serve bank 0 whatever the address.
+				gpio_put_masked(DATA_PIN_MASK,rom_table[addr&0xFFF]<<D0_PIN);
+				SET_DATA_MODE_OUT;
+				while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+				SET_DATA_MODE_IN;
+				if (addr == 0x1FF4) {
+					comms_enabled = true;
+					bankPtr = &rom_table[0];
+				}
+			}
+		}
+	}
+#else
   while (newgame==0)
 	{
 		while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
@@ -4063,6 +4174,7 @@ start:
       }
   	}
   }
+#endif  // MENU32
   ballout:
      delay(12); // 16 or 12 don't remove!!!
   
@@ -6815,6 +6927,215 @@ static bool is_firmware_own_file(FatFile *f) {
          (t[3] == 't' || t[3] == 'T') && (t[4] == 'a' || t[4] == 'A');
 }
 
+#if MENU32
+// --- 32-column menu, core 0 side --------------------------------------------
+// AtariMenu(1) still does the directory sweep into filelist[]; what follows
+// turns a slice of that list into the page the Atari runs, and scrolls the
+// highlighted row.
+
+// A 32-character line with something on the left and something on the right.
+// Written with spaces and no embedded terminator: the page builder copies until
+// the first NUL, so a string built as "left\0...right" would lose its right half
+// - which is exactly how the page number went missing in the first hardware
+// round.
+static void menu32_pad_line(char *dst, const char *left, const char *right) {
+  int i, ll = left ? (int)strlen(left) : 0, rl = right ? (int)strlen(right) : 0;
+  for (i = 0; i < MENU32_COLS; i++) dst[i] = ' ';
+  if (rl > MENU32_COLS) rl = MENU32_COLS;
+  if (ll > MENU32_COLS - rl - (rl ? 1 : 0)) ll = MENU32_COLS - rl - (rl ? 1 : 0);
+  if (ll > 0) memcpy(dst, left, (size_t)ll);
+  if (rl > 0) memcpy(dst + MENU32_COLS - rl, right, (size_t)rl);
+  dst[MENU32_COLS] = 0;
+}
+
+// The header row: where we are. The root shows the version instead of a bare
+// "/", and a path too long for the row is cut from the FRONT - the end of a path
+// is the part worth reading, which is what PlusCart does with its status line.
+static const char *menu32_build_header(void) {
+  const char *p = path;
+  int len;
+
+  if (path[0] == '/' && path[1] == 0) p = MENU32_VERSION_TEXT;  // root: the version
+  len = (int)strlen(p);
+  if (len > MENU32_COLS) p += len - MENU32_COLS;
+  menu32_pad_line(menu32_header_text, p, 0);
+  return menu32_header_text;
+}
+
+// The footer row: which page, and how much of the directory is on it.
+static const char *menu32_build_footer(void) {
+  char left[16], right[20];
+  int first = menu_count ? menu32_page * MENU32_ITEMS + 1 : 0;
+  int last  = first + menu32_map.items - 1;
+  if (last < first) last = first;
+  snprintf(left, sizeof(left), "PAGE %d/%d", menu32_page + 1, menu32_pages + 1);
+  if (menu_count > 0)
+    snprintf(right, sizeof(right), "%d-%d OF %d", first, last, menu_count);
+  else
+    snprintf(right, sizeof(right), "EMPTY");
+  menu32_pad_line(menu32_footer_text, left, right);
+  return menu32_footer_text;
+}
+
+// The row as the menu shows it: two reserved columns, then the name. This is the
+// ONLY place that decides it - the page build and the marquee both come here.
+// (They used not to: the page appended a "/" and the marquee wrote the raw name
+// back, so a directory lost its mark the moment the cursor had been on it.)
+//
+//   column 1  what the entry IS: "/" directory, "^" the way up, "+" a file,
+//             "X" a file that cannot be used (today: larger than rom_table)
+//   column 2  reserved, a space for now - the place for a second flag, e.g.
+//             which console a file is for
+//   column 3+ the name, 30 characters of it
+//
+// The marks are not part of the name: they never move with it, they do not
+// affect sorting, and they say what the colour says - which matters on a
+// monochrome screen, over RF where the colour of a 4-pixel glyph does not
+// survive (MENU_COLOURS.md), and for anyone who does not separate red from
+// green. "X" rather than "!": in this typeface "!" is a bar with a gap, which at
+// four pixels is the same shape as "i", "l", "|" and nearly "1".
+#define MENU32_MARK_DIR   '/'
+#define MENU32_MARK_UP    '^'
+#define MENU32_MARK_FILE  '+'
+#define MENU32_MARK_OVER  'X'
+#define MENU32_NAME_COLS  (MENU32_COLS - 2)
+static void menu32_display_name(int idx, int off, char *dst, int size);
+
+static unsigned char menu32_kind_of(int idx) {
+  const char *name = &filelist[idx * MAX_NAME_LEN];
+  if (name[0] == '.' && name[1] == '.' && name[2] == 0) return MENU32_KIND_UP;
+  if (direntry_toobig[idx]) return MENU32_KIND_OVER;
+  if (direntry_isdir[idx])  return MENU32_KIND_DIR;
+  return MENU32_KIND_FILE;
+}
+
+static void menu32_display_name(int idx, int off, char *dst, int size) {
+  const char *name = &filelist[idx * MAX_NAME_LEN];
+  int len = (int)strlen(name);
+  char mark;
+  switch (menu32_kind_of(idx)) {
+    case MENU32_KIND_DIR:  mark = MENU32_MARK_DIR;  break;
+    case MENU32_KIND_UP:   mark = MENU32_MARK_UP;   break;
+    case MENU32_KIND_OVER: mark = MENU32_MARK_OVER; break;
+    default:               mark = MENU32_MARK_FILE; break;
+  }
+  if (off < 0) off = 0;
+  if (off > len) off = len;
+  snprintf(dst, size, "%c %s", mark, name + off);   // the marks stay, the name scrolls
+}
+
+// Scrolling state for the highlighted row. A row exists twice - once per frame
+// phase - so a new text has to be written into both copies before the offset
+// moves on, or the two halves of the interlaced row would show different text.
+static int menu32_m_row = -1, menu32_m_off = 0, menu32_m_tick = 0, menu32_m_restore = -1;
+static unsigned char menu32_m_todo = 0, menu32_m_restore_todo = 0, menu32_m_col_todo = 0;
+static uint32_t menu32_m_last = 0;
+
+static void menu32_marquee_reset(void) {
+  menu32_m_row = -1;
+  menu32_m_off = menu32_m_tick = 0;
+  menu32_m_todo = menu32_m_restore_todo = menu32_m_col_todo = 0;
+  menu32_m_restore = -1;
+}
+
+static void menu32_write_row(int parity, int row, int idx, int off) {
+  char text[MAX_NAME_LEN + 4];
+  menu32_display_name(idx, off, text, sizeof(text));
+  menu32_update_row(rom_table, &menu32_map, parity, row + 1, text);  // row 0 is the header
+}
+
+// Build the page for `page` out of the current listing and hand it to the Atari.
+// rom_table[0] is the byte the kernel's wait routine polls for $D8: zeroing it
+// says "busy", which is exactly what it means - the page is being rewritten
+// underneath. The same byte goes away by itself when a game is loaded over it.
+static void menu32_show_page(int page) {
+  const int per = MENU32_ITEMS;
+  menu32_entry items[MENU32_MAX_ROWS];
+  static char names[MENU32_MAX_ROWS][MENU32_COLS + 1];
+  int first, n = 0, i;
+
+  menu32_pages = menu_count > 0 ? (menu_count - 1) / per : 0;
+  if (page > menu32_pages) page = menu32_pages;
+  if (page < 0) page = 0;
+  menu32_page = page;
+  first = page * per;
+  for (i = first; i < menu_count && n < per; i++, n++) {
+    char full[MAX_NAME_LEN + 4];
+    items[n].kind = menu32_kind_of(i);
+    menu32_display_name(i, 0, full, sizeof(full));
+    snprintf(names[n], sizeof(names[n]), "%s", full);
+    items[n].name = names[n];
+  }
+  menu32_map.items = (unsigned char)n;        // menu32_build_footer() counts with it
+  rom_table[0] = 0x00;                        // busy
+  menu32_build_page(rom_table, items, n, menu32_page, menu32_pages,
+                    menu32_build_header(), menu32_build_footer(), &menu32_map);
+  rom_table[0] = 0xD8;                       // ready: the kernel's wait loop looks for CLD
+  menu32_marquee_reset();
+}
+
+// One marquee step, driven by the cursor report. Writes only into the phase the
+// console is NOT about to draw, so a row is never rewritten while it is on
+// screen; the offset moves on only once both phases carry the current text.
+static void menu32_marquee_step(void) {
+  int parity = menu32_parity, row = menu32_cursor, idx;
+  unsigned char bit;
+
+  if (row < 0 || row >= MENU32_ITEMS) return;
+  bit = (unsigned char)(1 << parity);
+
+  if (menu32_m_restore >= 0 && (menu32_m_restore_todo & bit)) {
+    int ridx = menu32_page * MENU32_ITEMS + menu32_m_restore;
+    if (ridx < menu_count) {
+      menu32_write_row(parity, menu32_m_restore, ridx, 0);
+      menu32_set_row_colour(rom_table, &menu32_map, parity, menu32_m_restore + 1,
+                            menu32_kind_colour(menu32_kind_of(ridx)));
+    }
+    menu32_m_restore_todo &= (unsigned char)~bit;
+    if (!menu32_m_restore_todo) menu32_m_restore = -1;
+  }
+
+  idx = menu32_page * MENU32_ITEMS + row;
+  if (idx >= menu_count) return;
+
+  if (row != menu32_m_row) {                 // cursor moved: put the old row back
+    if (menu32_m_row >= 0) {
+      menu32_m_restore = menu32_m_row;       // its own colour, and its name unscrolled
+      menu32_m_restore_todo = 3;
+    }
+    menu32_m_row = row;
+    menu32_m_off = menu32_m_tick = 0;
+    menu32_m_todo = 0;
+    menu32_m_col_todo = 3;                   // the new row goes dark-on-yellow
+    menu32_m_last = millis();
+    return;
+  }
+  if (menu32_m_col_todo & bit) {
+    menu32_set_row_colour(rom_table, &menu32_map, parity, row + 1,
+                          menu32_kind_cursor_colour(menu32_kind_of(idx)));
+    menu32_m_col_todo &= (unsigned char)~bit;
+    return;
+  }
+  if (menu32_m_todo & bit) {                 // this phase has not got the current text yet
+    menu32_write_row(parity, row, idx, menu32_m_off);
+    menu32_m_todo &= (unsigned char)~bit;
+    return;
+  }
+  if (menu32_m_todo == 0 && millis() - menu32_m_last > MARQUEE_STEP_MS) {
+    int len = (int)strlen(&filelist[idx * MAX_NAME_LEN]);   // only the name scrolls
+    menu32_m_last = millis();
+    if (len > MENU32_NAME_COLS) {
+      int maxoff = len - MENU32_NAME_COLS;
+      menu32_m_tick = (menu32_m_tick + 1) % (maxoff + 2 * MARQUEE_HOLD);
+      menu32_m_off = menu32_m_tick < MARQUEE_HOLD          ? 0
+                   : menu32_m_tick < MARQUEE_HOLD + maxoff ? menu32_m_tick - MARQUEE_HOLD
+                                                           : maxoff;
+      menu32_m_todo = 3;                     // both phases need rewriting
+    }
+  }
+}
+#endif  // MENU32
+
 void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
   int contfile=0;
   char filename[MAX_NAME_LEN];
@@ -6947,6 +7268,13 @@ void setup() {
     vreg_set_voltage(VREG_VOLTAGE_1_15); // set to 1_15 or 1_20 if you experience some glitches
   //delay(10); // to stabilize voltage
   set_sys_clock_khz(250000, true); // settled in compiler IDE as 250mhz overclocked
+#if MENU32
+  // rom_table still comes up holding the 12-column kernel (rom.h's initialiser),
+  // so the 32-column one has to be put there before the Atari reads anything.
+  // An empty page is enough: the listing arrives with the kernel's first-boot
+  // command, and core 1 is serving from the same array by then.
+  menu32_show_page(0);
+#endif
  //   gpio_init_mask(ALL_GPIO_MASK);
   //pinMode(A0_PIN,INPUT);
   pinMode(RW_PIN,INPUT);
@@ -7077,6 +7405,61 @@ void loop()
      continue;                          // no cart type ever hands control back here
    }
 
+#if MENU32
+  // One command byte per press, written by the kernel to $1FE6 and picked off
+  // the data lines by core 1. "Select" is the row on the page; the entry it
+  // means is page * rows + row. Everything after that is the old path: a
+  // directory re-opens and the page is rebuilt, a game goes through LoadGame()
+  // and newgame, which takes core 1 out of this loop.
+  {
+    static uint32_t menu32_cmd_seen = 0;
+    static uint32_t menu32_cmd_last = 0;
+    if (menu32_cmd_seen != menu32_cmd_seq) {
+      int cmd = menu32_cmd;
+      uint32_t now = millis();
+      // The kernel has no debounce on the fire button: it sends the command
+      // again every two frames for as long as the button is down (checked in the
+      // simulator, tools/menu32). PlusCart gets away with it because its
+      // firmware is slow; ours rebuilds a page in milliseconds, so one press
+      // would walk into a directory and straight on into its first entry. Each
+      // repeat pushes the lock-out out again, so this waits for the release.
+      uint32_t hold = (cmd == MENU32_CMD_PAGE_PREV || cmd == MENU32_CMD_PAGE_NEXT) ? 300 : 400;
+      menu32_cmd_seen = menu32_cmd_seq;
+      if (cmd != MENU32_CMD_FIRSTBOOT && (now - menu32_cmd_last) < hold) {
+        menu32_cmd_last = now;
+        goto menu32_cmd_done;
+      }
+      menu32_cmd_last = now;
+      // "Busy" from here on, not just while the page is being written: reading a
+      // directory takes tens of milliseconds, and the kernel's wait routine must
+      // keep spinning through all of it rather than draw the page it still has.
+      rom_table[0] = 0x00;
+      if (cmd == MENU32_CMD_FIRSTBOOT) {
+        AtariMenu(1);
+        menu32_show_page(0);
+        menuletto = 1;
+      } else if (cmd == MENU32_CMD_PAGE_PREV) {
+        if (menuletto && menu32_page > 0) menu32_show_page(menu32_page - 1);
+      } else if (cmd == MENU32_CMD_PAGE_NEXT) {
+        if (menuletto && menu32_page < menu32_pages) menu32_show_page(menu32_page + 1);
+      } else if (menuletto && cmd >= 0 && cmd < MENU32_ITEMS) {
+        int pick = menu32_page * MENU32_ITEMS + cmd;
+        if (pick < menu_count) {
+          gamechoosen = (u_int8_t)pick;
+          Serial.print("Selected:");Serial.println(gamechoosen);
+          AtariMenu(2);
+          if (newgame == 0) {              // a directory, or a file that would not open
+            AtariMenu(1);
+            menu32_show_page(0);
+          }
+        }
+      }
+      if (newgame == 0) rom_table[0] = 0xD8;   // ready again (a loaded game owns rom_table)
+      menu32_cmd_done: ;
+    }
+  }
+  if (menuletto) menu32_marquee_step();
+#else
   if (retaddr>=CART_CMD_SEL_ITEM_n) {
     if (retaddr==CART_CMD_ROOT_DIR) {
       retaddr=0;
@@ -7117,6 +7500,7 @@ void loop()
        }
      }
    }
+#endif  // MENU32
 
 #if AUDIO_PIN_ROUTED && (AUDIO_IDLE_MODE == 3)
    // _AUDX diagnostic (MENU_FIX.md 2.5, TODO.md 9). Rotate the idle state of
