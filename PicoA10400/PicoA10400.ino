@@ -491,7 +491,7 @@ char menu_status[16];
 char filelist[85*MAX_NAME_LEN]; // 85 entries, MAX_NAME_LEN bytes each (incl. terminator)
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
 char direntry_toobig[85]; // 1 if filelist[n] cannot be used as listed: file larger than rom_table (loaded truncated), or a name too long to read; shown red in the menu
-#define MENU_FOOTER_TEXT "AOTTAv01 HR8" // 12 chars: the menu kernel renders exactly 12 per row
+#define MENU_FOOTER_TEXT "AOTTAv01 HR9" // 12 chars: the menu kernel renders exactly 12 per row
 // Stand-in name for a directory entry whose real name does not fit in MAX_NAME_LEN.
 // 12 chars, uppercase only: the row shows exactly 12 and the font has no lowercase.
 #define MENU_LONGNAME_TEXT "NAME TOO LNG"

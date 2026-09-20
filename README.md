@@ -281,6 +281,21 @@
   colour-marked in the listing, so you can just try them. False warnings for `.a78`
   files that fit exactly are gone too._
 
+- **15MB of room on a Pico 2 board that carries a 16MB flash chip**
+  _The Pico 2 build reserves 3MB for ROMs, because a real Raspberry Pi Pico 2 has
+  4MB of flash in total. The RP2350A clones sold with a 16MB chip were getting the
+  same 3MB, and there are now images for them that give them **15MB**:
+  `Pico2A10400.ino_16MB.uf2` and, for an NTSC set, `Pico2A10400.ino_16MB_NTSC.uf2`.
+  Nothing in the firmware changes — the size of the ROM filesystem is fixed when
+  the image is built, which is exactly why it takes an image of its own. The Pico 2
+  board therefore has four: PAL and NTSC, each in a 4MB and a 16MB version._
+
+  _**Format the drive after flashing it.** The size of a filesystem is written on
+  the flash and does not grow because the partition did. And do not put a 16MB
+  image on a real Pico 2: its filesystem would run off the end of the chip. The
+  menu still lists 85 entries per directory, so the extra room is a reason to use
+  subdirectories, not a reason to stop._
+
 - **A menu with room for the names: 32 characters per row instead of 12**
   _The row is four times as wide as the one the original menu draws, so most titles
   are simply readable instead of cut to a guess. A page holds nine entries and a
