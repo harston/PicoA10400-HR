@@ -3033,12 +3033,12 @@ void __time_critical_func(emulate_supercart_large_pokey()) {
 //                            fault is downstream (data or synthesis)
 //     silence             -> they are NOT reaching it, and the fault is in how
 //                            this loop sees the $0800 window
-// Prog jest WARTOSCIA tego przelacznika, nie stala w kodzie - bo dobranie go
-// zle raz juz zepsulo wniosek. Rutyna inicjalizujaca tego kartridza wykonuje
-// DOKLADNIE 29 zapisow (zmierzone, dump_pokey_writes.py), wiec prog 64 lezy
-// zaledwie 35 nad nia: kilkanascie przypadkowych przechwycen wystarczy, zeby go
-// przekroczyc, a wtedy ton nie mowi nic o odtwarzaczu. Prog rzedu tysiecy moze
-// osiagnac wylacznie cos, co pisze bez przerwy.
+// The threshold is the VALUE of this switch, not a constant in the code - because
+// picking it badly has already ruined one conclusion. This cart's initialisation
+// routine performs EXACTLY 29 writes (measured, dump_pokey_writes.py), so a
+// threshold of 64 sits only 35 above it: a dozen or so stray captures are enough
+// to cross it, and then the tone says nothing about the player. A threshold in
+// the thousands can only be reached by something writing continuously.
 #ifndef BANKSET_DIAG_TONE
 #define BANKSET_DIAG_TONE 0
 #endif
@@ -3074,17 +3074,18 @@ static uint32_t bankset_pk_seen = 0;
 #define BANKSET_CAPTURE(reg, val) pokey_capture_write((reg), (val))
 #endif
 
-// BANKSET_DIAG_TONE2 ("czy dociera JAKIKOLWIEK rozkaz zrobienia dzwieku?").
+// BANKSET_DIAG_TONE2 ("does ANY command to make a sound arrive at all?").
 //
-// _BSAU pokazalo, ze zapisy docieraja i synteza gra; bramka "tylko zapisy" nic
-// nie zmienila. Zostaly WARTOSCI. Ta sonda arm-uje slyszalny ton dopiero wtedy,
-// gdy przechwycimy zapis do rejestru GLOSNOSCI (AUDC1/2/3/4 = 1,3,5,7)
-// z niezerowa glosnoscia w bitach 0-3 - czyli jedyny rodzaj zapisu, ktory
-// w ogole moze cos zagrac.
+// _BSAU showed that the writes arrive and the synthesis plays; the "writes only"
+// gate changed nothing. That leaves the VALUES. This probe arms an audible tone
+// only once we capture a write to a VOLUME register (AUDC1/2/3/4 = 1,3,5,7)
+// with a non-zero volume in bits 0-3 - i.e. the only kind of write that can
+// possibly play anything.
 //
-//     ton    -> rozkazy glosnosci DOCIERAJA poprawnie; wina jest dalej
-//               (czestotliwosc, AUDCTL, albo interpretacja w syntezie)
-//     cisza  -> do rejestrow AUDCx trafiaja same zera; przechwytujemy zle DANE
+//     tone    -> the volume commands ARE arriving correctly; the fault is
+//                further on (frequency, AUDCTL, or the synthesis reading them)
+//     silence -> nothing but zeroes reaches the AUDCx registers; we are
+//                capturing the wrong DATA
 #ifndef BANKSET_DIAG_TONE2
 #define BANKSET_DIAG_TONE2 0
 #endif
@@ -3109,19 +3110,19 @@ static uint32_t bankset_pk_armed = 0;
   } while (0)
 #endif
 
-// BANKSET_DIAG_TONE3 ("czy widzimy JAKIKOLWIEK niezerowy bajt danych?").
+// BANKSET_DIAG_TONE3 ("do we see ANY non-zero data byte at all?").
 //
-// _BSA2 dalo cisze: zaden zapis do rejestru glosnosci z niezerowa wartoscia nie
-// dotarl. Zostaja dwie mozliwosci i ta sonda je rozdziela - arm-uje ton przy
-// pierwszym przechwyconym zapisie o NIEZEROWYM BAJCIE DANYCH, obojetnie do
-// ktorego rejestru. Rutyna inicjalizujaca tego kartridza pisze same zera
-// (zmierzone), wiec nie moze tego wywolac.
+// _BSA2 gave silence: not one write to a volume register carried a non-zero
+// value. Two possibilities remain and this probe separates them - it arms the
+// tone on the first captured write with a NON-ZERO DATA BYTE, to whichever
+// register. This cart's initialisation routine writes nothing but zeroes
+// (measured), so it cannot trigger it.
 //
-//     ton   -> niezerowe dane DOCIERAJA; probkowanie magistrali dziala, a
-//              problemem jest to, ktore zapisy widzimy
-//     cisza -> KAZDY przechwycony bajt to $00; probkujemy dane ZANIM procesor
-//              je wystawi (pady RP2040 maja domyslnie sciaganie do masy, wiec
-//              nienapedzana magistrala czyta sie jako zero)
+//     tone    -> non-zero data IS arriving; the bus sampling works and the
+//                problem is which writes we see
+//     silence -> EVERY captured byte is $00; we sample the data BEFORE the
+//                processor drives it (RP2040 pads pull down by default, so an
+//                undriven bus reads as zero)
 #ifndef BANKSET_DIAG_TONE3
 #define BANKSET_DIAG_TONE3 0
 #endif
@@ -3145,18 +3146,19 @@ static uint32_t bankset_pk_armed3 = 0;
   } while (0)
 #endif
 
-// BANKSET_DIAG_TONE4 ("czy do AUDCx trafia COKOLWIEK niezerowego?").
+// BANKSET_DIAG_TONE4 ("does ANYTHING non-zero reach AUDCx?").
 //
-// _BSAU4096 pokazalo, ze zapisy odtwarzacza docieraja tysiacami (inicjalizacja
-// robi 29). _BSA2 pokazalo, ze zaden z nich nie niesie niezerowej GLOSNOSCI
-// (bity 0-3 rejestru AUDCx). Ta sonda pyta o slabszy warunek: czy do AUDC1/2/3/4
-// trafia w ogole jakikolwiek niezerowy bajt - bo AUDCx niesie tez bity ksztaltu
-// fali (zwykle $A0), ktore odtwarzacz musi ustawiac.
+// _BSAU4096 showed the player's writes arrive in their thousands (initialisation
+// does 29). _BSA2 showed that none of them carries a non-zero VOLUME (bits 0-3
+// of an AUDCx register). This probe asks a weaker question: does any non-zero
+// byte at all reach AUDC1/2/3/4 - because AUDCx also carries the waveform bits
+// (usually $A0), which the player has to set.
 //
-//     ton   -> bajty AUDCx docieraja, ale z wyzerowana MLODSZA POLOWKA;
-//              czytamy dane czesciowo - problem w probkowaniu magistrali
-//     cisza -> do AUDCx nie trafia NIC niezerowego, mimo tysiecy przechwycen;
-//              czyli trafiaja tam bajty z innych zapisow albo same zera
+//     tone    -> the AUDCx bytes arrive, but with the LOW NIBBLE zeroed; we are
+//                reading the data partially - a bus sampling problem
+//     silence -> NOTHING non-zero reaches AUDCx despite thousands of captures;
+//                so what lands there is bytes from other writes, or just
+//                zeroes
 #ifndef BANKSET_DIAG_TONE4
 #define BANKSET_DIAG_TONE4 0
 #endif
@@ -3181,20 +3183,20 @@ static uint32_t bankset_pk_armed4 = 0;
   } while (0)
 #endif
 
-// BANKSET_DIAG_TONE5 - jak TONE, ale liczy WYLACZNIE przechwycenia
-// z NIEZEROWYM bajtem danych. Prog jest wartoscia.
+// BANKSET_DIAG_TONE5 - like TONE, but counts ONLY captures with a NON-ZERO data
+// byte. The threshold is the value.
 //
-// Ostatni czysty rozdzial. Wiadomo juz, ze przechwytujemy tysiace zapisow
-// w 32-bajtowym oknie $0800-$081F (_BSAU4096 uzbraja ton takze PO zawezeniu),
-// a mimo to zaden nie niesie niezerowego bajtu do AUDCx (_BSA2, _BSA5).
-// Sonda TONE3 pytala o to samo, ale z progiem 1 - odpalala wiec na rutynie
-// inicjalizujacej, ktora pisze SKCTL=$03. Z progiem rzedu tysiecy inicjalizacja
-// (29 zapisow) nie ma szans.
+// The last clean split. We already know we capture thousands of writes in the
+// 32-byte window $0800-$081F (_BSAU4096 arms the tone even AFTER narrowing it),
+// and that none of them carries a non-zero byte to AUDCx (_BSA2, _BSA5). Probe
+// TONE3 asked the same question but with a threshold of 1 - so it fired on the
+// initialisation routine, which writes SKCTL=$03. With a threshold in the
+// thousands, initialisation (29 writes) has no chance.
 //
-//     ton   -> tysiace przechwycen ma sensowne DANE; czytanie magistrali
-//              dziala, a bledny jest NUMER REJESTRU
-//     cisza -> po inicjalizacji KAZDY przechwycony bajt to $00; czytamy dane
-//              systematycznie jako zero
+//     tone    -> thousands of captures carry sensible DATA; reading the bus
+//                works and it is the REGISTER NUMBER that is wrong
+//     silence -> after initialisation EVERY captured byte is $00; we read the
+//                data as zero systematically
 #ifndef BANKSET_DIAG_TONE5
 #define BANKSET_DIAG_TONE5 0
 #endif
