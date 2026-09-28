@@ -482,8 +482,16 @@ swap_in_menu_kernel() {
   ROMH_SWAP_TARGETS+=("$romh")
   ROMH_SWAP_BACKUPS+=("$backup")
   trap 'restore_swapped_files' EXIT
-  python3 "$REPO_ROOT/menu_rom_analysis/make_rom_h.py" "$bin" > "$romh"
-  echo "  Swapped in menu_kernel_${tag}.bin as rom.h for this build (rom.h restored afterward)."
+  # The array size is NOT the same on both boards since 0.73: PicoA10400 keeps
+  # 144KB (an RP2040 has 264KB of SRAM in total) and Pico2A10400 runs 384KB.
+  # make_rom_h.py copies the template's head verbatim, and that template carries
+  # 144 - so without this argument a -MENU-<tag> build on the Pico 2 would
+  # quietly hand the board a 144KB game buffer and every ROM above that would
+  # start being truncated again, with nothing in the build output saying so.
+  local array_kb=144
+  [[ "$sketch_dir" == "Pico2A10400" ]] && array_kb=384
+  python3 "$REPO_ROOT/menu_rom_analysis/make_rom_h.py" "$bin" --array-kb "$array_kb" > "$romh"
+  echo "  Swapped in menu_kernel_${tag}.bin as rom.h for this build (rom_table[1024*${array_kb}], rom.h restored afterward)."
 }
 
 restore_romh_after_ntsc() {
@@ -519,6 +527,16 @@ build_sketch() {
   # sanity check below is what proves the filesystem was still reserved.
   if [[ -n "$fqbn_override" ]]; then
     extra_args+=(--fqbn "$fqbn_override")
+  fi
+  # macOS 27 no longer runs x86_64 binaries (no Rosetta 2), and the ctags that
+  # arduino-cli installs for its prototype step - builtin:ctags 5.8-arduino11 -
+  # exists only as x86_64, so every compile stopped with "bad CPU type in
+  # executable". tools/build_native_ctags.sh builds the very same tag natively
+  # into tools/.cache/ctags/; when it is there, arduino-cli is pointed at it.
+  # Verified harmless before first use: the 0.73 tree compiled this way came
+  # out byte-identical to the shipped PicoA10400.ino.uf2 and Pico2A10400.ino.uf2.
+  if [[ -x "$REPO_ROOT/tools/.cache/ctags/ctags" ]]; then
+    extra_args+=(--build-property "tools.ctags.path=$REPO_ROOT/tools/.cache/ctags")
   fi
   if [[ -n "$diag" ]]; then
     if [[ "$diag" == "MENU32" || "$diag" == "MENU32_NTSC" ]]; then

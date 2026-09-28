@@ -1048,12 +1048,37 @@ void __time_critical_func(emulate_supercart_large()) {
   // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
   // returns, so nothing needs restoring.
   __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
-      // bank is a byte OFFSET into rom_table for the $8000-$BFFF window (not a bank
-      // number): bank=0 means file bank 0 - the same 16KB already visible at
-      // $4000-$7FFF - is what a real 9-bank SuperGame cart shows at $8000 before its
-      // first bank-select write (MAME's a78 sg9 device: device_reset() { m_bank=0; }).
-      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      // bank_ptr points at the 16KB shown at $8000-$BFFF. It starts at file bank 0 -
+      // the same 16KB already visible at $4000-$7FFF - which is what a real 9-bank
+      // SuperGame cart shows at $8000 before its first bank-select write (MAME's a78
+      // sg9 device: device_reset() { m_bank=0; }). A pointer since 0.74 instead of
+      // a byte offset: the geometry below costs registers, and the pointer takes
+      // the add out of every $8000 fetch, so no ROM fetch of this loop got slower
+      // than in 0.73 (compared instruction by instruction on both boards).
+      uint32_t addr=0, addr_prev=0, rawaddr=0;
+      const uint8_t *bank_ptr = rom_table;
       uint8_t rom_in_use=1;
+      // Geometry from romLen (0.74), the way MAME's a78_sg9 device derives it
+      // (rom.cpp:441-455, bank mask from a78_slot.cpp:74-77): file bank 0 is
+      // fixed at $4000, the $8000 window serves file bank (value & mask) + 1,
+      // and $C000 serves the LAST bank of the image. This loop used to assume
+      // nine banks - fixed offset 0x14000, mask 7 - and those are exactly the
+      // two numbers this comes out as for a 144KB image, so Alien Brigade,
+      // Crossbow and Bentley Bear are served as before. A 48KB or 272KB SG9
+      // cart used to fetch its reset vector from bank 8, which the one does
+      // not have and the other does not boot from.
+      //
+      // The mask is nbanks-2: MAME's value for the odd bank counts SG9 images
+      // have (3, 9, 17, 33). For an even count it is one below MAME's, on
+      // purpose - (value & mask) + 1 can then never name a bank past the last
+      // one, so nothing here indexes beyond romLen, and identify_cartridge()
+      // keeps romLen within what was loaded into rom_table.
+      const uint32_t sg9_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sg9_mask   = (sg9_nbanks >= 3) ? (sg9_nbanks - 2) : 0;
+      // (last bank) - $C000, since addr is $C000-$FFFF where this is used; it
+      // wraps in uint32_t exactly the way emulate_supercart_ram()'s fixed_base
+      // does. 0x14000 for a 144KB image.
+      const uint32_t fixed_off  = ((sg9_nbanks > 0) ? (sg9_nbanks - 1) * 0x4000 : 0) - 0xC000;
 
       while (1) {    // Get address
              // Get address
@@ -1063,8 +1088,8 @@ void __time_critical_func(emulate_supercart_large()) {
         if (addr & A15_PIN_MASK) {
             // Check for A14
             if (addr & A14_PIN_MASK) {
-                // Set the data on the bus for fixed bank 7
-                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x14000] << D0_PIN;
+                // Set the data on the bus for the fixed last bank
+                sio_hw->gpio_out = (uint32_t)rom_table[addr + fixed_off] << D0_PIN;
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == READ_PIN_MASK) {
                     // Read cycle
@@ -1075,7 +1100,7 @@ void __time_critical_func(emulate_supercart_large()) {
                 }
             } else {
                 // Set the data on the bus for active bank
-                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;
+                sio_hw->gpio_out = (uint32_t)bank_ptr[addr & 0x3fff] << D0_PIN;
                 // Check for RW
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
@@ -1102,14 +1127,13 @@ void __time_critical_func(emulate_supercart_large()) {
                             last = cur;
                         }
                         rawaddr = last;
-                        // Mask 7, not 0xF: MAME computes bank_mask=7 for a 9-bank (144KB)
-                        // image and wraps the written value against it. With 0xF a stray
-                        // write of 8..15 would select "file banks 9..16", i.e. read past
-                        // the end of rom_table into unrelated RAM - Alien Brigade writes
-                        // values it loaded from memory here, not only the immediates
-                        // 2..5 seen in its startup code, so out-of-range values cannot be
-                        // ruled out. +1: file bank 0 is already shown at $4000.
-                        bank = (((rawaddr >> D0_PIN) & 0x7) + 1) * 0x4000;
+                        // The written value wraps against sg9_mask (7 for a 144KB image,
+                        // as MAME's bank_mask) and never selects past the last bank -
+                        // Alien Brigade writes values it loaded from memory here, not
+                        // only the immediates 2..5 seen in its startup code, so
+                        // out-of-range values cannot be ruled out. +1: file bank 0 is
+                        // already shown at $4000.
+                        bank_ptr = rom_table + (((rawaddr >> D0_PIN) & sg9_mask) + 1) * 0x4000;
                         rom_in_use = 0;
                     }
                 }
@@ -2664,12 +2688,37 @@ void __time_critical_func(emulate_supercart_large_pokey()) {
       // with no POKEY at all) start glitching.
       const uint32_t pkbase = (uint32_t)pokey_base;
       const uint32_t pkmask = (uint32_t)pokey_mask;
-      // bank is a byte OFFSET into rom_table for the $8000-$BFFF window (not a bank
-      // number): bank=0 means file bank 0 - the same 16KB already visible at
-      // $4000-$7FFF - is what a real 9-bank SuperGame cart shows at $8000 before its
-      // first bank-select write (MAME's a78 sg9 device: device_reset() { m_bank=0; }).
-      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      // bank_ptr points at the 16KB shown at $8000-$BFFF. It starts at file bank 0 -
+      // the same 16KB already visible at $4000-$7FFF - which is what a real 9-bank
+      // SuperGame cart shows at $8000 before its first bank-select write (MAME's a78
+      // sg9 device: device_reset() { m_bank=0; }). A pointer since 0.74 instead of
+      // a byte offset: the geometry below costs registers, and the pointer takes
+      // the add out of every $8000 fetch, so no ROM fetch of this loop got slower
+      // than in 0.73 (compared instruction by instruction on both boards).
+      uint32_t addr=0, addr_prev=0, rawaddr=0;
+      const uint8_t *bank_ptr = rom_table;
       uint8_t rom_in_use=1;
+      // Geometry from romLen (0.74), the way MAME's a78_sg9 device derives it
+      // (rom.cpp:441-455, bank mask from a78_slot.cpp:74-77): file bank 0 is
+      // fixed at $4000, the $8000 window serves file bank (value & mask) + 1,
+      // and $C000 serves the LAST bank of the image. This loop used to assume
+      // nine banks - fixed offset 0x14000, mask 7 - and those are exactly the
+      // two numbers this comes out as for a 144KB image, so Alien Brigade,
+      // Crossbow and Bentley Bear are served as before. A 48KB or 272KB SG9
+      // cart used to fetch its reset vector from bank 8, which the one does
+      // not have and the other does not boot from.
+      //
+      // The mask is nbanks-2: MAME's value for the odd bank counts SG9 images
+      // have (3, 9, 17, 33). For an even count it is one below MAME's, on
+      // purpose - (value & mask) + 1 can then never name a bank past the last
+      // one, so nothing here indexes beyond romLen, and identify_cartridge()
+      // keeps romLen within what was loaded into rom_table.
+      const uint32_t sg9_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sg9_mask   = (sg9_nbanks >= 3) ? (sg9_nbanks - 2) : 0;
+      // (last bank) - $C000, since addr is $C000-$FFFF where this is used; it
+      // wraps in uint32_t exactly the way emulate_supercart_ram()'s fixed_base
+      // does. 0x14000 for a 144KB image.
+      const uint32_t fixed_off  = ((sg9_nbanks > 0) ? (sg9_nbanks - 1) * 0x4000 : 0) - 0xC000;
 
       while (1) {    // Get address
              // Get address
@@ -2679,8 +2728,8 @@ void __time_critical_func(emulate_supercart_large_pokey()) {
         if (addr & A15_PIN_MASK) {
             // Check for A14
             if (addr & A14_PIN_MASK) {
-                // Set the data on the bus for fixed bank 7
-                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x14000] << D0_PIN;
+                // Set the data on the bus for the fixed last bank
+                sio_hw->gpio_out = (uint32_t)rom_table[addr + fixed_off] << D0_PIN;
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == READ_PIN_MASK) {
                     // Read cycle
@@ -2691,7 +2740,7 @@ void __time_critical_func(emulate_supercart_large_pokey()) {
                 }
             } else {
                 // Set the data on the bus for active bank
-                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;
+                sio_hw->gpio_out = (uint32_t)bank_ptr[addr & 0x3fff] << D0_PIN;
                 // Check for RW
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
@@ -2718,14 +2767,13 @@ void __time_critical_func(emulate_supercart_large_pokey()) {
                             last = cur;
                         }
                         rawaddr = last;
-                        // Mask 7, not 0xF: MAME computes bank_mask=7 for a 9-bank (144KB)
-                        // image and wraps the written value against it. With 0xF a stray
-                        // write of 8..15 would select "file banks 9..16", i.e. read past
-                        // the end of rom_table into unrelated RAM - Alien Brigade writes
-                        // values it loaded from memory here, not only the immediates
-                        // 2..5 seen in its startup code, so out-of-range values cannot be
-                        // ruled out. +1: file bank 0 is already shown at $4000.
-                        bank = (((rawaddr >> D0_PIN) & 0x7) + 1) * 0x4000;
+                        // The written value wraps against sg9_mask (7 for a 144KB image,
+                        // as MAME's bank_mask) and never selects past the last bank -
+                        // Alien Brigade writes values it loaded from memory here, not
+                        // only the immediates 2..5 seen in its startup code, so
+                        // out-of-range values cannot be ruled out. +1: file bank 0 is
+                        // already shown at $4000.
+                        bank_ptr = rom_table + (((rawaddr >> D0_PIN) & sg9_mask) + 1) * 0x4000;
                         rom_in_use = 0;
                     }
                 }
@@ -6453,30 +6501,60 @@ int identify_cartridge(char *filename)
             // (:424); that variant is deliberately not implemented, since 512KB
             // cannot fit rom_table and no file in this library needs it.
             cart_type = CART_TYPE_VERSA;
-          } else if(image_size > (131072+0x80)) {
-            cart_type = CART_TYPE_SUPERCART_LARGE;
-          } else if(A78_HEADER[54] == 2 || A78_HEADER[54] == 3) {
-              cart_type = CART_TYPE_SUPERCART;
-            } else if(A78_HEADER[54] == 18 || A78_HEADER[54] == 19) {
-              cart_type = CART_TYPE_SUPERCART_EF;
           } else if(A78_HEADER[54] == 4 || A78_HEADER[54] == 5 || A78_HEADER[54] == 6 || A78_HEADER[54] == 7) {
+            // BEFORE the size test below since 0.74, not after it. That test
+            // sent every cart over 128KB to the 9-bank/144KB loop whatever its
+            // header said - SuperGame + RAM boards included, which that loop has
+            // no RAM for. A 256KB "1942" or "A.R.T.I" then fetched its reset
+            // vector from bank 8 instead of bank 15 and never started. MAME picks
+            // the board from the header alone (a78_slot.cpp:416: 0x0006 is
+            // a78_sg_ram at any size), and emulate_supercart_ram() already takes
+            // its fixed bank and bank mask from romLen.
             cart_type = CART_TYPE_SUPERCART_RAM;
           } else if(A78_HEADER[54] == 10 || A78_HEADER[54] == 11) {
               // MAME's switch has a case for 0x000a (A78_TYPEA - SuperGame with
-              // bank 6 at $4000, Alien Brigade/Crossbow) but NONE for 0x0008, so
+              // file bank 0 at $4000, Alien Brigade/Crossbow) but NONE for 0x0008, so
               // that value leaves m_type at its initial A78_TYPE0: a plain flat
               // cart. Byte54 bit 3 on its own means "ROM at $4000", which for a
               // non-bankswitched board is simply a 48K image - and every one of
               // the 21 files in ROMS/7800 that masks to 0x08 is exactly 49152
               // bytes. Serving them as a 9-bank SuperCart, which is what this
               // branch used to do, cannot have worked.
+              //
+              // Also before the size test since 0.74: 0x000a is MAME's a78_sg9
+              // at ANY size (a78_slot.cpp:419) - 48KB, 144KB, 272KB - and
+              // emulate_supercart_large() now takes its geometry from romLen
+              // instead of assuming nine banks.
               cart_type = CART_TYPE_SUPERCART_ROM;
+          } else if(image_size > (131072+0x80)) {
+            // What still lands here is a plain SuperGame (0x02) or bank-6
+            // (0x12) image over 128KB, or a flat header declaring more than a
+            // flat cart holds. None of them is a 9-bank board, so none is served
+            // correctly - emulate_supercart_ef() is written for 128KB and there
+            // is no loop for a bigger plain SuperGame. Left as it was.
+            cart_type = CART_TYPE_SUPERCART_LARGE;
+          } else if(A78_HEADER[54] == 2 || A78_HEADER[54] == 3) {
+              cart_type = CART_TYPE_SUPERCART;
+            } else if(A78_HEADER[54] == 18 || A78_HEADER[54] == 19) {
+              cart_type = CART_TYPE_SUPERCART_EF;
           } else {
             cart_type = CART_TYPE_NORMALA78;
           }
         } else {
           cart_type = CART_TYPE_NORMALA78;
         }
+        // romLen must never promise more than rom_table holds (0.74). It is the
+        // header's figure, and every loop that derives its geometry from it -
+        // emulate_supercart_ram(), the VersaBoard loops and, since 0.74,
+        // emulate_supercart_large() - puts its FIXED bank at the end of that
+        // figure. For an image the loader had to truncate (an entry the menu
+        // draws in red) that end lies past the array, so the very first fetch,
+        // the reset vector, would read beyond rom_table. Clamped to what was
+        // loaded, every such index stays inside it; the game still cannot run,
+        // which is what the red entry says. No header in ROMS/7800 declares
+        // more than its own file holds, so for an image that fits this changes
+        // nothing.
+        if ((uint32_t)romLen > (uint32_t)bytes_read) romLen = bytes_read;
       Serial.println("7800 cart");
       goto close_exit;
     }
