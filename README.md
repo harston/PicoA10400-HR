@@ -311,6 +311,64 @@
   _The kernel that draws it is PlusCart's (United Carts of Atari, GPL-3); its source,
   and the proof that our copy differs from it by three bytes, are in `menu32_rom/`._
 
+- **A Pico 2 loads ROMs up to 384KB whole**
+  _The ROM buffer was 144KB on both boards — most of what an RP2040 has, but less
+  than a third of an RP2350. On the Pico 2 it is now 384KB, which holds every image in
+  the library the chip can hold at all: the sizes above 144KB are 256, 272 and 316KB,
+  and the next one up, 480KB, is more than the whole of its RAM. The RP2040 board keeps
+  144KB._
+
+- **SuperGame carts get the board their header asks for — 1942, A.R.T.I, Castle Storm, Karateka**
+  _A SuperGame cartridge was matched to a board by its size alone, and anything over
+  128KB went to the 9-bank board written for Alien Brigade. **1942** and **A.R.T.I** —
+  256KB with RAM on the cart — fetched their reset vector from the wrong bank and never
+  started, even once the Pico 2 had room for them. The header says which board a cart
+  is, and that is now what decides, as it does in MAME._
+
+  _The plain SuperGame board had the opposite fault: it was written for exactly 128KB,
+  so every 64KB title read its reset vector from past the end of its own image.
+  **Karateka**, **Tank Command**, **Water Ski** and **RealSports Baseball** had never
+  started on either board. Its banks are now sized from the image. On the Pico 2 the
+  same loop also served ROM where the header puts a POKEY; that is fixed too._
+
+  _Confirmed on a PAL 7800: **1942**, **A.R.T.I**, **Black Forest**, **Castle Storm** and
+  **Karateka** start and play (the 256KB ones on the Pico 2 board only). Tank Command,
+  Water Ski and RealSports Baseball exist only as NTSC dumps and show the usual faults
+  of an NTSC game on a PAL console. **Bomber Hero** now starts too, but after a long
+  session it can stop at its own red error screen, for a reason not yet found._
+
+- **ARM cartridges are named and refused instead of hanging the console**
+  _DPC+, CDF, CDFJ and CDFJ+ cartridges — the formats of the Champ Games releases and
+  of batari Basic's DPC+ kernel — carry a program for the ARM chip on a Harmony
+  cartridge, and so do BUS, ELF and ACE images. This board has no such chip, and the
+  firmware did not know these formats at all: a 32KB image was started as an ordinary
+  F4 cart, a 64KB one as F0, and every one of them hung the console. The test library
+  holds about 1,260 such files._
+
+  _They are now recognised by Stella's signatures and marked in the menu — `X` and `A`
+  in the two mark columns, in the red of a file the cart cannot use — and choosing one
+  only says why: the footer reads, for example, `CDFJ+ ARM CART - NOT SUPPORTED` until
+  the cursor moves. Running them would need the Pico to execute that ARM program itself,
+  which is a separate and much larger project._
+
+  _Recognising them costs the menu almost nothing. Every Harmony image starts with an
+  ARM instruction that jumps over its driver's data, so the cart reads 64 bytes of each
+  file and looks deeper only when that instruction is there: a folder of 84 ordinary
+  32KB games lists in 8 ms, a folder full of ARM games in about 0.2 s. Confirmed on both
+  boards on a PAL 7800._
+
+- **Atari 2600+ and 7800+: one game straight from the `/PLUS/` folder**
+  _The 2600+ and 7800+ never run code from a cartridge: a reader in the console copies
+  it over the bus and an emulator plays the copy, so a menu cannot work there. Put a ROM
+  in a folder named `/PLUS/` on the cart's drive and the cart is that game from the
+  moment it is switched on — no menu. With several files the first by name is used; an
+  empty folder, or one holding only files the cart cannot use, changes nothing. With a
+  PC attached the menu comes back as always, and while a `/PLUS/` game runs the USB
+  drive is read-only. Switch the cart on about a second before the console._
+
+  _Confirmed on an ordinary PAL 7800 with both boards: the game starts instead of the
+  menu. Not yet tried on a 2600+ or 7800+, which is what it is for._
+
 - **Easier browsing**
   - _The listing is sorted: directories first, then alphabetically._
   - _Subdirectories no longer vanish in folders holding hundreds of files._
@@ -336,6 +394,10 @@
   or a YM2151 run at 300MHz, because on those the extra margin turned out to be worth
   something on screen.
 
+_On an Atari 7800, insert the cart with its **2600 face** to play 2600 games and with
+its 7800 face for 7800 games. The menu works either way, but a 2600 game on the 7800
+face fights the console over three address lines and misbehaves._
+
 _Supercharger titles run on an Atari 2600; on an Atari 7800 in its 2600 mode they
 do not, and that one is not solved._
 
@@ -350,9 +412,10 @@ from this side._
 
 _Not fixed, and out of the cartridge's reach: an NTSC ROM on a PAL console may run
 too fast and show interference along the bottom of the screen — use a PAL version
-where one exists. Some 2600 schemes stay out of range for a harder reason — **DPC+**
-and **CDFJ** cartridges carry their own ARM program and expect a processor in the
-cartridge to run it, which is what a Harmony has and this board does not._
+where one exists. Some 2600 schemes stay out of range for a harder reason — **DPC+**,
+**CDF** and **CDFJ** cartridges carry their own ARM program and expect a processor in
+the cartridge to run it, which is what a Harmony has and this board does not. The menu
+now marks them and refuses them instead of hanging (see above)._
 
 _The audio line exists only on **PicoA10400** — the Pico 2 board uses the
 standard Raspberry Pi Pico footprint, where the cartridge bus consumes every

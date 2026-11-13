@@ -200,6 +200,12 @@ Targets:
                     times seen. This is the number TODO.md phase 0 asked for, and
                     it can only be read off the TV, because the cartridge is in
                     the Atari and not in a PC while it is measured.
+  PicoA10400-ARMT / Pico2A10400-ARMT / Pico2A10400-16MB-ARMT
+                    Diagnostic (0.76): the 32-column menu footer shows how long
+                    the last directory read took and how many files it checked
+                    for ARM cartridges - "LIST 42 MS  85 FILES". The figure
+                    CHAMP_ARM_TODO.md 4.3 asks for before the probe in the
+                    listing can be kept (budget ~150 ms for a full directory).
   PicoA10400-FA2N   Diagnostic (0.50): the FA2 handshake and the full busy delay,
                     but NO flash access at all. Splits the two suspects this
                     feature introduces - "the new bus branch or the core-0
@@ -365,6 +371,9 @@ case "$TARGET_LOWER" in
   picoa10400-fa2t)  BUILD_PICOA10400=1;  BUILD_PICO2A10400=0; DIAG="FA2T" ;;
   picoa10400-fa2n)  BUILD_PICOA10400=1;  BUILD_PICO2A10400=0; DIAG="FA2N" ;;
   pico2a10400-fa2t) BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="FA2T" ;;
+  picoa10400-armt)  BUILD_PICOA10400=1;  BUILD_PICO2A10400=0; DIAG="ARMT" ;;
+  pico2a10400-armt) BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="ARMT" ;;
+  pico2a10400-16mb-armt) BUILD_PICOA10400=0; BUILD_PICO2A10400=1; PICO2_16MB=1; DIAG="ARMT" ;;
   pico2a10400-fa2n) BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="FA2N" ;;
   pico2a10400-e3)   BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="E3" ;;
   pico2a10400-e4)   BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="E4" ;;
@@ -560,6 +569,8 @@ build_sketch() {
       extra_args+=(--build-property "compiler.cpp.extra_flags=-DNV_DIAG_FOOTER=1")
     elif [[ "$diag" == "FA2T" ]]; then
       extra_args+=(--build-property "compiler.cpp.extra_flags=-DFA2_DIAG_TIMING=1")
+    elif [[ "$diag" == "ARMT" ]]; then
+      extra_args+=(--build-property "compiler.cpp.extra_flags=-DARM_DIAG_LISTTIME=1")
     elif [[ "$diag" == "FA2N" ]]; then
       extra_args+=(--build-property "compiler.cpp.extra_flags=-DFA2_DIAG_NOWRITE=1")
     elif [[ "$diag" == "BSP1" ]]; then
@@ -651,9 +662,12 @@ build_sketch() {
   # order the existing _MENU32_NTSC images use. Treating NTSC as the winner,
   # which is what the first version of this did, makes a 16MB NTSC build install
   # itself over the 4MB NTSC image under that image's own name.
-  local variant_tag=""
-  [[ -n "$diag" ]] && variant_tag="$diag"
-  [[ -z "$variant_tag" && -n "$name_suffix" ]] && variant_tag="$name_suffix"
+  # A diagnostic build is a third axis: a 16MB diagnostic image is
+  # "<Sketch>.ino_16MB_<DIAG>.uf2". Letting the diagnostic tag replace the board
+  # tag, as this did until 0.76, installed the 16MB ARMT image under the 4MB
+  # one's name, Pico2A10400.ino_ARMT.uf2.
+  local variant_tag="$name_suffix"
+  [[ -n "$diag" ]] && variant_tag="${variant_tag:+${variant_tag}_}$diag"
   local install_tag="$variant_tag"
   if [[ "$use_ntsc" -eq 1 ]]; then
     install_tag="${install_tag:+${install_tag}_}NTSC"

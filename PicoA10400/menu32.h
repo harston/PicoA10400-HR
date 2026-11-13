@@ -62,7 +62,10 @@
 // to red - the palette measurement in CLAUDE.md):
 //   DIR     light green, so a directory is recognisable without the cursor
 //   CURSOR  yellow, patched into the kernel's `lda #SEL_COL` (SetActiveItem)
-//   OVER    file larger than rom_table, the same red the 12-column menu used
+//   OVER    file larger than rom_table, or an ARM cartridge (0.76). PAL $64,
+//           picked on the TV from TEST_ROMS_KOLORY page 04 (2026-11-13: "best on
+//           the blue background"); until 0.78 it was $68, the 12-column menu's red
+//           made brighter, which the user found too weak
 // A row under the cursor keeps its MEANING and changes only its shade: on the
 // bright yellow bar a colour of similar luminance would vanish (that is what
 // happened to the red of an oversized file), so each kind has a dark variant of
@@ -112,7 +115,7 @@
   #define MENU32_COL_DIR      0x56
  #endif
  #ifndef MENU32_COL_OVER
-  #define MENU32_COL_OVER     0x68
+  #define MENU32_COL_OVER     0x64
  #endif
  #ifndef MENU32_COL_CURSOR
   #define MENU32_COL_CURSOR   0x2A
@@ -145,6 +148,7 @@
 #define MENU32_KIND_DIR   1
 #define MENU32_KIND_UP    2
 #define MENU32_KIND_OVER  3   // file larger than rom_table: loaded truncated
+#define MENU32_KIND_ARM   4   // ARM-coprocessor cartridge: refused (arm_cart.h); drawn as OVER
 
 // Comms, as the kernel uses them (menu32_rom/menu32_hr.asm).
 #define MENU32_CMD_BYTE      0x1FE6  // the Atari WRITES a command byte here
@@ -421,6 +425,7 @@ static unsigned char menu32_kind_colour(unsigned char kind) {
     case MENU32_KIND_DIR:  return MENU32_COL_DIR;
     case MENU32_KIND_UP:   return MENU32_COL_DIR;
     case MENU32_KIND_OVER: return MENU32_COL_OVER;
+    case MENU32_KIND_ARM:  return MENU32_COL_OVER;
     default:               return MENU32_COL_TEXT;
   }
 }
@@ -431,6 +436,7 @@ static unsigned char menu32_kind_cursor_colour(unsigned char kind) {
     case MENU32_KIND_DIR:  return MENU32_COL_CUR_DIR;
     case MENU32_KIND_UP:   return MENU32_COL_CUR_DIR;
     case MENU32_KIND_OVER: return MENU32_COL_CUR_OVER;
+    case MENU32_KIND_ARM:  return MENU32_COL_CUR_OVER;
     default:               return MENU32_COL_CUR_TEXT;
   }
 }

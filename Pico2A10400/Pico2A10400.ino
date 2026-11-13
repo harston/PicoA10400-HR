@@ -367,6 +367,16 @@ static void audio_idle_apply(uint8_t phase) {
 // image is ignored rather than wrapped. Our own SN_BANK_TEST.s78 is what
 // caught the difference; see TODO.md SS8.
 #define CART_TYPE_SN	51	// SN/Eagle .s78, 7x4K banked + SN76489
+
+// ARM-coprocessor 2600 cartridges (arm_cart.h, CHAMP_ARM_TODO.md). 2600 types, so
+// every one of them is listed in the is2600 test in setup1() - numbered above 32
+// they would otherwise get the 7800 clock and no BUS_H drive. Since 0.76 they are
+// recognised, marked in the menu and refused; none has a bus loop yet. ACE (25)
+// joins them in the refusal.
+#define CART_TYPE_DPCP	52	// DPC+ (Harmony): 32K, ARM driver + 6 banks + display data
+#define CART_TYPE_CDF	53	// CDF0/CDF1/CDFJ/CDFJ+ (Harmony, Champ Games); arm_variant says which
+#define CART_TYPE_BUS	54	// BUS, the predecessor of CDF
+#define CART_TYPE_ELF	55	// relocatable ARM ELF (PlusCart-style)
 #define CART_TYPE_JANE	50	// 16K, hotspots $1FF0/$1FF1/$1FF8/$1FF9
 
 // CCM_RAM/CCM_SIZE/RAM_BANKS/CCM_BANKS/MAX_RAM_BANK/MAX_CCM_BANK removed
@@ -502,7 +512,13 @@ char menu_status[16];
 #define MAX_NAME_LEN 128
 char filelist[85*MAX_NAME_LEN]; // 85 entries, MAX_NAME_LEN bytes each (incl. terminator)
 char direntry_isdir[85]; // 1 if filelist[n] is a directory, 0 if a regular file (".." counts as 0: no highlight, not sorted)
-char direntry_toobig[85]; // 1 if filelist[n] cannot be used as listed: file larger than rom_table (loaded truncated), or a name too long to read; shown red in the menu
+// What the menu has to tell about filelist[n], as bits: DIRENT_UNUSABLE - file larger
+// than rom_table (loaded truncated) or a name too long to read; DIRENT_ARM - an ARM
+// coprocessor cartridge that cannot run (arm_cart.h: marked, and refused if chosen).
+// Either one draws the entry in OVERSIZED_COLOUR / MENU32_COL_OVER.
+#define DIRENT_UNUSABLE 0x01
+#define DIRENT_ARM      0x02
+char direntry_flags[85];
 #define MENU_FOOTER_TEXT "AOTTAv01 HR9" // 12 chars: the menu kernel renders exactly 12 per row
 // Stand-in name for a directory entry whose real name does not fit in MAX_NAME_LEN.
 // 12 chars, uppercase only: the row shows exactly 12 and the font has no lowercase.
@@ -591,6 +607,12 @@ volatile u_int8_t new_bank_type=1;
 volatile int romLen=0;
 u_int8_t gamechoosen=0;
 volatile u_int8_t newgame=0;
+// /PLUS/ autostart (0.78) - see plus_scan() above setup(). Core 0 decides in
+// setup() whether the cartridge is one game from its first bus cycle; core 1
+// serves NOTHING until plus_decided is set, and then either the menu (as every
+// version before 0.78) or, with plus_autostart, the game straight away.
+volatile u_int8_t plus_decided = 0;
+volatile u_int8_t plus_autostart = 0;
 volatile u_int8_t rootdir=0;
 volatile uint32_t addrc;
 volatile uint32_t retaddr;
@@ -600,6 +622,16 @@ volatile u_int8_t cart_to_emulate;
 // needs CART_TYPE_NORMALA78, romLen, rom_table, ram_table, pokey_enabled and
 // ym_enabled to already exist, plus nvstore.h for the save slot.
 #include "hsc.h"
+#include "arm_cart.h"  // ARM-coprocessor cartridges: recognised, marked, refused
+
+// Set by LoadGame() when it refuses a file (an ARM cartridge that cannot run), so
+// the menu loop can say why and keep the listing and page where they were.
+static uint8_t load_refused_kind = ARM_KIND_NONE;
+#if ARM_DIAG_LISTTIME
+// ARMT diagnostic build: how long the last directory listing took, and how many
+// files it checked - the figure CHAMP_ARM_TODO.md 4.3 asks to measure.
+static uint32_t arm_list_ms = 0, arm_list_files = 0;
+#endif
   
 ////////////////////////////////////////////////////////////////////////////////////
 //                     REBOOT
@@ -625,19 +657,49 @@ void exit_cartridge(uint32_t addr, uint32_t addr_prev){
 //                    reboot CARTRIDGE
 ////////////////////////////////////////////////////////////////////////////////////
 
+// 0.78: the three bytes reboot_cartridge() feeds are written through this RAM
+// function. Until 0.77 GCC left those three gpio_put_masked() calls out of line
+// as gpio_put_masked.constprop.0 - in FLASH, reached through a veneer (the
+// check_hotpath.sh warning about setup1()). Once reboot_cartridge() had to be
+// always_inline (see there), the RP2350 build inlined them instead, and the
+// changed register pressure reshuffled the menu loop and several 2600 loops in
+// setup1(). A call of the same shape keeps setup1() as it was - and the
+// hand-over no longer runs a single instruction from flash.
+static void __no_inline_not_in_flash_func(reboot_put)(uint32_t value) {
+  gpio_put_masked(DATA_PIN_MASK, value);
+}
+
+// always_inline (0.78): with the /PLUS/ test at its top, GCC for the RP2350 split
+// this function - the test inlined into setup1(), the rest outlined as
+// reboot_cartridge.part.0 IN FLASH, called through a veneer together with an
+// outlined gpio_put_masked() - i.e. the menu -> game hand-over would have run from
+// XIP. It was always inlined whole until 0.77; this keeps it that way.
+__attribute__((always_inline)) inline
 void reboot_cartridge(uint32_t addr, uint32_t addr_prev){
+  // 0.78 /PLUS/ autostart: no menu ran, so there is no running CPU to redirect - the
+  // console, or a 2600+/7800+ cartridge reader, starts on the game exactly as on any
+  // ROM cartridge, reset vector included. Feeding it JMP ($FFFC) would put three
+  // foreign bytes into its first reads instead. The test sits HERE and not around
+  // the call in setup1(): this function is inlined there, and written at the call
+  // site the same test moved the far-branch layout of five inline 2600 bus loops
+  // on the RP2040 (4KSC, E7, FA, FA2, F0 - compared block by block in the
+  // disassembly). Here, with reboot_put() below, every bus loop in setup1() keeps
+  // its instructions: identical on the RP2040; on the RP2350 four branches changed
+  // only their encoding width (b/b.w in F8SC, F4SC, FC, 3E), which is the same
+  // cycle count on a Cortex-M33.
+  if (__builtin_expect(plus_autostart, 0)) return;   // unlikely: keeps the rest inlined whole
 retry:
   while(!(addr=gpio_get_all()&BUS_PIN_MASK) & 0x1000);
-  gpio_put_masked(DATA_PIN_MASK,0x6c<<D0_PIN);    // (NOP) or data for SWCHB
+  reboot_put(0x6c<<D0_PIN);    // (NOP) or data for SWCHB
 	SET_DATA_MODE_OUT;
 	while ((gpio_get_all()&BUS_PIN_MASK) == addr);
   
   addr = gpio_get_all()&BUS_PIN_MASK;
-	 gpio_put_masked(DATA_PIN_MASK,0xfc<<D0_PIN); // (BRK)
+	 reboot_put(0xfc<<D0_PIN); // (BRK)
  
   while ((gpio_get_all()&BUS_PIN_MASK) == addr);
    
-   gpio_put_masked(DATA_PIN_MASK,0xff<<D0_PIN); // (BRK)
+   reboot_put(0xff<<D0_PIN); // (BRK)
   while ((gpio_get_all()&BUS_PIN_MASK) == addr);
   //if ((gpio_get_all()&BUS_PIN_MASK) != 0xfffc) goto retry;
 }
@@ -779,8 +841,34 @@ void __time_critical_func(emulate_supercart_ef()) {
   // never be reproduced. Core 0 (USB/menu) is unaffected; this function never
   // returns, so nothing needs restoring.
   __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
-      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      uint32_t addr=0, addr_prev=0, rawaddr=0;
       uint8_t rom_in_use=1;
+      // Bank-number mask derived from the real ROM size - see the identical
+      // comment in emulate_supercart_ram() for the full reasoning and sources.
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
+      // Geometry from the same mask (0.75), the way MAME's a78_sg serves a plain
+      // SuperGame board (rom.cpp:347-361): $C000 is bank m_bank_mask - the last
+      // bank for every even bank count - and $4000 is the bank below it. Until
+      // 0.74 both were constants for 128KB (0x10000 above $C000, bank 6 at
+      // $4000), so a 64KB or 256KB image fetched its reset vector from past its
+      // own end. For 128KB top[addr] is exactly rom_table[addr + 0x10000] and
+      // top[addr + 0x4000] exactly bank 6.
+      //
+      // ONE pointer serves both windows because $4000 is always the bank right
+      // below $C000. Two separate offsets were tried first and cost the RP2040 a
+      // register it does not have: GCC then rebuilt the SIO base address on
+      // nearly every path of this loop (read in the .elf). This keeps the live
+      // set of 0.74. A mask of 0 - an image under 32KB - counts as 1 so that
+      // $4000 cannot point below rom_table; identify_cartridge() keeps romLen
+      // within what was loaded, so nothing here points past it either.
+      const uint8_t *top = (const uint8_t *)((uintptr_t)rom_table
+                            + (sc_bank_mask ? sc_bank_mask : 1) * 0x4000 - 0xC000);
+      // bank_ptr points at the 16KB shown at $8000-$BFFF; a pointer rather than a
+      // byte offset for the reason given in emulate_supercart_large() - it takes
+      // the add out of every $8000 fetch.
+      const uint8_t *bank_ptr = rom_table;
       
       while (1) {    // Get address
              // Get address
@@ -791,8 +879,8 @@ void __time_critical_func(emulate_supercart_ef()) {
             addr=addr | 0x8000;
             // Check for A14
             if (addr & A14_PIN_MASK) {
-                // Set the data on the bus for fixed bank 7
-                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x10000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                // Set the data on the bus for the fixed last bank
+                sio_hw->gpio_out = (uint32_t)top[addr] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == READ_PIN_MASK) {
                     // Read cycle
@@ -803,7 +891,7 @@ void __time_critical_func(emulate_supercart_ef()) {
                 }
             } else {
                 // Set the data on the bus for active bank
-                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                sio_hw->gpio_out = (uint32_t)bank_ptr[addr & 0x3fff] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 // Check for RW
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
@@ -832,42 +920,19 @@ void __time_critical_func(emulate_supercart_ef()) {
                           }
                           rawaddr = last;
                         }
-                        switch ((rawaddr >> D0_PIN) & 0xff) {
-                        case 0:
-                            bank = 0;
-                            break;
-                        case 1:
-                            bank = 0x4000;
-                            break;
-                        case 2:
-                            bank = 0x8000;
-                            break;
-                        case 3:
-                            bank = 0xc000;
-                            break;
-                        case 4:
-                            bank = 0x10000;
-                            break;
-                        case 5:
-                            bank = 0x14000;
-                            break;
-                        case 6:
-                            bank = 0x18000;
-                            break;
-                        case 7:
-                            bank = 0x1c000;
-                            break;
-                        default:
-                            break;
-                        }
+                        // 0.75: the mask replaces a "switch 0..7" that assumed eight
+                        // banks and kept the old bank for any other value. MAME wraps
+                        // the value against the mask instead (rom.cpp:357-361), and
+                        // PicoA10400 has done the same here for many versions.
+                        bank_ptr = rom_table + ((rawaddr >> D0_PIN) & sc_bank_mask) * 0x4000;
                         rom_in_use = 0;
                     }
                 }
             }
         } else {
-            // EXFIX - bank 6 is in 0x4000
+            // EXFIX - the bank below the fixed one (bank 6 of 128KB) is at 0x4000
             if (addr & 0x4000) {
-                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + 0x18000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                sio_hw->gpio_out = (uint32_t)top[addr + 0x4000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & (READ_PIN_MASK );
 	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
                     // Read cycle
@@ -2208,8 +2273,34 @@ void __time_critical_func(emulate_supercart_ef_pokey()) {
       // no POKEY at all (Alien Brigade) start glitching on the other board.
       const uint32_t pkbase = (uint32_t)pokey_base;
       const uint32_t pkmask = (uint32_t)pokey_mask;
-      uint32_t bank=0, addr=0, addr_prev=0, rawaddr=0;
+      uint32_t addr=0, addr_prev=0, rawaddr=0;
       uint8_t rom_in_use=1;
+      // Bank-number mask derived from the real ROM size - see the identical
+      // comment in emulate_supercart_ram() for the full reasoning and sources.
+      const uint32_t sc_nbanks = (uint32_t)romLen / 0x4000;
+      const uint32_t sc_bank_mask = (sc_nbanks < 2) ? 0
+                                  : ((sc_nbanks & 1) ? (sc_nbanks - 2) : (sc_nbanks - 1));
+      // Geometry from the same mask (0.75), the way MAME's a78_sg serves a plain
+      // SuperGame board (rom.cpp:347-361): $C000 is bank m_bank_mask - the last
+      // bank for every even bank count - and $4000 is the bank below it. Until
+      // 0.74 both were constants for 128KB (0x10000 above $C000, bank 6 at
+      // $4000), so a 64KB or 256KB image fetched its reset vector from past its
+      // own end. For 128KB top[addr] is exactly rom_table[addr + 0x10000] and
+      // top[addr + 0x4000] exactly bank 6.
+      //
+      // ONE pointer serves both windows because $4000 is always the bank right
+      // below $C000. Two separate offsets were tried first and cost the RP2040 a
+      // register it does not have: GCC then rebuilt the SIO base address on
+      // nearly every path of this loop (read in the .elf). This keeps the live
+      // set of 0.74. A mask of 0 - an image under 32KB - counts as 1 so that
+      // $4000 cannot point below rom_table; identify_cartridge() keeps romLen
+      // within what was loaded, so nothing here points past it either.
+      const uint8_t *top = (const uint8_t *)((uintptr_t)rom_table
+                            + (sc_bank_mask ? sc_bank_mask : 1) * 0x4000 - 0xC000);
+      // bank_ptr points at the 16KB shown at $8000-$BFFF; a pointer rather than a
+      // byte offset for the reason given in emulate_supercart_large() - it takes
+      // the add out of every $8000 fetch.
+      const uint8_t *bank_ptr = rom_table;
       
       while (1) {    // Get address
              // Get address
@@ -2220,8 +2311,8 @@ void __time_critical_func(emulate_supercart_ef_pokey()) {
             addr=addr | 0x8000;
             // Check for A14
             if (addr & A14_PIN_MASK) {
-                // Set the data on the bus for fixed bank 7
-                sio_hw->gpio_out = (uint32_t)rom_table[addr + 0x10000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                // Set the data on the bus for the fixed last bank
+                sio_hw->gpio_out = (uint32_t)top[addr] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == READ_PIN_MASK) {
                     // Read cycle
@@ -2232,7 +2323,7 @@ void __time_critical_func(emulate_supercart_ef_pokey()) {
                 }
             } else {
                 // Set the data on the bus for active bank
-                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + bank] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+                sio_hw->gpio_out = (uint32_t)bank_ptr[addr & 0x3fff] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 // Check for RW
                 rawaddr = gpio_get_all() & READ_PIN_MASK;
 	          if (rawaddr == (RW_PIN_MASK | A15_PIN_MASK)) {  // READ ROM
@@ -2261,42 +2352,30 @@ void __time_critical_func(emulate_supercart_ef_pokey()) {
                           }
                           rawaddr = last;
                         }
-                        switch ((rawaddr >> D0_PIN) & 0xff) {
-                        case 0:
-                            bank = 0;
-                            break;
-                        case 1:
-                            bank = 0x4000;
-                            break;
-                        case 2:
-                            bank = 0x8000;
-                            break;
-                        case 3:
-                            bank = 0xc000;
-                            break;
-                        case 4:
-                            bank = 0x10000;
-                            break;
-                        case 5:
-                            bank = 0x14000;
-                            break;
-                        case 6:
-                            bank = 0x18000;
-                            break;
-                        case 7:
-                            bank = 0x1c000;
-                            break;
-                        default:
-                            break;
-                        }
+                        // 0.75: the mask replaces a "switch 0..7" that assumed eight
+                        // banks and kept the old bank for any other value. MAME wraps
+                        // the value against the mask instead (rom.cpp:357-361), and
+                        // PicoA10400 has done the same here for many versions.
+                        bank_ptr = rom_table + ((rawaddr >> D0_PIN) & sc_bank_mask) * 0x4000;
                         rom_in_use = 0;
                     }
                 }
             }
         } else {
-            // EXFIX - bank 6 is in 0x4000
+            // EXFIX - the bank below the fixed one (bank 6 of 128KB) is at 0x4000
             if (addr & 0x4000) {
-                sio_hw->gpio_out = (uint32_t)rom_table[(addr & 0x3fff) + 0x18000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
+              // POKEY @$4000 (byte54 bit0) replaces this window entirely. MAME:
+              // a78_rom_sg_pokey_device::read_40xx returns m_pokey->read(offset & 0x0f)
+              // for the whole $4000-$7FFF range and write_40xx sends writes there to
+              // the chip - the ROM below is the NON-POKEY SuperGame layout. Until
+              // 0.75 only PicoA10400 did this; this board served ROM here to Commando
+              // and every other SuperGame + POKEY@$4000 cart, so a read of a POKEY
+              // register returned a byte of bank 6. pkbase is a hoisted constant, so
+              // this costs one register compare, and only in the POKEY variant.
+              if (pkbase == 0x4000) {
+                pokey_window_service(addr, &rom_in_use);   // mirrors every 16 bytes
+              } else {
+                sio_hw->gpio_out = (uint32_t)top[addr + 0x4000] << D0_PIN;  // v0.13: D0-D7 are the only outputs in 7800 modes
                 rawaddr = gpio_get_all() & (READ_PIN_MASK );
 	        if (rawaddr == (RW_PIN_MASK | A14_PIN_MASK)) {
                     // Read cycle
@@ -2310,6 +2389,7 @@ void __time_critical_func(emulate_supercart_ef_pokey()) {
                         rom_in_use = 0;
                     }
                 }
+              }   // end of the non-POKEY $4000-$7FFF branch
             } else {
                 // $0000-$3FFF. The $0450/$0440/$0800 POKEY windows live here, below
                 // every SuperGame window, so they cannot collide with ROM/RAM.
@@ -4038,6 +4118,28 @@ void setup_fa2() {
   for (int b = 0; b < 7; b++) rom_table[b * 4096 + 0xFF4] &= (uint8_t)~0x40;
 }
 
+////////////////////////////////////////////////////////////////////////////////////
+//                     /PLUS/ AUTOSTART, core 1 side (0.78)
+////////////////////////////////////////////////////////////////////////////////////
+// Serve nothing until core 0 has decided between the menu and a game from /PLUS/
+// (plus_scan()/plus_boot() above setup()). The data lines are still inputs here,
+// so the bus sees an empty slot meanwhile. Interrupts MUST stay on in this wait:
+// core 0's flash.begin() runs during it and parks this core through
+// rp2040.idleOtherCore(), which is taken in the inter-core interrupt. Without a
+// /PLUS/ candidate the wait is one filesystem mount plus one directory lookup;
+// until 0.78 the menu was served from the first microsecond instead, while setup()
+// was still writing the MENU32 page into rom_table.
+//
+// A function of its own, never inlined: setup1() also holds the menu loop and the
+// inline 2600 bus loops, and the same lines written into it moved the register
+// allocation of those loops (seen in the disassembly). As a call that takes the
+// place of setup1()'s own "newgame=0" store, setup1() keeps its size up to here.
+static void __no_inline_not_in_flash_func(plus_core1_wait)(void) {
+  while (!plus_decided) tight_loop_contents();
+  __dmb();                          // pairs with core 0's barrier before plus_decided = 1
+  newgame = plus_autostart ? 1 : 0; // what setup1()'s "newgame=0" used to do, for the menu
+}
+
 void __time_critical_func(setup1()) {   //HandleBUS()
 	
   u_int8_t data, data_prev;
@@ -4097,7 +4199,9 @@ void __time_critical_func(setup1()) {   //HandleBUS()
 //Serial.println("menu");
 bool comms_enabled = false;
 
-newgame=0; // poi rimetti 1
+// 0.78: was "newgame=0; // poi rimetti 1". plus_core1_wait() waits for core 0's
+// menu-or-/PLUS/ decision and then leaves newgame at 0 (menu) or 1 (/PLUS/ game).
+plus_core1_wait();
 //exit_cartridge(0,0);
 
     //comms_enabled=true; // poi via?
@@ -4244,7 +4348,11 @@ start:
                       || (cart_to_emulate == CART_TYPE_UA)
                       || (cart_to_emulate == CART_TYPE_UASW)
                       || (cart_to_emulate == CART_TYPE_FC)
-                      || (cart_to_emulate == CART_TYPE_JANE);
+                      || (cart_to_emulate == CART_TYPE_JANE)
+                      || (cart_to_emulate == CART_TYPE_DPCP)
+                      || (cart_to_emulate == CART_TYPE_CDF)
+                      || (cart_to_emulate == CART_TYPE_BUS)
+                      || (cart_to_emulate == CART_TYPE_ELF);
 
   if (ym_enabled) {
    vreg_set_voltage(VREG_VOLTAGE_1_25);
@@ -4311,6 +4419,7 @@ start:
   if (cart_to_emulate >= CART_TYPE_BANKSET && cart_to_emulate <= CART_TYPE_BANKSET_SG_RAM)
     setup_bankset();
 
+  // With a /PLUS/ autostart (0.78) reboot_cartridge() returns at once - see there.
   reboot_cartridge(addr,addr_prev);
   
   //exit_cartridge(addr,addr_prev);
@@ -6093,6 +6202,7 @@ int identify_cartridge(char *filename)
   // one must not inherit its sound chip and hand core 0 to a synthesiser the
   // game never asked for.
   sn76489_enabled = 0;
+  arm_variant = ARM_KIND_NONE;
   // Header byte 58 is the save-device field; nothing read it before 0.52. Cleared
   // here for the same reason as ym_enabled - a 2600 file must not inherit the
   // previous 7800 cart's declaration.
@@ -6492,17 +6602,20 @@ int identify_cartridge(char *filename)
               // emulate_supercart_large() now takes its geometry from romLen
               // instead of assuming nine banks.
               cart_type = CART_TYPE_SUPERCART_ROM;
-          } else if(image_size > (131072+0x80)) {
-            // What still lands here is a plain SuperGame (0x02) or bank-6
-            // (0x12) image over 128KB, or a flat header declaring more than a
-            // flat cart holds. None of them is a 9-bank board, so none is served
-            // correctly - emulate_supercart_ef() is written for 128KB and there
-            // is no loop for a bigger plain SuperGame. Left as it was.
-            cart_type = CART_TYPE_SUPERCART_LARGE;
           } else if(A78_HEADER[54] == 2 || A78_HEADER[54] == 3) {
+              // Plain SuperGame, also before the size test since 0.75: MAME's
+              // a78_sg / a78_sg_pokey at any size (a78_slot.cpp:413-414), and
+              // emulate_supercart_ef() now takes its geometry from romLen. Until
+              // 0.74 a 256KB image ("Bomber Hero") went to the 9-bank loop, which
+              // shows bank value+1 at $8000.
               cart_type = CART_TYPE_SUPERCART;
             } else if(A78_HEADER[54] == 18 || A78_HEADER[54] == 19) {
               cart_type = CART_TYPE_SUPERCART_EF;
+          } else if(image_size > (131072+0x80)) {
+            // What still lands here is a header whose byte 54 names no board this
+            // firmware knows, declaring more than a flat cart holds. None of them
+            // is a 9-bank board; left as it was.
+            cart_type = CART_TYPE_SUPERCART_LARGE;
           } else {
             cart_type = CART_TYPE_NORMALA78;
           }
@@ -6537,6 +6650,15 @@ int identify_cartridge(char *filename)
 	if (is_ace_cartridge(bytes_read, rom_table))
 	{
 		cart_type = CART_TYPE_ACE;
+	}
+	// ARM-coprocessor cartridges (arm_cart.h), ahead of the size tree as in Stella:
+	// the same probe on the same first 4 KB as the menu listing and LoadGame(), with
+	// the file's real size (image_size may have been cut to rom_table). LoadGame()
+	// refuses these before this function runs, so today this only keeps the three
+	// in agreement - and is where the later stages will pick them up.
+	else if ((arm_variant = arm_probe(rom_table, bytes_read, file.fileSize())) != ARM_KIND_NONE)
+	{
+		cart_type = arm_cart_type_of(arm_variant);
 	}
 	else if (image_size <= 64 * 1024 && (image_size % 1024) == 0 && isProbably3EPlus(image_size, rom_table))
 	{
@@ -6768,7 +6890,15 @@ int32_t msc_read_cb (uint32_t lba, void* rom_table, uint32_t bufsize)
 // return number of written bytes (must be multiple of block size)
 int32_t msc_write_cb (uint32_t lba, uint8_t* rom_table, uint32_t bufsize)
 {
- 
+  // 0.78: refused while a /PLUS/ game runs. Every flash write of the Adafruit
+  // driver parks core 1 through rp2040.idleOtherCore(), which waits for core 1 to
+  // take an interrupt - and the emulate_* loops run with interrupts off (cpsid i).
+  // Core 0 would hang for good, with the USB drive dead and /PLUS/ impossible to
+  // rename. plus_boot() keeps a PC-attached cart out of autostart in the first
+  // place; this covers a USB cable plugged in later. msc_writable_cb() makes the
+  // host mount the drive read-only then, so it does not try at all.
+  if (plus_autostart) return -1;
+
   // Note: SPIFLash Block API: readBlocks/writeBlocks/syncBlocks
   // already include 4K sector caching internally. We don't need to cache it, yahhhh!!
   return flash.writeBlocks(lba, rom_table, bufsize / 512) ? bufsize : -1;
@@ -6778,6 +6908,10 @@ int32_t msc_write_cb (uint32_t lba, uint8_t* rom_table, uint32_t bufsize)
 // used to flush any pending cache.
 void msc_flush_cb (void)
 {
+  // 0.78: nothing can be pending during a /PLUS/ game (msc_write_cb() refuses
+  // every write), and the FatFs cache is not ours to clear then.
+  if (plus_autostart) return;
+
   // sync with flash
   flash.syncBlocks();
 
@@ -6786,6 +6920,14 @@ void msc_flush_cb (void)
 
   fs_changed = true;
 
+}
+
+// 0.78: whether the host may write the drive - read-only while a /PLUS/ game
+// runs (see msc_write_cb()), writable otherwise, which is what the driver
+// reports when no callback is registered at all.
+bool msc_writable_cb (void)
+{
+  return !plus_autostart;
 }
 // check if dir up
 bool checkDirUp (char* fileto) {
@@ -6859,6 +7001,20 @@ void LoadGame(int numfile) {
   //    AtariMenu(1);
  
   } else {
+    // An ARM-coprocessor cartridge that cannot run is refused HERE, before
+    // identify_cartridge() copies the file into rom_table: rom_table holds the menu
+    // kernel and page, and once they are overwritten there is no way back to the
+    // menu. Checked again rather than trusted from the listing, which may be stale
+    // (files changed over USB while the menu was up).
+    {
+      uint8_t kind = arm_classify(filetoopen, &file);
+      if (kind != ARM_KIND_NONE && !arm_cart_runnable(kind)) {
+        file.close();
+        load_refused_kind = kind;
+        Serial.print("refused: ARM cartridge ");Serial.println(arm_kind_name(kind));
+        return;
+      }
+    }
     Serial.println("start loading");
     file.close();
 
@@ -6948,7 +7104,7 @@ void sortFileList(int start, int count) {
       memcpy(&filelist[i*MAX_NAME_LEN],&filelist[best*MAX_NAME_LEN],MAX_NAME_LEN);
       memcpy(&filelist[best*MAX_NAME_LEN],tmp,MAX_NAME_LEN);
       char t=direntry_isdir[i]; direntry_isdir[i]=direntry_isdir[best]; direntry_isdir[best]=t;
-      t=direntry_toobig[i]; direntry_toobig[i]=direntry_toobig[best]; direntry_toobig[best]=t;
+      t=direntry_flags[i]; direntry_flags[i]=direntry_flags[best]; direntry_flags[best]=t;
     }
   }
 }
@@ -6964,7 +7120,7 @@ void renderEntry(int idx, int off) {
     if ((c>96) && (c<123)) c=c-32; // the font has no lowercase letters
     if (c==0) c=32;
     if ((i==0) && direntry_isdir[idx]) c=c|0x80;
-    if ((i==1) && direntry_toobig[idx]) c=c|0x80;
+    if ((i==1) && direntry_flags[idx]) c=c|0x80;   // too big, name too long, or ARM: red
     menu_ram[idx*12+i]=c;
   }
 }
@@ -7042,9 +7198,31 @@ static const char *menu32_build_header(void) {
   return menu32_header_text;
 }
 
+// A one-off message for the footer, shown by the next page build instead of the
+// page count and cleared by it: why a chosen file was refused. menu32_notice_up
+// says the footer on screen is such a message, so the first cursor move can put
+// the ordinary footer back (menu32_marquee_step()) - 0.76 kept it until the page
+// changed, which read as if every file the cursor reached was refused too.
+static char menu32_notice[MENU32_COLS + 1];
+static unsigned char menu32_notice_up = 0;
+
 // The footer row: which page, and how much of the directory is on it.
 static const char *menu32_build_footer(void) {
   char left[16], right[20];
+  menu32_notice_up = 0;
+  if (menu32_notice[0]) {
+    menu32_pad_line(menu32_footer_text, menu32_notice, 0);
+    menu32_notice[0] = 0;
+    menu32_notice_up = 1;
+    return menu32_footer_text;
+  }
+#if ARM_DIAG_LISTTIME
+  // ARMT: the time the last directory read took, and how many files it checked.
+  snprintf(left, sizeof(left), "LIST %lu MS", (unsigned long)arm_list_ms);
+  snprintf(right, sizeof(right), "%lu FILES", (unsigned long)arm_list_files);
+  menu32_pad_line(menu32_footer_text, left, right);
+  return menu32_footer_text;
+#endif
   int first = menu_count ? menu32_page * MENU32_ITEMS + 1 : 0;
   int last  = first + menu32_map.items - 1;
   if (last < first) last = first;
@@ -7063,9 +7241,10 @@ static const char *menu32_build_footer(void) {
 // back, so a directory lost its mark the moment the cursor had been on it.)
 //
 //   column 1  what the entry IS: "/" directory, "^" the way up, "+" a file,
-//             "X" a file that cannot be used (today: larger than rom_table)
-//   column 2  reserved, a space for now - the place for a second flag, e.g.
-//             which console a file is for
+//             "X" a file that cannot be used (larger than rom_table, or an
+//             ARM-coprocessor cartridge - then column 2 says "A")
+//   column 2  why an "X" file cannot be used: "A" = an ARM-coprocessor cartridge
+//             (arm_cart.h); a space otherwise
 //   column 3+ the name, 30 characters of it
 //
 // The marks are not part of the name: they never move with it, they do not
@@ -7078,13 +7257,15 @@ static const char *menu32_build_footer(void) {
 #define MENU32_MARK_UP    '^'
 #define MENU32_MARK_FILE  '+'
 #define MENU32_MARK_OVER  'X'
+#define MENU32_MARK_ARM   'A'     // column 2, next to the "X"
 #define MENU32_NAME_COLS  (MENU32_COLS - 2)
 static void menu32_display_name(int idx, int off, char *dst, int size);
 
 static unsigned char menu32_kind_of(int idx) {
   const char *name = &filelist[idx * MAX_NAME_LEN];
   if (name[0] == '.' && name[1] == '.' && name[2] == 0) return MENU32_KIND_UP;
-  if (direntry_toobig[idx]) return MENU32_KIND_OVER;
+  if (direntry_flags[idx] & DIRENT_ARM) return MENU32_KIND_ARM;   // before OVER: says more
+  if (direntry_flags[idx]) return MENU32_KIND_OVER;
   if (direntry_isdir[idx])  return MENU32_KIND_DIR;
   return MENU32_KIND_FILE;
 }
@@ -7097,11 +7278,13 @@ static void menu32_display_name(int idx, int off, char *dst, int size) {
     case MENU32_KIND_DIR:  mark = MENU32_MARK_DIR;  break;
     case MENU32_KIND_UP:   mark = MENU32_MARK_UP;   break;
     case MENU32_KIND_OVER: mark = MENU32_MARK_OVER; break;
+    case MENU32_KIND_ARM:  mark = MENU32_MARK_OVER; break;
     default:               mark = MENU32_MARK_FILE; break;
   }
+  const char why = menu32_kind_of(idx) == MENU32_KIND_ARM ? MENU32_MARK_ARM : ' ';
   if (off < 0) off = 0;
   if (off > len) off = len;
-  snprintf(dst, size, "%c %s", mark, name + off);   // the marks stay, the name scrolls
+  snprintf(dst, size, "%c%c%s", mark, why, name + off);   // the marks stay, the name scrolls
 }
 
 // Scrolling state for the highlighted row. A row exists twice - once per frame
@@ -7109,12 +7292,13 @@ static void menu32_display_name(int idx, int off, char *dst, int size) {
 // moves on, or the two halves of the interlaced row would show different text.
 static int menu32_m_row = -1, menu32_m_off = 0, menu32_m_tick = 0, menu32_m_restore = -1;
 static unsigned char menu32_m_todo = 0, menu32_m_restore_todo = 0, menu32_m_col_todo = 0;
+static unsigned char menu32_m_foot_todo = 0;   // phases still showing a refusal notice
 static uint32_t menu32_m_last = 0;
 
 static void menu32_marquee_reset(void) {
   menu32_m_row = -1;
   menu32_m_off = menu32_m_tick = 0;
-  menu32_m_todo = menu32_m_restore_todo = menu32_m_col_todo = 0;
+  menu32_m_todo = menu32_m_restore_todo = menu32_m_col_todo = menu32_m_foot_todo = 0;
   menu32_m_restore = -1;
 }
 
@@ -7150,6 +7334,12 @@ static void menu32_show_page(int page) {
   rom_table[0] = 0x00;                        // busy
   menu32_build_page(rom_table, items, n, menu32_page, menu32_pages,
                     menu32_build_header(), menu32_build_footer(), &menu32_map);
+  // The last cursor report belongs to the page the kernel is leaving: after a
+  // selection it sets CurItem = 0 (menu32_hr.asm, after WaitCart), and comparing
+  // that with the stale row looked like a cursor move - which wiped a refusal
+  // notice in its first frame (0.77 on hardware). Wait for a report from this
+  // page. Done while still busy: the kernel reports from SetActiveItem only.
+  menu32_cursor = -1;
   rom_table[0] = 0xD8;                       // ready: the kernel's wait loop looks for CLD
   menu32_marquee_reset();
 }
@@ -7174,6 +7364,10 @@ static void menu32_marquee_step(void) {
     menu32_m_restore_todo &= (unsigned char)~bit;
     if (!menu32_m_restore_todo) menu32_m_restore = -1;
   }
+  if (menu32_m_foot_todo & bit) {            // the refusal notice goes, the page count comes back
+    menu32_update_row(rom_table, &menu32_map, parity, menu32_map.rows - 1, menu32_footer_text);
+    menu32_m_foot_todo &= (unsigned char)~bit;
+  }
 
   idx = menu32_page * MENU32_ITEMS + row;
   if (idx >= menu_count) return;
@@ -7182,6 +7376,10 @@ static void menu32_marquee_step(void) {
     if (menu32_m_row >= 0) {
       menu32_m_restore = menu32_m_row;       // its own colour, and its name unscrolled
       menu32_m_restore_todo = 3;
+      if (menu32_notice_up && MENU32_FOOTER) {   // a real move, not the first report
+        menu32_build_footer();               // the notice is spent: this is the page count
+        menu32_m_foot_todo = 3;
+      }
     }
     menu32_m_row = row;
     menu32_m_off = menu32_m_tick = 0;
@@ -7227,7 +7425,11 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
       contfile=0;
       memset(filelist,0,sizeof(filelist));
       memset(direntry_isdir,0,sizeof(direntry_isdir));
-      memset(direntry_toobig,0,sizeof(direntry_toobig));
+      memset(direntry_flags,0,sizeof(direntry_flags));
+#if ARM_DIAG_LISTTIME
+      const uint32_t arm_list_t0 = millis();
+      arm_list_files = 0;
+#endif
       root.rewind();
       // Serial.println(" Menu-1:");
 
@@ -7293,13 +7495,27 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
             char *ext = strrchr(filename, '.');
             if (ext && (ext[1]=='a'||ext[1]=='A') && ext[2]=='7' && ext[3]=='8' && payload>=0x80)
               payload -= 0x80;
-            direntry_toobig[contfile] = (!namefits || (!isdir && payload > sizeof(rom_table))) ? 1 : 0;
+            uint8_t flags = (!namefits || (!isdir && payload > sizeof(rom_table))) ? DIRENT_UNUSABLE : 0;
+            // An ARM cartridge is marked here, while the file is open anyway: 4 KB
+            // read for a size an ARM format can have, 64 bytes for any other size,
+            // nothing for a name whose extension decides the type (arm_classify()).
+            if (!isdir && namefits) {
+              uint8_t kind = arm_classify(filename, &file);
+#if ARM_DIAG_LISTTIME
+              arm_list_files++;
+#endif
+              if (kind != ARM_KIND_NONE && !arm_cart_runnable(kind)) flags |= DIRENT_ARM;
+            }
+            direntry_flags[contfile] = flags;
             contfile++;
           }
           file.close();
         }
       }
 
+#if ARM_DIAG_LISTTIME
+      arm_list_ms = millis() - arm_list_t0;   // pass 1: the directory walk with its probes
+#endif
       // pass 2: sort real entries (".." excluded) - directories first, alphabetical within each group
       sortFileList(firstentry, contfile-firstentry);
 
@@ -7341,6 +7557,153 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
    }
 }
 ////////////////////////////////////////////////////////////////////////////////////
+//                     /PLUS/ AUTOSTART (0.78)
+////////////////////////////////////////////////////////////////////////////////////
+// The Atari 2600+ and 7800+ never execute the cartridge. A reader in the console
+// dumps it over the bus, an emulator runs the copy, and the reader keeps reading
+// the slot to notice a cartridge being swapped. No menu can work there: the reader
+// sweeps the whole window, and in the menu loop a read of $1EFF alone is
+// CART_CMD_START_CART. What works is a cartridge that is ONE game from its first
+// bus cycle - which is how Harmony's AUTOROM.BIN is used on those consoles.
+//
+// So: when /PLUS/ holds a usable ROM, the cartridge boots that ROM and only that;
+// without one nothing differs from 0.77. Nothing tells a Plus console from a real
+// one before the first bus cycle, so this is a single-game mode on every console -
+// on a real 7800 the game is entered by the BIOS like any cartridge, without the
+// menu and without the power cycle a game chosen from the menu needs.
+//
+// Usable: a file, not hidden, not starting with '.' (macOS puts a "._name"
+// companion next to every file it copies), a name that fits, an extension
+// identify_cartridge() knows (ext_to_cart_type_map[]), a payload that fits
+// rom_table, and none of the types that cannot run as a plain cartridge: AR (the
+// Supercharger loads its game from tape into cartridge RAM) and the ARM types
+// arm_cart_runnable() refuses. With several, the first by name, ignoring case, so
+// the choice does not depend on directory order.
+//
+// What the game must not meet once core 1 serves it - the bus loops run with
+// interrupts off and the console may read the slot at any moment:
+//   * a flash write through the Adafruit driver. It parks core 1 through
+//     rp2040.idleOtherCore(), which needs core 1 to take an interrupt, so core 0
+//     would hang instead. Hence no autostart on a cartridge attached to a PC
+//     (plus_boot()), nv_init() with may_create false, and msc_write_cb() refusing
+//     writes for a cable plugged in later;
+//   * the High Score Cart windows at $1000-$17FF and $3000-$3FFF. A real cartridge
+//     is silent there and a reader could take the HSC BIOS for ROM, so
+//     hsc_prepare() is not called: hsc_enabled stays 0 and the plain loop runs;
+//   * the menu set-up at the top of loop() - skipped, see there.
+
+#define PLUS_DIR          "/PLUS"
+// How long after power-on a USB host gets to show itself before the cartridge
+// commits to a /PLUS/ game. tud_connected() turns true at the host's first SETUP
+// packet; USB 2.0 gives a host at least ~170 ms after attach for it (100 ms
+// debounce, bus reset, recovery) and real hosts take 150-500 ms. A cartridge
+// powered by a console, a power bank or a charger never sees one. Only a cartridge
+// WITH a /PLUS/ candidate waits: a 2600+/7800+ reader finds the slot empty on its
+// first reads and takes the game on a later one, and on a real console the
+// cartridge is switched on before the console anyway (upstream README, NOTE 2).
+#define PLUS_HOST_WAIT_MS 1000
+
+static char plus_name[MAX_NAME_LEN];   // the file plus_scan() picked, name only
+static bool plus_candidate = false;
+
+// The type the extension of <name> selects, read exactly the way
+// identify_cartridge() reads it - the three characters after the last dot,
+// letters upper-cased, against ext_to_cart_type_map[] - or -1 for an extension
+// that table does not know.
+static int plus_ext_type(const char *name) {
+  const char *dot = strrchr(name, '.');
+  if (!dot) return -1;
+  char ext[3] = {0, 0, 0};
+  for (int i = 0; i < 3 && dot[1 + i]; i++)
+    ext[i] = (dot[1 + i] > 96) ? dot[1 + i] - 32 : dot[1 + i];
+  for (const EXT_TO_CART_TYPE_MAP *p = ext_to_cart_type_map; p->ext; p++)
+    if (memcmp(ext, p->ext, 3) == 0) return p->cart_type;   // every entry is >= 2 chars + NUL
+  return -1;
+}
+
+// strcmp() ignoring the case of ASCII letters.
+static int plus_namecmp(const char *a, const char *b) {
+  for (;; a++, b++) {
+    int ca = (unsigned char)*a, cb = (unsigned char)*b;
+    if (ca >= 'a' && ca <= 'z') ca -= 32;
+    if (cb >= 'a' && cb <= 'z') cb -= 32;
+    if (ca != cb || !ca) return ca - cb;
+  }
+}
+
+// Core 0, in setup(), right after the filesystem is mounted and before anything
+// slow: pick the /PLUS/ file. With none, core 1 is released to the menu at once,
+// so a cartridge without /PLUS/ waits one mount and one directory lookup.
+static void plus_scan(void) {
+  plus_candidate = false;
+  FatFile dir, f;
+  if (fs_formatted && dir.open(PLUS_DIR, O_RDONLY) && dir.isDir()) {
+    char n[MAX_NAME_LEN];
+    while (f.openNext(&dir, O_RDONLY)) {
+      bool ok = !f.isDir() && !f.isHidden() && f.getName(n, sizeof(n)) && n[0] != '.';
+      if (ok) {
+        const int t = plus_ext_type(n);
+        const uint32_t size = f.fileSize();
+        uint32_t payload = size;            // the .a78 header is skipped by the loader
+        if (t == CART_TYPE_A78 && payload >= 0x80) payload -= 0x80;
+        ok = t >= 0 && t != CART_TYPE_AR && t != CART_TYPE_ACE
+             && size > 0 && payload <= sizeof(rom_table)
+             && !(t == CART_TYPE_NONE && (size % 8448) == 0);  // AR by size, as identify_cartridge()
+      }
+      if (ok) {
+        const uint8_t kind = arm_classify(n, &f);
+        ok = (kind == ARM_KIND_NONE) || arm_cart_runnable(kind);
+      }
+      if (ok && (!plus_candidate || plus_namecmp(n, plus_name) < 0)) {
+        memcpy(plus_name, n, sizeof(plus_name));
+        plus_candidate = true;
+      }
+      f.close();
+    }
+  }
+  if (dir.isOpen()) dir.close();
+  if (!plus_candidate) {
+    __dmb();
+    plus_decided = 1;                     // core 1: serve the menu
+  }
+}
+
+// Core 0, at the very end of setup(): with a candidate, wait out the USB-host
+// window, load the file and start it. Core 1 is released either way.
+static void plus_boot(void) {
+  if (!plus_candidate) {                  // plus_scan() released core 1 already
+    Serial.println("PLUS: no usable file in " PLUS_DIR " - menu");
+    return;
+  }
+  Serial.print("PLUS: candidate ");Serial.println(plus_name);
+  while (!tud_connected() && to_ms_since_boot(get_absolute_time()) < PLUS_HOST_WAIT_MS)
+    tight_loop_contents();
+  bool start = !tud_connected();
+  if (!start) Serial.println("PLUS: USB host present - no autostart, menu as usual");
+  if (start) {
+    snprintf(filetoopen, sizeof(filetoopen), "%s/%s", PLUS_DIR, plus_name);
+    cart_to_emulate = identify_cartridge(filetoopen);
+    Serial.print("PLUS: cart type ");Serial.println(cart_to_emulate);
+#if MENU32
+    // A file identify_cartridge() could not type: it has written over the page, so
+    // put the menu back and run that instead. The 12-column kernel has no copy to
+    // come back from - that build starts the file, as choosing it would.
+    if (cart_to_emulate == CART_TYPE_NONE) {
+      menu32_show_page(0);
+      start = false;
+    }
+#endif
+  }
+  if (start) {
+    nv_init(false);       // existing save slots (FA2) only - never creates or writes
+    newgame = 1;
+    plus_autostart = 1;
+  }
+  __dmb();                // everything above is visible to core 1 before the flag
+  plus_decided = 1;
+}
+
+////////////////////////////////////////////////////////////////////////////////////
 //                     SETUP
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -7360,18 +7723,28 @@ void setup() {
   pinMode(RW_PIN,INPUT);
   bool carton=false;
 
+  // 0.78: the filesystem comes up FIRST, ahead of the 200 ms Atari/PC sampling
+  // below, which it used to follow - core 1 now serves nothing until the /PLUS/
+  // decision (plus_scan()), and this way a cartridge without a /PLUS/ candidate
+  // gets its menu after one mount and one directory lookup, not after 200 ms.
+  // Nothing below depends on the old order: usb_msc.setCapacity() needs
+  // flash.begin() first and still gets it.
+  flash.begin();
+  fs_formatted = fatfs.begin(&flash);
+  plus_scan();
+
   while (to_ms_since_boot(get_absolute_time()) < 200) // era 200
     {
       if (gpio_get(A0_PIN)==1)
         carton=true;
     }
- flash.begin();
 
   // Set disk vendor id, product id and revision with string up to 8, 16, 4 characters respectively
   usb_msc.setID("Pico2600", "External Flash", "1.0");
 
   // Set callback
    usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
+   usb_msc.setWritableCallback(msc_writable_cb);   // 0.78, see msc_write_cb()
 
   // Set disk size, block size should be 512 regardless of spi flash page size
   usb_msc.setCapacity(flash.size() / 512, 512);
@@ -7381,8 +7754,7 @@ void setup() {
 
    usb_msc.begin();
 
-  // Init file system on the flash
-  fs_formatted = fatfs.begin(&flash);
+  // (0.78: the file system on the flash is mounted at the top of setup() now.)
 
   Serial.begin(115200);
   memset(ram_table,0,sizeof(ram_table));
@@ -7408,6 +7780,9 @@ if (!carton) {
   Serial.println("connected to Atari");
   }
 
+  // Last, so that every flash access above (flash.getJEDECID() included) is done
+  // before a /PLUS/ game can take core 1 - see plus_scan().
+  plus_boot();
 }
 ////////////////////////////////////////////////////////////////////////////////////
 //                     MAIN LOOP
@@ -7418,6 +7793,11 @@ void loop()
   u_int8_t gc=0;
   
   bool menuletto=false;
+  // 0.78: a /PLUS/ game was started in setup() (plus_boot()), so none of the
+  // menu set-up down to set_menu_status_byte() applies - and nv_init() is
+  // done already, read-only. The "if (newgame)" branch of the loop below is
+  // where such a cartridge goes, as one started from the menu does.
+  if (!plus_autostart) {
   Serial.println("Opening root");
   strcpy(path,"/");
     if ( !root.open(path) ) {
@@ -7441,6 +7821,7 @@ void loop()
      set_menu_status_msg(MENU_FOOTER_NOW());
      menu_status[12] = OVERSIZED_COLOUR; // read by the menu kernel for oversized entries
    	 set_menu_status_byte(0);
+  }   // !plus_autostart
 
   int i=0;
   int cmd_exec=0; // start with read files
@@ -7527,8 +7908,15 @@ void loop()
         if (pick < menu_count) {
           gamechoosen = (u_int8_t)pick;
           Serial.print("Selected:");Serial.println(gamechoosen);
+          load_refused_kind = ARM_KIND_NONE;
           AtariMenu(2);
-          if (newgame == 0) {              // a directory, or a file that would not open
+          if (newgame == 0 && load_refused_kind != ARM_KIND_NONE) {
+            // Refused (arm_cart.h): nothing on the drive changed, so the listing
+            // and the page stay; only the footer says why, until the next page.
+            snprintf(menu32_notice, sizeof(menu32_notice), "%s ARM CART - NOT SUPPORTED",
+                     arm_kind_name(load_refused_kind));
+            menu32_show_page(menu32_page);
+          } else if (newgame == 0) {       // a directory, or a file that would not open
             AtariMenu(1);
             menu32_show_page(0);
           }
@@ -7548,8 +7936,14 @@ void loop()
     } else if (menuletto) {
       gamechoosen = retaddr-CART_CMD_SEL_ITEM_n;
       Serial.print("Selected:");Serial.println(gamechoosen);
+      load_refused_kind = ARM_KIND_NONE;
       AtariMenu(2);
-      if (newgame==0){
+      if (newgame==0 && load_refused_kind != ARM_KIND_NONE) {
+          // Refused (arm_cart.h): the listing stays; the footer says why until the
+          // next directory read. Exactly 12 glyphs, all present in this font.
+          set_menu_status_msg("ARM NOT SUPP");
+          delay(280);
+      } else if (newgame==0){
           AtariMenu(1);     
           delay(280);
       }
