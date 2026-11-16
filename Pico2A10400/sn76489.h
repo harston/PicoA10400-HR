@@ -364,12 +364,8 @@ static inline uint16_t sn76489_next_sample(void) {
 #ifndef SN76489_HOST_TEST
 
 static inline void sn76489_audio_init(void) {
-  gpio_set_function(SN_AUDIO_PIN, GPIO_FUNC_PWM);
-  uint slice = pwm_gpio_to_slice_num(SN_AUDIO_PIN);
-  pwm_config cfg = pwm_get_default_config();
-  pwm_config_set_wrap(&cfg, SN_PWM_WRAP);
-  pwm_init(slice, &cfg, true);
-  pwm_set_gpio_level(SN_AUDIO_PIN, 0);
+  // 0.82: every pin audio_out.h selects (AUDIO_PIN in /CONFIG.TXT).
+  audio_out_init(SN_PWM_WRAP, 0);
 }
 
 #if SN_DIAG
@@ -457,7 +453,7 @@ static inline void sn76489_run(void) {
   while (1) {
     uint32_t now = time_us_32();
     if ((int32_t)(now - next_us) >= 0) {
-      pwm_set_gpio_level(SN_AUDIO_PIN, sn76489_next_sample());
+      audio_out_level(sn76489_next_sample());
       frac_us += period_us_frac;
       next_us += period_us_int + (frac_us >> 16);
       frac_us &= 0xFFFFu;

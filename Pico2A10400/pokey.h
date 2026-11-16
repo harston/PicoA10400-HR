@@ -1111,12 +1111,10 @@ static inline uint16_t pokey_next_sample(void) {
 #ifndef POKEY_HOST_TEST
 
 static inline void pokey_audio_init(void) {
-  gpio_set_function(POKEY_AUDIO_PIN, GPIO_FUNC_PWM);
-  uint slice = pwm_gpio_to_slice_num(POKEY_AUDIO_PIN);
-  pwm_config cfg = pwm_get_default_config();
-  pwm_config_set_wrap(&cfg, POKEY_PWM_WRAP);   // no clock divider: carrier as high
-  pwm_init(slice, &cfg, true);                 // as possible, ~488kHz at 250MHz
-  pwm_set_gpio_level(POKEY_AUDIO_PIN, 0);
+  // 0.82: every pin audio_out.h selects (AUDIO_PIN in /CONFIG.TXT), started
+  // together. No clock divider: carrier as high as possible, ~488kHz at
+  // 250MHz. POKEY_AUDIO_PIN no longer decides where the sound goes.
+  audio_out_init(POKEY_PWM_WRAP, 0);
 }
 
 // Core 0 audio loop. Runs only while a POKEY cart is playing; returns never.
@@ -1157,7 +1155,7 @@ static inline void pokey_run(void) {
 #if POKEY_DIAG_E3
       pokey_diag_sink = pokey_next_sample();
 #else
-      pwm_set_gpio_level(POKEY_AUDIO_PIN, pokey_next_sample());
+      audio_out_level(pokey_next_sample());
 #endif
       frac_us += period_us_frac;
       next_us += period_us_int + (frac_us >> 16);

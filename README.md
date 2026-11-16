@@ -12,9 +12,10 @@
   _Titles built around the POKEY chip — **Ballblazer**, **Commando**, **Ace of Aces**,
   **Basketbrawl**, **Apple Snaffle** and the rest — used to run in silence. The chip is
   now emulated in software and every cartridge tested that actually drives one plays
-  its music. No extra hardware: the 7800's cartridge audio line was already wired on
-  this board and simply unused. The synthesis runs on the core that sits idle once a
-  game starts, so the picture costs nothing for the sound._
+  its music. No extra hardware on **PicoA10400**: the 7800's cartridge audio line was
+  already wired on that board and simply unused (the Pico 2 board needs one wire — see
+  below). The synthesis runs on the core that sits idle once a game starts, so the
+  picture costs nothing for the sound._
 
   _The emulation has since been rebuilt around how the chip actually works, and that
   turned up two faults rather than rough edges: **everything had been playing an octave
@@ -55,7 +56,7 @@
   its own bank switching: seven 4KB windows, a fixed bank for the vectors and two
   banks of cartridge RAM. Its `.s78` files now load, bank and play. The chip is
   emulated on the core that sits idle during a game and plays through the same
-  audio line as the POKEY, so it is heard on **PicoA10400** only. Both halves
+  audio line as the POKEY — on the Pico 2 board, the one wire described below. Both halves
   follow Ocelot, the emulator written by the board's author — down to the clock
   the chip runs at. Confirmed on a real console with two test programs, one for
   the sound and one for every bank window._
@@ -78,6 +79,31 @@
   real console — and measured rather than guessed: a diagnostic build cycled the pin
   through three idle states and named each one on screen, so a single flash decided
   which one to keep. Sound from the console's own TIA is no quieter than before._
+
+- **Sound on the Pico 2 board too — one wire, and the pin is a setting**
+  _The Pico 2 board has no audio line of its own: on the standard Pico footprint the
+  cartridge bus takes every pin, so POKEY, YM2151 and SN76489 sound never reached the
+  console. One wire fixes that. It runs from pin 18 of the 7800 connector — on the
+  cart's 7800 face, the second contact from the end, next to A15 and across a gap from
+  A7 — to either **GPIO25**, the pad of the on-board LED on any Pico 2, or, on RP2350A
+  clones that bring it out, **header pin 35**, labelled `A3` (GPIO29). An original Pico 2
+  has ADC_VREF there, and the board leaves that hole unconnected. The firmware drives
+  both pins, started on the same clock edge, so either wire works with no setting at
+  all — and two wires would not fight._
+
+  _The choice can be changed without rebuilding: a text file `CONFIG.TXT` in the root of
+  the cart's drive with the line `AUDIO_PIN = AUTO`, `GP25`, `GP29`, `BOTH` or `OFF`. It is
+  read at power-on and hidden in the menu; no file, or a value the firmware does not know,
+  means `AUTO` — GPIO25 and GPIO29 on the Pico 2 board, GPIO29 on PicoA10400 as before. In
+  the menu the pins are held low, so the wire does not leave the console's audio input
+  floating and humming. A diagnostic build (`build.sh Pico2A10400-16MB-AUDT2`) puts
+  3.3 V, 0 V and two 440 Hz test tones on the pins, each named on screen, to check a wire
+  with a multimeter and by ear._
+
+  _Confirmed on a PAL 7800 with a black RP2350A clone and the wire on header pin 35.
+  Choosing the pin by identifying the board was considered and dropped: the one marker,
+  the voltage divider an original Pico 2 has on GPIO29, can no longer be read once
+  GPIO29 is the wire._
 
 - **YM2151 demos that showed a picture and played nothing**
   _Eight of the forty-five YM2151 titles read the chip's address port before writing to
@@ -357,6 +383,21 @@
   32KB games lists in 8 ms, a folder full of ARM games in about 0.2 s. Confirmed on both
   boards on a PAL 7800._
 
+- **DPC+ games that never call their ARM program run — 22 images**
+  _Not every DPC+ cartridge uses the ARM chip. **Chaotic Grill**, **Chaos Griller**,
+  **Zarvox**, **Bigger Bitmaps**, the **Boulder Dash** demo and Harmony's own test
+  programs only drive the cartridge's data fetchers, random number generator and music
+  generator from the 6507, through registers. Those now run, on a bus loop of their own.
+  The menu tells them apart by looking for a write to the register that starts the ARM
+  program; the ones that do call it are still marked and refused, as above. The register
+  logic follows Stella and is checked against Gopher2600: 1200 frames of each of the 22
+  games, about 248 million bus bytes, not one different, music included._
+
+  _Confirmed on the Pico 2 board, each game as Gopher2600 shows it. On PicoA10400 the
+  first version answered the console too late — the RP2040 is the slower core — so the
+  loop was rebuilt to answer a register read as fast as a ROM byte; that version is not
+  yet confirmed on a console._
+
 - **Atari 2600+ and 7800+: one game straight from the `/PLUS/` folder**
   _The 2600+ and 7800+ never run code from a cartridge: a reader in the console copies
   it over the bus and an emulator plays the copy, so a menu cannot work there. Put a ROM
@@ -412,16 +453,15 @@ from this side._
 
 _Not fixed, and out of the cartridge's reach: an NTSC ROM on a PAL console may run
 too fast and show interference along the bottom of the screen — use a PAL version
-where one exists. Some 2600 schemes stay out of range for a harder reason — **DPC+**,
-**CDF** and **CDFJ** cartridges carry their own ARM program and expect a processor in
-the cartridge to run it, which is what a Harmony has and this board does not. The menu
-now marks them and refuses them instead of hanging (see above)._
+where one exists. Some 2600 schemes stay out of range for a harder reason — **CDF** and
+**CDFJ** cartridges, and the **DPC+** ones that call their ARM program, expect a processor
+in the cartridge to run it, which is what a Harmony has and this board does not. The menu
+marks them and refuses them instead of hanging (see above)._
 
-_The audio line exists only on **PicoA10400** — the Pico 2 board uses the
-standard Raspberry Pi Pico footprint, where the cartridge bus consumes every
-available pin, so **Pico2A10400 stays silent** whether the cartridge asks for a POKEY,
-a YM2151 or an SN76489. DPC music is the exception and plays on both boards, for the reason
-given above._
+_The audio line is wired on the board only on **PicoA10400**. On **Pico2A10400** the
+POKEY, YM2151 and SN76489 sound needs the one wire described above, and without it the
+board stays silent; DPC music is the exception and plays on both boards without it, for
+the reason given above._
 
 _The DPC music generator is driven from a free-running clock rather than from the
 console's own cycles. Games where music is an accompaniment — Pitfall II among them —

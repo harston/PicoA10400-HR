@@ -198,6 +198,11 @@ bool fs_changed;
 //                 pin's only load.
 //   Pico2A10400 - the net is a single unconnected pad (patch 0.31); POKEY and
 //                 YM use GPIO25 there and nothing reaches the cartridge.
+//                 Since 0.82 the synthesisers drive the pin set audio_out.h
+//                 selects (AUTO: GPIO25 + GPIO29, for the bodge) and core 0
+//                 holds those pins low in the menu (audio_idle_service()).
+//                 This switch works in setup1() on POKEY_AUDIO_PIN alone, so it
+//                 stays 0 on Pico2A10400 - setup1() is not touched.
 //
 // AUDIO_IDLE_MODE is what that pin does while nothing synthesises on it - the
 // menu, and every cart without a POKEY/YM/SN. Until now the answer was "it is
@@ -231,6 +236,69 @@ bool fs_changed;
 #endif
 #ifndef AUDX_PHASE_MS
 #define AUDX_PHASE_MS 4000
+#endif
+
+// AUDIO_AUTO_PINS - board fact for audio_out.h: what AUDIO_PIN = AUTO drives.
+// The board routes nothing to cartridge pin 18 (patch 0.31). The bodge goes
+// either from GPIO25 (the LED pad - any Pico 2) or from header pin 35, which on
+// the black RP2350A clone is "A3" = GPIO29 and on the board is NC (Pico2A10400.pdf,
+// and the Gerber gives U3 pad 35 a net of its own). Measured 2026-11-16: with
+// GPIO29 wired to pin 18 the AUDIO_TEST phases are heard through the console.
+// AUTO drives both, in step, so either wire works with no setting.
+#define AUDIO_AUTO_PINS ((1u << 25) | (1u << 29))
+
+#include "config_file.h" // /CONFIG.TXT (0.82): AUDIO_PIN
+#include "audio_out.h"   // the pin set POKEY / YM / SN drive (0.82)
+
+// --- AUDIO_TEST: known signals on the audio pins, for checking the wiring ---
+// DIAGNOSTIC (build.sh <Sketch>-AUDT2, Pico2A10400-16MB-AUDT2). Defaults to 0,
+// and with 0 nothing of it is compiled.
+//
+// Written for the Pico2A10400 audio bodge (2026-11-13..16). Once the test has
+// started, the audio pins - the set audio_out.h selects, i.e. AUDIO_PIN in
+// /CONFIG.TXT - get four fixed signals, AUDT_PHASE_MS each, named in the
+// footer:
+//
+//   1 HIGH 3.3V     PWM at 100% - a DC voltmeter on pin 18 reads ~3.3 V
+//   2 LOW 0V        PWM at 0%   - the voltmeter reads 0 V
+//   3 SQUARE 440HZ  full-swing 440 Hz square: the PWM counter divided down to
+//                   audio rate. Loud on the TV; ~1.65 V on the voltmeter
+//   4 PWM 440HZ     the POKEY carrier itself (wrap POKEY_PWM_WRAP, ~488 kHz at
+//                   250 MHz) with its duty switched 25%/75% at 440 Hz - the
+//                   kind of signal a POKEY cart produces, at half the swing
+//
+// LATE START. Until the test starts the firmware behaves exactly as
+// production. It starts AUDT_START_MENU_MS after the menu first reports to core
+// 0 or, with no console attached (USB power, multimeter), AUDT_START_ALONE_MS
+// after boot. (The first AUDT image started at boot; its "no signal" report on
+// hardware turned out to be a ROM left in /PLUS/, but power-on identical to
+// production is the better design either way.)
+//
+// All phases use the PWM function, never SIO: the 7800 bus loops write the
+// whole SIO output register (sio_hw->gpio_out = byte << D0_PIN), which would
+// clear a SIO-driven pin, and core 1's gpio_init_mask(ALL_GPIO_MASK) at boot
+// covers GPIO25. When a game starts the pins drop to PWM 0 until the cart's
+// synthesis (if any) takes them.
+//
+// HARDWARE RESULT (2026-11-16, Pico2A10400 0.79+AUDIO_TEST, black RP2350A
+// clone, 7800 PAL): multimeter readings as the table on GPIO25 and on header
+// pin 35 (= GPIO29); with GPIO29 wired to cartridge pin 18, phases 3 and 4 are
+// heard through the console.
+#ifndef AUDIO_TEST
+#define AUDIO_TEST 0
+#endif
+#ifndef AUDT_PHASE_MS
+#define AUDT_PHASE_MS 4000
+#endif
+#ifndef AUDT_START_MENU_MS
+#define AUDT_START_MENU_MS 10000
+#endif
+#ifndef AUDT_START_ALONE_MS
+#define AUDT_START_ALONE_MS 15000
+#endif
+#if AUDIO_TEST
+static volatile uint8_t audt_phase = 0;
+static volatile uint8_t audt_started = 0;   // 0 = still behaving as production
 #endif
 
 #include "ym2151.h"  // YM2151 (OPM) FM synthesis, same audio pin. Included
@@ -623,6 +691,20 @@ volatile u_int8_t cart_to_emulate;
 // ym_enabled to already exist, plus nvstore.h for the save slot.
 #include "hsc.h"
 #include "arm_cart.h"  // ARM-coprocessor cartridges: recognised, marked, refused
+#include "dpcplus.h"   // DPC+ without its ARM program: the 6507 side (stage 1)
+
+// The DPC+ cartridge state: prepared by identify_cartridge() on core 0, run by
+// emulate_dpcplus() on core 1. A global, not a local of the bus loop, so that the
+// memcpy of the display data stays out of the time-critical function.
+static dpcp_state dpcp_st;
+
+// 3E and 3F select a 2 KB bank with the byte written to $3E/$3F, modulo the number
+// of banks. 0.81: the bus loops look it up here instead of computing `%` - on the
+// RP2040 that `%` is __aeabi_idivmod, in FLASH, reached through a veneer at every
+// bank switch, i.e. just when the next ROM byte is due (the Cortex-M33 of the
+// RP2350 divides in hardware, so there it only saves a few cycles). Filled by
+// identify_cartridge() on core 0, before the game starts.
+static uint8_t bank_mod_2k[256];
 
 // Set by LoadGame() when it refuses a file (an ARM cartridge that cannot run), so
 // the menu loop can say why and keep the listing and page where they were.
@@ -1592,6 +1674,121 @@ void __time_critical_func(emulate_dpc_cartridge()) {
         } else {
           mphase[v] = 0;
         }
+      }
+      while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+      addr_prev = 0xFFFF;
+    }
+  }
+}
+
+// DPC+ (Harmony) without its ARM program - CHAMP_ARM_TODO.md stage 1. What the
+// registers do is in dpcplus.h, shared with the host test tools/dpcp_sim/ so that
+// the test runs this very code; this function is only the bus: which access is
+// which, and when the byte goes out.
+//
+//   $1000-$1027  register read: the byte is ready in dpcp_state.rv[] (0.81), so it
+//                goes out as fast as a ROM byte; the fetcher advances afterwards
+//                (dpcp_read_post, which also refreshes rv[]).
+//   $1028-$107F  register write: the 2600 has no R/W line, so, like the Harmony
+//                driver, every access here is a write, and the data bus is
+//                sampled at the end of the cycle (the F8SC/DPC idiom). 0.81: the
+//                write is HELD and applied during the next access, after that
+//                access's byte is on the bus (dpcp_apply_write). In 0.80 it ran
+//                between the two, and on the RP2040 the next byte went out 114
+//                cycles after the address changed - too late; the DPC+ games did
+//                not start. The access after a write is the next opcode fetch, and
+//                the write is applied before anything that depends on it: fast-
+//                fetch arming, a register read, the music generator.
+//   $1080-$1FFF  ROM from the current bank; $1FF6-$1FFB switch banks. With fast
+//                fetch on, the operand of an LDA # (fetched at the address after
+//                the $A9, lda_next) is a register number when it is below $28, and
+//                that register is read instead.
+//   A12 = 0      the console's own cycle: a held write is applied and the music
+//                generator catches up here, off the response path, from the
+//                microsecond timer (50 us is one tick of its 20 kHz oscillator).
+//
+// The state was prepared on core 0 by identify_cartridge() (dpcp_init(), which
+// copies the display data and frequency table into Harmony RAM in ram_table).
+// The one call is dpcp_apply_write(), a RAM function, always after the byte is
+// out: one copy of dpcp_write() instead of four pasted ones, which on the RP2040
+// cost 1.9 KB of RAM and, through register pressure, 3 cycles on the ROM path.
+// Writes are rare next to reads (220,000 against 15.6 million over the 22 stage-1
+// images), so the call's ~30 cycles land where there is time. Compiled without
+// jump tables: a case table on the RP2040 goes through a libgcc helper.
+__attribute__((optimize("O2", "no-jump-tables")))
+static void __no_inline_not_in_flash_func(dpcp_apply_write)(uint32_t r, uint32_t v) {
+  dpcp_write(&dpcp_st, r, (uint8_t)v);
+}
+
+__attribute__((optimize("O2", "no-jump-tables")))
+void __time_critical_func(emulate_dpcplus()) {
+  __asm volatile ("cpsid i" ::: "memory");   // plain CPSID: no CMSIS dependency
+  dpcp_state *const st = &dpcp_st;
+  const uint8_t *bankp = st->prog + st->bank;   // the current bank (st->bank kept too)
+  uint32_t addr, addr_prev = 0xFFFF, data = 0, data_prev = 0;
+  uint32_t lda_next = 0xFFFF;             // dpcp_state.lda_next, in a register here
+  uint32_t pend = 0;                      // a held register write: 0x100 | register
+  uint32_t pend_v = 0;
+  uint32_t music_last_us = timer_hw->timerawl;
+  uint32_t music_acc = 0;                 // microseconds not yet turned into ticks
+
+  while (1) {
+    while ((addr = (gpio_get_all()&BUS_PIN_MASK)) != addr_prev)
+      addr_prev = addr;
+
+    if (addr & 0x1000) {                  // A12 high: the cartridge is selected
+      uint32_t off = addr & 0x0FFF;
+      if (off >= 0x80) {
+        const uint32_t rom = bankp[off];
+        if (addr != lda_next || rom >= 0x28) {
+          // ---- ROM, bank hotspots ----
+          gpio_put_masked(DATA_PIN_MASK, rom << D0_PIN);
+          SET_DATA_MODE_OUT;
+          if (pend) { dpcp_apply_write(pend & 0xFF, pend_v); pend = 0; }
+          if (off >= 0x0FF6 && off <= 0x0FFB) {
+            dpcp_hotspot(st, off);
+            bankp = st->prog + st->bank;
+          }
+          lda_next = (st->fastfetch && rom == 0xA9) ? ((addr + 1) & 0x1FFF) : 0xFFFF;
+          while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+          SET_DATA_MODE_IN;
+          addr_prev = 0xFFFF;
+          continue;
+        }
+        off = rom;                        // fast fetch: LDA # names a register
+      }
+      if (off < 0x28) {                   // ---- register read ----
+        // a write held from the access before cannot normally be pending here
+        // (that access is an opcode fetch), but if it is, it goes first
+        if (pend) { dpcp_apply_write(pend & 0xFF, pend_v); pend = 0; }
+        gpio_put_masked(DATA_PIN_MASK, (uint32_t)st->rv[off] << D0_PIN);
+        SET_DATA_MODE_OUT;
+        lda_next = 0xFFFF;
+        dpcp_read_post(st, off);          // AFTER the byte is on the bus
+        while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
+        SET_DATA_MODE_IN;
+      }
+      else {                              // ---- register write: sample, hold ----
+        while ((gpio_get_all()&BUS_PIN_MASK) == addr)
+        { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK) >> D0_PIN; }
+        if (pend) dpcp_apply_write(pend & 0xFF, pend_v);   // two in a row: keep order
+        pend = 0x100 | off;
+        pend_v = data_prev;
+      }
+      addr_prev = 0xFFFF;
+    }
+    else {                                // console's cycle: held write, music
+      if (pend) { dpcp_apply_write(pend & 0xFF, pend_v); pend = 0; }
+      const uint32_t now = timer_hw->timerawl;
+      music_acc += now - music_last_us;   // unsigned: wraps correctly
+      music_last_us = now;
+      if (music_acc >= 50) {
+        // Bounded like the DPC loop's: realistically 0 or 1 tick, since the
+        // console's own cycles come thousands of times per frame.
+        uint32_t ticks = 0;
+        while (music_acc >= 50 && ticks < 16) { music_acc -= 50; ticks++; }
+        if (music_acc >= 50) music_acc = 0;           // fell far behind - resync
+        dpcp_music(st, ticks);
       }
       while ((gpio_get_all()&BUS_PIN_MASK) == addr) ;
       addr_prev = 0xFFFF;
@@ -5392,6 +5589,9 @@ start:
     case CART_TYPE_DPC:
          emulate_dpc_cartridge();
       break;
+    case CART_TYPE_DPCP:                  // stage 1: only images without ARM calls get here
+         emulate_dpcplus();
+      break;
     // JANE - Tarzan prototype (Stella CartJANE.cxx). $1FF0 -> bank 0,
     // $1FF1 -> 1, $1FF8 -> 2, $1FF9 -> 3. Two of those four are F6 hotspots
     // that happen to select the same banks, which is why this image boots and
@@ -5492,7 +5692,7 @@ start:
           while ((gpio_get_all()&BUS_PIN_MASK) == addr)
           { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
           if (addr == 0x003F) {               // ROM bank into the low segment
-            bankPtr = &rom_table[(data_prev % cartPages) * 2048];
+            bankPtr = &rom_table[bank_mod_2k[data_prev] * 2048];   // data_prev % cartPages
             ram1Ptr = 0;
           } else if (addr == 0x003E) {        // RAM bank into the low segment
             ram1Ptr = &ram_table[(data_prev & 0x1F) * 1024];
@@ -5527,8 +5727,7 @@ start:
 		    } else {	// A12 low, read last data on the bus before the address lines change
 			    while ((gpio_get_all()&BUS_PIN_MASK) == addr) { data_prev = data; data = (gpio_get_all()&DATA_PIN_MASK)>>D0_PIN; }
 			    if (addr == 0x003F) {	// switch bank
-				    int newPage = data_prev % cartPages; //data_prev>>8
-				    bankPtr = &rom_table[newPage*2048];
+				    bankPtr = &rom_table[bank_mod_2k[data_prev]*2048];   // data_prev % cartPages
 			    }
 			  }
 		  }
@@ -6659,6 +6858,10 @@ int identify_cartridge(char *filename)
 	else if ((arm_variant = arm_probe(rom_table, bytes_read, file.fileSize())) != ARM_KIND_NONE)
 	{
 		cart_type = arm_cart_type_of(arm_variant);
+		// DPC+ that LoadGame() let through (no CALLFUNCTION writes): set it up here, on
+		// core 0, while the whole image is in rom_table and core 1 still runs the menu.
+		if (cart_type == CART_TYPE_DPCP)
+			dpcp_init(&dpcp_st, rom_table, (uint32_t)bytes_read, ram_table);
 	}
 	else if (image_size <= 64 * 1024 && (image_size % 1024) == 0 && isProbably3EPlus(image_size, rom_table))
 	{
@@ -6850,6 +7053,13 @@ found:
 		cart_size_bytes = image_size;
    
 close_exit:
+  // the bank table of the 3E and 3F loops (see bank_mod_2k), computed here so that
+  // neither loop divides
+  if (cart_type == CART_TYPE_3E || cart_type == CART_TYPE_3F) {
+    uint32_t pages = (uint32_t)romLen / 2048;
+    if (pages < 1) pages = 1;
+    for (uint32_t v = 0; v < 256; v++) bank_mod_2k[v] = (uint8_t)(v % pages);
+  }
   Serial.print("RomLen:");Serial.println(image_size,HEX);
   
   file.close();
@@ -7008,7 +7218,7 @@ void LoadGame(int numfile) {
     // (files changed over USB while the menu was up).
     {
       uint8_t kind = arm_classify(filetoopen, &file);
-      if (kind != ARM_KIND_NONE && !arm_cart_runnable(kind)) {
+      if (kind != ARM_KIND_NONE && !arm_cart_runnable(kind, &file)) {
         file.close();
         load_refused_kind = kind;
         Serial.print("refused: ARM cartridge ");Serial.println(arm_kind_name(kind));
@@ -7150,6 +7360,7 @@ static bool is_firmware_own_file(FatFile *f) {
   char n[32];
   if (!f->getName(n, sizeof(n))) return false;
   size_t len = strlen(n);
+  if (cfg_ieq(n, CONFIG_FILE_NAME)) return true;   // /CONFIG.TXT (0.82)
   if (len == 7 &&
       (n[0] == 'h' || n[0] == 'H') && (n[1] == 's' || n[1] == 'S') &&
       (n[2] == 'c' || n[2] == 'C') && n[3] == '.' &&
@@ -7206,6 +7417,27 @@ static const char *menu32_build_header(void) {
 static char menu32_notice[MENU32_COLS + 1];
 static unsigned char menu32_notice_up = 0;
 
+#if AUDIO_TEST
+// 32-column footer for the AUDIO_TEST diagnostic: phase on the left, the pins
+// carrying it on the right.
+static const char *audt_phase_text(void) {
+  switch (audt_phase) {
+    case 0:  return "AUDT 1/4 HIGH 3.3V";
+    case 1:  return "AUDT 2/4 LOW 0V";
+    case 2:  return "AUDT 3/4 SQUARE 440HZ";
+    default: return "AUDT 4/4 PWM 440HZ";
+  }
+}
+static const char *audt_pins_text(void) {
+  switch (audio_pins & (AUDIO_GP25 | AUDIO_GP29)) {
+    case AUDIO_GP25 | AUDIO_GP29: return "GP25+GP29";
+    case AUDIO_GP25:              return "GP25";
+    case AUDIO_GP29:              return "GP29";
+    default:                      return "NO PIN";
+  }
+}
+#endif
+
 // The footer row: which page, and how much of the directory is on it.
 static const char *menu32_build_footer(void) {
   char left[16], right[20];
@@ -7216,10 +7448,19 @@ static const char *menu32_build_footer(void) {
     menu32_notice_up = 1;
     return menu32_footer_text;
   }
+#if AUDIO_TEST
+  if (audt_started) {   // AUDT: which test signal is on the audio pins now
+    menu32_pad_line(menu32_footer_text, audt_phase_text(), audt_pins_text());
+    return menu32_footer_text;
+  }
+#endif
 #if ARM_DIAG_LISTTIME
   // ARMT: the time the last directory read took, and how many files it checked.
   snprintf(left, sizeof(left), "LIST %lu MS", (unsigned long)arm_list_ms);
-  snprintf(right, sizeof(right), "%lu FILES", (unsigned long)arm_list_files);
+  // and (0.80) the average time of one 4 KB read in it - 2.2-2.7 ms measured,
+  // where XIP alone should take a fraction of a millisecond
+  snprintf(right, sizeof(right), "%lu F %lu US/4K", (unsigned long)arm_list_files,
+           (unsigned long)(arm_rd_n ? arm_rd_us / arm_rd_n : 0));
   menu32_pad_line(menu32_footer_text, left, right);
   return menu32_footer_text;
 #endif
@@ -7429,6 +7670,7 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
 #if ARM_DIAG_LISTTIME
       const uint32_t arm_list_t0 = millis();
       arm_list_files = 0;
+      arm_rd_us = arm_rd_n = 0;
 #endif
       root.rewind();
       // Serial.println(" Menu-1:");
@@ -7504,7 +7746,7 @@ void AtariMenu(int tipo) { // 1=start,2=next page, 3=prev page, 4=dir up
 #if ARM_DIAG_LISTTIME
               arm_list_files++;
 #endif
-              if (kind != ARM_KIND_NONE && !arm_cart_runnable(kind)) flags |= DIRENT_ARM;
+              if (kind != ARM_KIND_NONE && !arm_cart_runnable(kind, &file)) flags |= DIRENT_ARM;
             }
             direntry_flags[contfile] = flags;
             contfile++;
@@ -7652,7 +7894,7 @@ static void plus_scan(void) {
       }
       if (ok) {
         const uint8_t kind = arm_classify(n, &f);
-        ok = (kind == ARM_KIND_NONE) || arm_cart_runnable(kind);
+        ok = (kind == ARM_KIND_NONE) || arm_cart_runnable(kind, &f);
       }
       if (ok && (!plus_candidate || plus_namecmp(n, plus_name) < 0)) {
         memcpy(plus_name, n, sizeof(plus_name));
@@ -7707,6 +7949,127 @@ static void plus_boot(void) {
 //                     SETUP
 ////////////////////////////////////////////////////////////////////////////////////
 
+// Menu: hold the audio pins low (0.82, core 0). Production since 0.66 on
+// PicoA10400 (AUDIO_IDLE_MODE 1, setup1()) for its one pin; on Pico2A10400 the
+// bodge left the wired pin floating in the menu - a high-impedance trace on the
+// console's audio input, which hums (MENU_FIX.md 2). PWM level 0 is the same
+// "low" and keeps the pins on the PWM function the synthesisers will use.
+// Re-applied if core 1's gpio_init_mask(ALL_GPIO_MASK) - which covers GPIO25 -
+// runs after it; once the menu has reported, core 1 is past its start-up and
+// this stops looking. With AUDIO_PIN = OFF there is no pin and nothing happens.
+// Follows AUDIO_IDLE_MODE: 1 (production) low, 2 mid rail; 0 and 3 are the
+// AUD0 / AUDX diagnostics, which own the pin themselves, so it stays away.
+static void audio_idle_service(bool menu_up) {
+#if AUDIO_IDLE_MODE == 1 || AUDIO_IDLE_MODE == 2
+  static uint8_t state = 0;   // 0 not yet, 1 applied, 2 settled
+  if (state == 2) return;
+  bool lost = ((audio_pins & AUDIO_GP25) && gpio_get_function(25) != GPIO_FUNC_PWM) ||
+              ((audio_pins & AUDIO_GP29) && gpio_get_function(29) != GPIO_FUNC_PWM);
+  if (state == 0 || lost) {
+    audio_out_init(POKEY_PWM_WRAP, AUDIO_IDLE_MODE == 2 ? (POKEY_PWM_WRAP + 1) / 2 : 0);
+    state = 1;
+  }
+  if (menu_up) state = 2;
+#else
+  (void)menu_up;
+#endif
+}
+
+#if AUDIO_TEST
+// AUDIO_TEST service, core 0, once per pass of loop() while the menu runs.
+// See the AUDIO_TEST block near the top of this file.
+static void audt_apply(uint8_t phase) {
+  pwm_config cfg = pwm_get_default_config();
+  uint16_t level;
+  if (phase == 2) {                 // 440 Hz square: 65536 counts per period
+    pwm_config_set_wrap(&cfg, 65535);
+    pwm_config_set_clkdiv(&cfg, (float)clock_get_hz(clk_sys) / (440.0f * 65536.0f));
+    level = 32768;
+  } else {                          // the POKEY carrier, as pokey_audio_init()
+    pwm_config_set_wrap(&cfg, POKEY_PWM_WRAP);
+    level = phase == 0 ? POKEY_PWM_WRAP + 1          // above TOP = always high
+          : phase == 1 ? 0                           // always low
+                       : (POKEY_PWM_WRAP + 1) / 4;   // phase 4 starts at 25%
+  }
+  audio_out_start(&cfg, level);
+}
+
+// Exactly 12 characters each for the 12-column menu (CLAUDE.md); upper case
+// only, that font has no lower case.
+static const char *audt_phase_text12(void) {
+  switch (audt_phase) {
+    case 0:  return "AT1 HIGH 3V3";
+    case 1:  return "AT2 LOW 0V  ";
+    case 2:  return "AT3 SQ 440HZ";
+    default: return "AT4 PWM 440 ";
+  }
+}
+
+static void audio_test_service(bool menu_up) {
+  static bool begun = false;
+  static uint32_t last_ms = 0, next_us = 0, menu_since = 0;
+  static bool hi = false;
+  bool changed = false;
+  uint32_t now_ms = millis();
+  if (!begun) {
+    // Late start: nothing is touched until the menu has been up for a while,
+    // or until it is clear that no console is attached.
+    if (menu_up && !menu_since) menu_since = now_ms | 1;
+    if (menu_since ? (now_ms - menu_since < AUDT_START_MENU_MS)
+                   : (now_ms < AUDT_START_ALONE_MS))
+      return;
+    audt_started = 1;
+    begun = true;
+    last_ms = now_ms;
+    audt_phase = 0;
+    audio_out_select();
+    audt_apply(0);
+    changed = true;
+  }
+  if (now_ms - last_ms >= AUDT_PHASE_MS) {
+    last_ms = now_ms;
+    audt_phase = (uint8_t)((audt_phase + 1) & 3);
+    audt_apply(audt_phase);
+    changed = true;
+  }
+  if (((audio_pins & AUDIO_GP25) && gpio_get_function(25) != GPIO_FUNC_PWM) ||
+      ((audio_pins & AUDIO_GP29) && gpio_get_function(29) != GPIO_FUNC_PWM))
+    audt_apply(audt_phase);           // core 1 took a pin
+  if (audt_phase == 3) {
+    // 440 Hz = 1136 us per half period. Polled, so a slow pass (a directory
+    // read) bends one cycle; after a stall it restarts from now rather than
+    // firing a burst of catch-up edges.
+    uint32_t now = time_us_32();
+    if ((int32_t)(now - next_us) >= 0) {
+      next_us = ((int32_t)(now - next_us) > 1136) ? now + 1136 : next_us + 1136;
+      hi = !hi;
+      audio_out_level(hi ? 3 * (POKEY_PWM_WRAP + 1) / 4 : (POKEY_PWM_WRAP + 1) / 4);
+    }
+  }
+#if MENU32
+  if (changed) {                      // the marquee writes it into both phases
+    menu32_build_footer();
+    menu32_m_foot_todo = 3;
+  }
+#else
+  (void)changed;
+  // Every pass, as the AUDX diagnostic does: a directory listing rewrites the
+  // footer, and the phase has to come straight back.
+  set_menu_status_msg(audt_phase_text12());
+#endif
+}
+
+// A game has started: silence until the cart's own synthesis (if any) takes
+// the pins. Once - this runs on every pass of the "newgame" branch - and only
+// if the test had started; otherwise the pins are where the menu left them.
+static void audt_quiet(void) {
+  static bool done = false;
+  if (done || !audt_started) return;
+  done = true;
+  audt_apply(1);
+}
+#endif
+
 void setup() {
     vreg_set_voltage(VREG_VOLTAGE_1_15); // set to 1_15 or 1_20 if you experience some glitches
   //delay(10); // to stabilize voltage
@@ -7731,6 +8094,7 @@ void setup() {
   // flash.begin() first and still gets it.
   flash.begin();
   fs_formatted = fatfs.begin(&flash);
+  if (fs_formatted) config_load();   // /CONFIG.TXT, before a /PLUS/ game can start
   plus_scan();
 
   while (to_ms_since_boot(get_absolute_time()) < 200) // era 200
@@ -7842,6 +8206,9 @@ void loop()
    // running". This is the same class of core0/core1 SRAM contention the POKEY
    // carve-out exists to avoid.
    if (newgame) {
+#if AUDIO_TEST
+     audt_quiet();   // AUDT: the menu test signal stops with the menu
+#endif
      if (ym_enabled)    ym_run();      // never returns
 #if !POKEY_DIAG_E4
      if (pokey_enabled) pokey_run();   // never returns
@@ -8004,6 +8371,10 @@ void loop()
                        : audx_phase == 1 ? "AUD1 LOW    "
                                          : "AUD2 PWM MID");
    }
+#endif
+   audio_idle_service(menuletto);   // 0.82: audio pins low in the menu
+#if AUDIO_TEST
+   audio_test_service(menuletto);   // AUDT diagnostic, menu only
 #endif
    if (cmd_exec!=0) {
     Serial.print("GC:");Serial.println(gamechoosen);

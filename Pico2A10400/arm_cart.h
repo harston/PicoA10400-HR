@@ -20,7 +20,9 @@
 // the two mark columns, the colour of an oversized file; 12 columns: red like an
 // oversized file), and choosing one is REFUSED - the file is not loaded, the menu
 // stays where it was and the footer says why. arm_cart_runnable() is the single
-// place later stages open up as the formats become supported.
+// place later stages open up as the formats become supported - since stage 1 it
+// lets through DPC+ images whose 6507 program never writes CALLFUNCTION, which
+// emulate_dpcplus() runs (dpcplus.h).
 //
 // ---------------------------------------------------------------------------
 // How they are recognised
@@ -80,6 +82,18 @@
 // that will run them; nothing reads it yet).
 static uint8_t arm_variant = ARM_KIND_NONE;
 
+#if ARM_DIAG_LISTTIME
+// ARMT: time spent in the 4 KB reads (the probe past its 64 bytes, and the DPC+
+// bank scans), so the footer can show what one costs - measured 2.2-2.7 ms, far
+// more than XIP alone should take; this says how much of it is the read itself.
+static uint32_t arm_rd_us = 0, arm_rd_n = 0;
+#define ARM_RD_BEGIN() const uint32_t arm_rd_t0 = time_us_32()
+#define ARM_RD_END()   do { arm_rd_us += time_us_32() - arm_rd_t0; arm_rd_n++; } while (0)
+#else
+#define ARM_RD_BEGIN() do { } while (0)
+#define ARM_RD_END()   do { } while (0)
+#endif
+
 static const char *arm_kind_name(uint8_t k) {
   switch (k) {
     case ARM_KIND_DPCP:  return "DPC+";
@@ -106,12 +120,6 @@ static int arm_cart_type_of(uint8_t k) {
     case ARM_KIND_ELF:   return CART_TYPE_ELF;
     default:             return CART_TYPE_NONE;
   }
-}
-
-// Stage 0: none of them can run. Later stages open cases here, one at a time.
-static bool arm_cart_runnable(uint8_t k) {
-  (void)k;
-  return false;
 }
 
 static bool arm_size_is(uint32_t size, uint32_t kb) { return size == kb * 1024u; }
@@ -216,7 +224,9 @@ static uint8_t arm_probe_file(FatFile *f) {
     // RP2350A clone), rather than an unaligned tail from byte 64.
     const uint32_t full = size < ARM_PROBE_BYTES ? size : ARM_PROBE_BYTES;
     if (!f->seekSet(0)) return ARM_KIND_NONE;
+    ARM_RD_BEGIN();
     got = f->read(ARM_PROBE_BUF, full);
+    ARM_RD_END();
     if (got <= 0) return ARM_KIND_NONE;
   }
   return arm_probe(ARM_PROBE_BUF, (uint32_t)got, size);
@@ -229,6 +239,56 @@ static uint8_t arm_classify(const char *name, FatFile *f) {
     case ARM_EXT_ACE:   return ARM_KIND_ACE;
     case ARM_EXT_PROBE: return arm_probe_file(f);
     default:            return ARM_KIND_NONE;
+  }
+}
+
+// Does a DPC+ 6507 program write CALLFUNCTION? Any absolute STA/STX/STY to $x05A
+// with A12 = 1 (an odd high nibble) counts - the static rule of
+// tools/arm_carts/arm_scan.py, where "no-callfn" is exactly what stage 1 runs
+// (22 images, 44 files): P3 confirmed it against Gopher2600, 3600 frames each, not
+// one call. Functions 1 and 2 (copy into display data) are stage 2, 254/255 the
+// ARM program, so any write at all keeps an image refused for now.
+static bool dpcp_writes_callfn(const uint8_t *p, uint32_t n) {
+  for (uint32_t i = 0; i + 2 < n; i++)
+    if ((p[i] == 0x8C || p[i] == 0x8D || p[i] == 0x8E) && p[i + 1] == 0x5A && (p[i + 2] & 0x1F) == 0x10)
+      return true;
+  return false;
+}
+
+// The same over an open DPC+ file, bank by bank, each read with the two bytes
+// after it so an instruction straddling a bank edge is seen exactly once. Banks go
+// in the order the library's calls are most often found in (0, 5, 1, 4, 2, 3) and
+// the scan stops at the first write: of the library's 1 085 files that call ARM,
+// 762 are decided by bank 0 and the other 323 by bank 5, so they cost one or two
+// reads; only the ones that can run pay for all six.
+static bool dpcp_file_writes_callfn(FatFile *f) {
+  static const uint8_t order_init[6] = {0, 5, 1, 4, 2, 3};   // read once per call, not in a bus loop
+  const uint32_t size = f->fileSize();
+  if (size < 29u * 1024u) return true;                        // not a DPC+ image after all
+  const uint32_t prog = size - 29u * 1024u;                   // 3 KB of driver on a 32 KB file
+  for (uint32_t k = 0; k < 6; k++) {
+    const uint32_t start = prog + (uint32_t)order_init[k] * 4096u;
+    uint32_t want = 4096u + 2u;
+    if (start + want > prog + 24u * 1024u) want = prog + 24u * 1024u - start;
+    if (!f->seekSet(start)) return true;
+    ARM_RD_BEGIN();
+    const int got = f->read(ARM_PROBE_BUF, want);
+    ARM_RD_END();
+    if (got != (int)want) return true;                        // short read: refuse, never guess
+    if (dpcp_writes_callfn(ARM_PROBE_BUF, want)) return true;
+  }
+  return false;
+}
+
+// Can this kind of ARM cartridge run here? The single place the stages open.
+//   stage 1: DPC+ whose 6507 program never writes CALLFUNCTION.
+// f is the open file (its position is not kept); every caller passes the one it
+// just classified - the listing, LoadGame() and the /PLUS/ scan - so all three
+// decide the same way.
+static bool arm_cart_runnable(uint8_t k, FatFile *f) {
+  switch (k) {
+    case ARM_KIND_DPCP: return !dpcp_file_writes_callfn(f);
+    default:            return false;
   }
 }
 

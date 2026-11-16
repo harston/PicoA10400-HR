@@ -233,6 +233,18 @@ Targets:
                     no Pico pad at all (patch 0.31), so the image comes out
                     identical to production. The targets exist only so the two
                     sketches stay in step.
+  PicoA10400-AUDT2 / Pico2A10400-AUDT2 / Pico2A10400-16MB-AUDT2
+                    Diagnostic (audio wiring to cartridge pin 18, 0.82): four
+                    fixed signals on the audio pins, 4 s each, named in the
+                    32-column footer - "AUDT 1/4 HIGH 3.3V" (PWM 100%: a
+                    voltmeter on pin 18 reads ~3.3 V), "2/4 LOW 0V", "3/4
+                    SQUARE 440HZ" (full-swing tone), "4/4 PWM 440HZ" (the POKEY
+                    carrier with its duty switched at 440 Hz). LATE START:
+                    power-on and the menu are production until the test begins,
+                    10 s after the menu appears or 15 s after power-up with no
+                    console (USB + multimeter). The pins are the ones AUDIO_PIN
+                    in /CONFIG.TXT selects - by default GPIO29 on PicoA10400 and
+                    GPIO25 + GPIO29 on Pico2A10400. TEST_ROMS_POKEY3/README.md.
   Pico2A10400-E3..E7, -E8-2MA/-4MA/-8MA/-12MA, -DIGI   The same for the Pico 2
 
   PicoA10400-MENU-<tag> / Pico2A10400-MENU-<tag> / all-MENU-<tag>
@@ -374,6 +386,9 @@ case "$TARGET_LOWER" in
   picoa10400-armt)  BUILD_PICOA10400=1;  BUILD_PICO2A10400=0; DIAG="ARMT" ;;
   pico2a10400-armt) BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="ARMT" ;;
   pico2a10400-16mb-armt) BUILD_PICOA10400=0; BUILD_PICO2A10400=1; PICO2_16MB=1; DIAG="ARMT" ;;
+  picoa10400-audt2)  BUILD_PICOA10400=1;  BUILD_PICO2A10400=0; DIAG="AUDT2" ;;
+  pico2a10400-audt2) BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="AUDT2" ;;
+  pico2a10400-16mb-audt2) BUILD_PICOA10400=0; BUILD_PICO2A10400=1; PICO2_16MB=1; DIAG="AUDT2" ;;
   pico2a10400-fa2n) BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="FA2N" ;;
   pico2a10400-e3)   BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="E3" ;;
   pico2a10400-e4)   BUILD_PICOA10400=0;  BUILD_PICO2A10400=1; DIAG="E4" ;;
@@ -606,6 +621,9 @@ build_sketch() {
       # VALUE, exactly as E8 carries its drive strength; the sketch guards its
       # own #define with #ifndef, so this -D wins without touching the sources.
       extra_args+=(--build-property "compiler.cpp.extra_flags=-DAUDIO_IDLE_MODE=${diag#AUD}")
+    elif [[ "$diag" == "AUDT2" ]]; then
+      # Audio wiring test on the configured audio pins (AUDIO_TEST in the .ino)
+      extra_args+=(--build-property "compiler.cpp.extra_flags=-DAUDIO_TEST=1")
     elif [[ "$diag" == "AUDX" ]]; then
       # Mode 3: rotate the three idle states in the menu, one flash instead of
       # three. AUD0/AUD1/AUD2 stay available for a single fixed state.

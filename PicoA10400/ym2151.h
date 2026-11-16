@@ -989,12 +989,8 @@ static inline int32_t next_sample() {
                            - ((1000000u / YM_SAMPLE_RATE) << 16))        /* 0.879 */
 
 static inline void ym_audio_init(void) {
-  gpio_set_function(YM_AUDIO_PIN, GPIO_FUNC_PWM);
-  uint slice = pwm_gpio_to_slice_num(YM_AUDIO_PIN);
-  pwm_config cfg = pwm_get_default_config();
-  pwm_config_set_wrap(&cfg, YM_PWM_WRAP);
-  pwm_init(slice, &cfg, true);
-  pwm_set_gpio_level(YM_AUDIO_PIN, (YM_PWM_WRAP + 1) / 2);   // mid rail = silence
+  // 0.82: every pin audio_out.h selects (AUDIO_PIN in /CONFIG.TXT).
+  audio_out_init(YM_PWM_WRAP, (YM_PWM_WRAP + 1) / 2);   // mid rail = silence
 }
 
 #if YM_REPORT_RATE
@@ -1145,7 +1141,7 @@ static inline void ym_run(void) {
       int32_t s = ym2151::next_sample();
       s = (s >> YM_VOLUME_SHIFT) + ((YM_PWM_WRAP + 1) / 2);
       if (s < 0) s = 0; else if (s > YM_PWM_WRAP) s = YM_PWM_WRAP;
-      pwm_set_gpio_level(YM_AUDIO_PIN, (uint16_t)s);
+      audio_out_level((uint16_t)s);
       ym_status = ym2151::status;               // publish timer flags to core 1
 
       // Schedule the next sample one native period after this one was DUE, not
